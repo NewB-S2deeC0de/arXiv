@@ -1,11 +1,11 @@
 schema_version: 1
 range:
-  start_month: '2025-04'
-  start_id: 2523
-  end_month: '2025-04'
-  end_id: 7522
-  # Range xuyên tháng: thêm monthly_end_ids cho tháng đầu và các tháng giữa.
-  # Không dùng 99999 làm giới hạn giả định; xem README.
+  start_month: "2024-10"
+  start_id: 23025
+  end_month: "2024-11"
+  end_id: 3798
+  monthly_end_ids:
+    "2024-10": 23999
 paths:
   persistent_root: runtime
   scratch_root: runtime/temp

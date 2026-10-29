@@ -24,13 +24,14 @@ def parse_atom(raw,paper,version=None):
     match = re.search(r'/abs/(.+)v([1-9][0-9]*)$',identifier)
     if not match or match[1] != paper or (version and int(match[2]) != version):
         raise ValueError('Atom ID mismatch or error entry')
+    journal_ref=text('x:journal_ref')
     return dict(arxiv_id=paper, version=int(match[2]), 
                 title=text('a:title'), abstract=text('a:summary'), 
                 authors=[a.findtext('a:name', namespaces = NS) 
                          for a in entry.findall('a:author',NS)] , 
                 categories=[a.get('term') for a in entry.findall('a:category', NS)],
                 published=text('a:published'),updated=text('a:updated'),
-                journal_ref=text('x:journal_ref'), doi=text('x:doi'), venue=None)
+                journal_ref=journal_ref, doi=text('x:doi'), venue=journal_ref or None)
 
 def parse_atom_batch(raw, requested_papers):
     """Map only verified entries to requested IDs; API errors are never absence."""

@@ -14,7 +14,7 @@ class CrawlerConfig:
     def validate(self):
         for value in self.paths.values():
             p=Path(value)
-            if p.is_absolute() or '..' in p.parts: raise ValueError('Project paths must be relative and contained')
+            if p.is_absolute() or p.anchor or '..' in p.parts: raise ValueError('Project paths must be relative and contained')
         if self.schema_version!=1: raise ValueError('Unsupported config schema')
         for name in ('queue_capacity','max_member_bytes','max_unpacked_bytes','ram_sample_seconds','disk_sample_seconds'):
             if self.execution[name]<=0: raise ValueError(f'{name} must be positive')

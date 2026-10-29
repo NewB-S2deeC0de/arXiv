@@ -52,7 +52,7 @@ class ProgressJournal:
                 os.fsync(descriptor)
                 self.directory_sync_supported=True
             except OSError as exc:
-                if exc.errno not in (errno.EINVAL,errno.ENOTSUP,errno.EBADF,errno.ENOSYS): raise
+                if exc.errno not in (errno.EINVAL,errno.ENOTSUP,errno.EBADF,errno.ENOSYS,errno.EACCES,errno.EPERM): raise
                 # Drive/FUSE may not expose directory fsync. File fsync/readback
                 # still precedes network I/O; record the reduced guarantee.
                 self.directory_sync_supported=False

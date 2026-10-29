@@ -17,13 +17,14 @@ def _export_snapshot(config,run_id):
     store=ProgressStore(config.paths['persistent_root'])
     target=Path(config.paths['persistent_root'])/'exports'/run_id
     target.mkdir(parents=True,exist_ok=False)
-    papers=[]; references={}; missing=0; duplicates=0; conflicts=[]; revision_missing=0
+    papers=[]; input_ids=[]; references={}; missing=0; duplicates=0; conflicts=[]; revision_missing=0
     for key in sorted(store.rows):
         if key[2]!='discovery': continue
-        paper=key[0]; meta={}; revisions=[]
+        paper=key[0]; input_ids.append(paper)
         marker=store.storage.verify(key)
-        if marker and marker['status']=='succeeded': meta=json.loads((store.storage.result_dir(key)/'normalized.json').read_text())
-        else: missing+=1
+        if not marker or marker['status']!='succeeded':
+            missing+=1; continue
+        meta=json.loads((store.storage.result_dir(key)/'normalized.json').read_text()); revisions=[]
         for version in range(2,meta.get('version',0)+1):
             vkey=(paper,version,'metadata',0)
             if store.storage.verify(vkey):
@@ -31,7 +32,7 @@ def _export_snapshot(config,run_id):
                 if value: revisions.append(value)
                 else: revision_missing+=1
             else: revision_missing+=1
-        papers.append(dict(arxiv_id=paper,title=meta.get('title'),authors=meta.get('authors'),submission_date=meta.get('published'),revised_dates=revisions if meta else None,venue=meta.get('venue')))
+        papers.append(dict(arxiv_id=paper,title=meta.get('title'),authors=meta.get('authors'),submission_date=meta.get('published'),revised_dates=revisions,venue=meta.get('venue') or meta.get('journal_ref')))
         rkey=(paper,0,'references',0)
         if not store.storage.verify(rkey): continue
         snapshot=json.loads((store.storage.result_dir(rkey)/'normalized.json').read_text())
@@ -74,7 +75,7 @@ def _export_snapshot(config,run_id):
     def mean(rows,field):
         values=[r[field] for r in rows if r.get(field) is not None]
         return dict(mean=sum(values)/len(values) if values else None,sample_count=len(values),missing_count=len(rows)-len(values))
-    manifest=dict(schema_version=1,run_id=run_id,papers=len(papers),references=len(references),missing_metadata=missing,missing_reference_snapshots=sum(r['reference_count'] is None for r in paper_metrics),valid_empty_reference_snapshots=sum(r['reference_count']==0 for r in paper_metrics),missing_revision_dates=revision_missing,duplicate_references=duplicates,conflicting_references=len(conflicts),config_fingerprint=hashlib.sha256(json.dumps(asdict(config),sort_keys=True).encode()).hexdigest(),input_fingerprint=hashlib.sha256(json.dumps([p['arxiv_id'] for p in papers]).encode()).hexdigest(),schema_fingerprint=hashlib.sha256((str(PAPER_SCHEMA)+str(REFERENCE_SCHEMA)).encode()).hexdigest(),contributing_run_ids=[r['run_id'] for r in run_summaries],means=dict(reference_count=mean(paper_metrics,'reference_count'),compressed_bytes=mean(version_metrics,'compressed_bytes'),unpacked_bytes=mean(version_metrics,'unpacked_bytes'),kept_bytes=mean(version_metrics,'kept_bytes')),checksums={p.name:digest(p) for p in target.iterdir()})
+    manifest=dict(schema_version=1,run_id=run_id,papers=len(papers),references=len(references),missing_metadata=missing,missing_reference_snapshots=sum(r['reference_count'] is None for r in paper_metrics),valid_empty_reference_snapshots=sum(r['reference_count']==0 for r in paper_metrics),missing_revision_dates=revision_missing,duplicate_references=duplicates,conflicting_references=len(conflicts),config_fingerprint=hashlib.sha256(json.dumps(asdict(config),sort_keys=True).encode()).hexdigest(),input_fingerprint=hashlib.sha256(json.dumps(input_ids).encode()).hexdigest(),schema_fingerprint=hashlib.sha256((str(PAPER_SCHEMA)+str(REFERENCE_SCHEMA)).encode()).hexdigest(),contributing_run_ids=[r['run_id'] for r in run_summaries],means=dict(reference_count=mean(paper_metrics,'reference_count'),compressed_bytes=mean(version_metrics,'compressed_bytes'),unpacked_bytes=mean(version_metrics,'unpacked_bytes'),kept_bytes=mean(version_metrics,'kept_bytes')),checksums={p.name:digest(p) for p in target.iterdir()})
     atomic_json(target/'manifest.json',manifest)
     return manifest
 

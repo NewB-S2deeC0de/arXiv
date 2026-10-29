@@ -13,10 +13,15 @@ def inspect_and_extract(archive,staging,config):
     def save(name,reader,size):
         nonlocal total,kept,tex,bib,discarded
         p=PurePosixPath(name)
-        if p.is_absolute() or '..' in p.parts or '\\' in name or str(p) in names: raise ValueError('Unsafe archive member')
+        if p.is_absolute() or '..' in p.parts or '\\' in name:
+            total+=size; discarded+=1; return
+        if str(p) in names:
+            total+=size; discarded+=1; return
         names.add(str(p)); total+=size
-        if size>limits['max_member_bytes'] or total>limits['max_unpacked_bytes']: raise RuntimeError('resource_limit')
-        if p.suffix.lower() not in ('.tex','.bib'): discarded+=1; return
+        if p.suffix.lower() not in ('.tex','.bib'):
+            discarded+=1; return
+        if size>limits['max_member_bytes'] or kept+size>limits['max_unpacked_bytes']:
+            raise RuntimeError('resource_limit')
         dest=staging/'tex'/str(p); dest.parent.mkdir(parents=True,exist_ok=True)
         with dest.open('wb') as f: shutil.copyfileobj(reader,f,1024*1024)
         if dest.stat().st_size!=size: raise ValueError('Truncated archive member')
@@ -39,15 +44,14 @@ def inspect_and_extract(archive,staging,config):
         try:
             with tarfile.open(payload,'r:') as tar:
                 for member in tar:
-                    member_path=PurePosixPath(member.name)
-                    if member_path.is_absolute() or '..' in member_path.parts or '\\' in member.name: raise ValueError('Unsafe archive member')
                     if member.isdir(): continue
-                    if not member.isfile(): raise ValueError('Non-regular archive member')
+                    if not member.isfile():
+                        total+=max(member.size,0); discarded+=1; continue
                     with tar.extractfile(member) as reader: save(member.name,reader,member.size)
         except tarfile.TarError as exc: raise ValueError('Invalid tar') from exc
     else:
         with payload.open('rb') as f: prefix=f.read(65536)
-        if prefix.startswith(b'%PDF-'):
+        if prefix.startswith((b'%PDF-',b'PK\x03\x04',b'%!PS')):
             total=payload.stat().st_size; discarded=1
             if total>min(limits['max_member_bytes'],limits['max_unpacked_bytes']): raise RuntimeError('resource_limit')
         elif any(token in prefix for token in (b'\\documentclass',b'\\documentstyle',b'\\begin{document}',b'\\input',b'\\def')) and b'<html' not in prefix.lower():

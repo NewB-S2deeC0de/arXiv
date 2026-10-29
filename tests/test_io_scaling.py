@@ -85,7 +85,8 @@ def test_new_journal_syncs_parent_directory(tmp_path,monkeypatch):
     monkeypatch.setattr(os,'fsync',sync)
     journal=ProgressJournal(tmp_path/'journal.jsonl')
     journal.append([])
-    assert True in calls
+    if os.name=='nt': assert journal.directory_sync_supported is False
+    else: assert True in calls
 
 
 def test_metadata_absence_can_be_rechecked(tmp_path):

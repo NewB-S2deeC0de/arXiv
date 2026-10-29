@@ -1,21 +1,38 @@
 """Local exclusion plus an explicit stale-run takeover marker for Drive datasets."""
-import fcntl
 import json
+import os
 from pathlib import Path
+try:
+    import fcntl
+except ImportError:
+    fcntl=None
+    import msvcrt
 from .storage import atomic_json
 from .console import log
 
 class DatasetLock:
     def __init__(self,root,run_id,takeover_stale=False):
         self.root=Path(root); self.run_id=run_id; self.takeover=takeover_stale; self.previous=None
+    def _lock(self):
+        if fcntl: fcntl.flock(self.file,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        else:
+            if os.fstat(self.file.fileno()).st_size==0:
+                self.file.write(b'\0'); self.file.flush()
+            self.file.seek(0)
+            msvcrt.locking(self.file.fileno(),msvcrt.LK_NBLCK,1)
+    def _unlock(self):
+        if fcntl: fcntl.flock(self.file,fcntl.LOCK_UN)
+        else:
+            self.file.seek(0)
+            msvcrt.locking(self.file.fileno(),msvcrt.LK_UNLCK,1)
     def __enter__(self):
         log('Lock: creating/checking dataset directory')
         self.root.mkdir(parents=True,exist_ok=True)
         log('Lock: opening writer.lock')
-        self.file=(self.root/'writer.lock').open('a')
+        self.file=(self.root/'writer.lock').open('a+b')
         try:
             log('Lock: acquiring local writer lock')
-            fcntl.flock(self.file,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            self._lock()
             self.marker=self.root/'progress'/'active_run.json'
             log('Lock: checking previous active marker')
             if self.marker.exists():
@@ -34,4 +51,6 @@ class DatasetLock:
     def __exit__(self,*args):
         log('Lock: releasing active marker')
         try: self.marker.unlink(missing_ok=True)
-        finally: self.file.close()
+        finally:
+            try: self._unlock()
+            finally: self.file.close()

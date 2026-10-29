@@ -299,9 +299,11 @@ Chỉ được tạo khi chạy export, không gọi API mạng để thu thập
 | `reference_conflicts.json` | Audit reference trùng khóa nhưng khác nội dung. |
 | `manifest.json` | Counts, coverage thiếu, mean với sample/missing counts, fingerprints và checksums. |
 
-`papers.parquet` có thể có 5.000 dòng khi mới crawl 10 bài, vì export giữ cả ID
-đầu vào chưa có metadata và để các trường chưa có dữ liệu là null. Số dòng không
-đồng nghĩa số bài đã thu thập xong.
+`papers.parquet` chỉ chứa các ID có discovery thành công và metadata hợp lệ;
+ID không tồn tại hoặc discovery thất bại được đếm trong `manifest.json`
+(`missing_metadata`) thay vì tạo dòng toàn null. `venue` dùng giá trị `venue`
+nếu có, nếu không thì fallback sang `journal_ref`. `input_fingerprint` vẫn tính
+trên toàn bộ ID đầu vào.
 
 `references.parquet` chỉ giữ references có ref_arxiv_id; raw JSON vẫn giữ các
 reference không có arXiv ID. Bảng export không phản ánh tất cả raw references.

@@ -19,7 +19,8 @@ def atomic_json(path,value):
     tmp=path.with_suffix(path.suffix+'.tmp')
     with tmp.open('w',encoding='utf8') as f:
         json.dump(value,f,ensure_ascii=False,sort_keys=True); f.flush(); os.fsync(f.fileno())
-    assert json.loads(tmp.read_text())==value
+    written=json.loads(tmp.read_text())
+    if written!=value: raise OSError('Publication verification failed')
     tmp.replace(path)
     if json.loads(path.read_text())!=value: raise OSError('Publication verification failed')
 

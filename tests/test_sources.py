@@ -18,20 +18,23 @@ def test_corrupt_gzip(tmp_path):
     with pytest.raises(ValueError): inspect_and_extract(archive,tmp_path/'out',CrawlerConfig())
 
 @pytest.mark.parametrize('name',['../bad.tex','/bad.tex','dir/../../bad.tex'])
-def test_traversal(tmp_path,name):
+def test_traversal_skipped(tmp_path,name):
     import tarfile,io
     archive=tmp_path/'download'
     with tarfile.open(archive,'w:gz') as tar:
         member=tarfile.TarInfo(name); member.size=1; tar.addfile(member,io.BytesIO(b'x'))
-    with pytest.raises(ValueError): inspect_and_extract(archive,tmp_path/'out',CrawlerConfig())
+    result=inspect_and_extract(archive,tmp_path/'out',CrawlerConfig())
+    assert result['status']=='no_tex' and result['discarded_files']==1
+    assert not (tmp_path/'bad.tex').exists()
 
 @pytest.mark.parametrize('kind',['symlink','hardlink'])
-def test_links(tmp_path,kind):
+def test_links_skipped(tmp_path,kind):
     import tarfile
     archive=tmp_path/'download'
     with tarfile.open(archive,'w:gz') as tar:
         member=tarfile.TarInfo('bad.tex'); member.type=tarfile.SYMTYPE if kind=='symlink' else tarfile.LNKTYPE; member.linkname='../escape'; tar.addfile(member)
-    with pytest.raises(ValueError): inspect_and_extract(archive,tmp_path/'out',CrawlerConfig())
+    result=inspect_and_extract(archive,tmp_path/'out',CrawlerConfig())
+    assert result['status']=='no_tex' and result['discarded_files']==1
 
 def test_tar_bytes_bib_only_and_limit(tmp_path):
     import tarfile,io
@@ -45,9 +48,39 @@ def test_tar_bytes_bib_only_and_limit(tmp_path):
     c.execution['max_member_bytes']=3
     with pytest.raises(RuntimeError,match='resource_limit'): inspect_and_extract(archive,tmp_path/'out',c)
 
-def test_unsafe_directory_rejected(tmp_path):
+def test_unsafe_directory_skipped(tmp_path):
     import tarfile
     p=tmp_path/'download'
     with tarfile.open(p,'w:gz') as t:
         m=tarfile.TarInfo('../outside'); m.type=tarfile.DIRTYPE; t.addfile(m)
-    with pytest.raises(ValueError): inspect_and_extract(p,tmp_path/'out',CrawlerConfig())
+    result=inspect_and_extract(p,tmp_path/'out',CrawlerConfig())
+    assert result['status']=='no_tex'
+    assert not (tmp_path/'outside').exists()
+
+def test_large_non_source_member_does_not_fail_version(tmp_path):
+    import tarfile,io
+    p=tmp_path/'download'
+    tex=b'\\documentclass{article}\n'
+    with tarfile.open(p,'w:gz') as t:
+        for name,data in [('main.tex',tex),('huge.png',b'x'*100)]:
+            m=tarfile.TarInfo(name); m.size=len(data); t.addfile(m,io.BytesIO(data))
+    c=CrawlerConfig(); c.execution['max_member_bytes']=50
+    result=inspect_and_extract(p,tmp_path/'out',c)
+    assert result['status']=='succeeded' and result['tex_count']==1
+    assert (tmp_path/'out/tex/main.tex').read_bytes()==tex
+
+def test_duplicate_names_keep_first_member(tmp_path):
+    import tarfile,io
+    p=tmp_path/'download'
+    with tarfile.open(p,'w:gz') as t:
+        for data in (b'\\documentclass{article}\nfirst',b'\\documentclass{article}\nsecond'):
+            m=tarfile.TarInfo('main.tex'); m.size=len(data); t.addfile(m,io.BytesIO(data))
+    result=inspect_and_extract(p,tmp_path/'out',CrawlerConfig())
+    assert result['status']=='succeeded' and result['discarded_files']==1
+    assert b'first' in (tmp_path/'out/tex/main.tex').read_bytes()
+
+@pytest.mark.parametrize('payload',[b'PK\x03\x04docx',b'%!PS-Adobe-3.0'])
+def test_non_tex_document_form_is_empty_record(tmp_path,payload):
+    archive=tmp_path/'download'; archive.write_bytes(payload)
+    result=inspect_and_extract(archive,tmp_path/'out',CrawlerConfig())
+    assert result['status']=='no_tex' and result['discarded_files']==1
