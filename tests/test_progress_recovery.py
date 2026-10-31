@@ -22,7 +22,7 @@ def test_missing_primary_does_not_initialize_empty(tmp_path):
     with pytest.raises(RuntimeError): ProgressStore(tmp_path)
 
 def test_retry_failed_reference_rearms_exhausted_page(tmp_path):
-    s=ProgressStore(tmp_path); s.initialize(['2504.02523'])
+    s=ProgressStore(tmp_path,s2_max_attempts=3); s.initialize(['2504.02523'])
     base=('2504.02523',0,'references',0); page=('2504.02523',0,'references',100)
     s.add(page)
     for _ in range(3): s.start_attempt(page)

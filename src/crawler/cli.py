@@ -37,7 +37,7 @@ def main():
                 if not args.run_id: parser.error('--run-id required')
                 result=_export_snapshot(config,args.run_id)
             else:
-                store=ProgressStore(config.paths['persistent_root'])
+                store=ProgressStore(config.paths['persistent_root'],s2_max_attempts=config.network['s2_max_attempts'])
                 ids=generate_ids(**config.range)
                 selected=set(ids[:args.limit]) if args.limit else set(ids)
                 stages=set()

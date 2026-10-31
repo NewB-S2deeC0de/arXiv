@@ -10,7 +10,8 @@ from .journal import ProgressJournal
 
 class ProgressStore:
     columns=['paper','version','stage','offset','status','attempts','total','cycle','error']
-    def __init__(self,root):
+    def __init__(self,root,*,s2_max_attempts=50):
+        self.s2_max_attempts=s2_max_attempts
         self.root=Path(root); self.path=self.root/'progress'/'jobs.csv'
         self.lock=threading.RLock(); self.rows={}; self.storage=Storage(root); self.reference_counts={}
         self.dirty_count = 0
@@ -109,8 +110,11 @@ class ProgressStore:
         self.add(key); self.save()
 
     def get(self,key): return self.rows[key]
+    def attempt_limit(self,key):
+        return self.s2_max_attempts if key[2]=='references' else 3
+
     def pending(self,stage):
-        return [k for k,r in self.rows.items() if k[2]==stage and r['status'] in ('pending','running') and r['attempts']<3]
+        return [k for k,r in self.rows.items() if k[2]==stage and r['status'] in ('pending','running') and r['attempts']<self.attempt_limit(k)]
     def start_attempt(self,key):
         self.start_attempts([key])
 
@@ -120,7 +124,7 @@ class ProgressStore:
             if not keys or len(set(keys))!=len(keys): raise ValueError('Expected distinct job keys')
             for key in keys:
                 row=self.rows[key]
-                if row['attempts']>=3: raise RuntimeError('Attempt budget exhausted')
+                if row['attempts']>=self.attempt_limit(key): raise RuntimeError('Attempt budget exhausted')
                 if row['status'] not in ('pending','running'): raise ValueError('Cannot send terminal job')
             for key in keys:
                 row=self.rows[key]
@@ -167,7 +171,7 @@ class ProgressStore:
                     if key[2]=='references':
                         next_offset,finished=self.reference_resume_offset(key[0],key[1])
                         attempts=0 if finished else self.rows.get((key[0],key[1],'references',next_offset),{}).get('attempts',0)
-                    row['status']='pending' if attempts<3 else 'failed'
+                    row['status']='pending' if attempts<self.attempt_limit(key) else 'failed'
                     row['error']='integrity_missing_result'
             self.save(with_views=True)
     def reset(self,status='failed',stages=None,ids=None):
@@ -264,10 +268,10 @@ class ProgressStore:
         with self.lock:
             row=self.rows[key]
             if row['status']=='succeeded':
-                row.update(status='pending' if row['attempts']<3 else 'failed',
+                row.update(status='pending' if row['attempts']<self.attempt_limit(key) else 'failed',
                            error='integrity_missing_result')
                 self.save()
-            return row['status'] in ('pending','running') and row['attempts']<3
+            return row['status'] in ('pending','running') and row['attempts']<self.attempt_limit(key)
 
     def reference_cache_root(self,paper,version=0):
         base=self.storage.paper_dir(paper)

@@ -18,7 +18,7 @@ def test_existing_results_without_progress_fail_closed(tmp_path):
     with pytest.raises(RuntimeError): ProgressStore(tmp_path)
 
 def test_committed_third_attempt_page_can_resume(tmp_path):
-    store=ProgressStore(tmp_path); store.initialize(['2504.02523'])
+    store=ProgressStore(tmp_path,s2_max_attempts=3); store.initialize(['2504.02523'])
     base=('2504.02523',0,'references',0)
     for _ in range(3): store.start_attempt(base)
     directory=store.storage.paper_dir(base[0])/'reference-staging'/'fingerprint'

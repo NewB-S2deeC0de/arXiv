@@ -58,7 +58,7 @@ def test_exhausted_missing_page_does_not_stop_other_papers(tmp_path, monkeypatch
     base=(ids[0],1,'references',0); page=(ids[0],1,'references',100)
     for paper in ids: store.add((paper,1,'references',0))
     store.start_attempt(base); store.add(page)
-    for _ in range(3): store.start_attempt(page)
+    for _ in range(50): store.start_attempt(page)
     store.finish(page,'succeeded')
     fingerprint=query_identity(base[0],1,100)[1]
     directory=store.reference_cache_root(ids[0],1)/fingerprint; directory.mkdir(parents=True)
@@ -69,7 +69,7 @@ def test_exhausted_missing_page_does_not_stop_other_papers(tmp_path, monkeypatch
     asyncio.run(run_pipeline(config,{'s2'},transport=httpx.MockTransport(handler)))
     restored=ProgressStore('runtime')
     assert restored.get(base)['status']=='failed'
-    assert restored.get(page)['attempts']==3 and restored.get(page)['total']==3
+    assert restored.get(page)['attempts']==50 and restored.get(page)['total']==50
     assert restored.get((ids[1],1,'references',0))['status']=='succeeded'
     assert len(calls)==1 and ids[1] in calls[0]
 

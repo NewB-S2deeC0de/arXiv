@@ -38,7 +38,7 @@ async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeov
     if 's2' in stages and not api_key and not config.execution['allow_anonymous_s2']:
         raise RuntimeError('Set API key or explicitly allow anonymous S2')
     print('[Startup] Loading progress snapshot and journal',flush=True)
-    store=await progress.call(ProgressStore,root); store.run_id=run_id; store.storage.run_id=run_id
+    store=await progress.call(ProgressStore,root,s2_max_attempts=config.network['s2_max_attempts']); store.run_id=run_id; store.storage.run_id=run_id
     log('Startup: progress loaded; initializing/checkpointing jobs')
     await progress.call(store.initialize,ids,versioned=True)
     print('[Startup] Recovering interrupted jobs in selected scope',flush=True)
