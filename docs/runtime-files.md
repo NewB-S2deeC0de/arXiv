@@ -73,8 +73,9 @@ Mỗi dòng tương ứng một bài. Các nhóm cột chính:
 - `arxiv_id`, `order_index`: ID và vị trí trong range đầu vào.
 - `discovery_status`, `latest_version`: kết quả tra cứu arXiv và phiên bản mới
   nhất tại snapshot discovery.
-- `references_status`, `reference_count`: trạng thái snapshot references và số
-  references đã chuẩn hóa khi có kết quả hoàn chỉnh.
+- `references_status`, `reference_count`: trạng thái/count snapshot **legacy v0**.
+  `references_scope=legacy_paper`; tiến độ mới nằm ở `reference_versions_total`,
+  `reference_versions_succeeded` và `versions.csv`.
 - Các cột attempts/cycle, error, thời gian và run ID: lịch sử xử lý và lỗi.
 
 `reference_count` không phải số citation mà bài nhận được. Các mục
@@ -89,6 +90,8 @@ Mỗi dòng có khóa `(arxiv_id, version)`, ví dụ `(2504.02525, 2)`.
 |---|---|
 | `metadata_status` | Kết quả lấy metadata của đúng phiên bản đó. |
 | `source_status` | Kết quả tải và kiểm tra nguồn của phiên bản đó. |
+| `references_status`, `reference_count` | Snapshot truy vấn URL vN; blank count không có nghĩa rỗng. |
+| `references_current_offset` | Offset page xa nhất đã ghi vào ledger của version. |
 | `*_attempts_total` | Tổng attempts, không reset khi restart hoặc mở chu kỳ retry. |
 | `*_cycle_attempts` | Attempts trong chu kỳ hiện tại; reset khi chủ động mở chu kỳ mới. |
 | `*_cycle_id` | Số chu kỳ xử lý. |
@@ -110,9 +113,9 @@ thành công không tự chứng minh metadata cũng thành công.
 | `not_found` | Không tìm thấy tài nguyên theo kết quả đã xử lý. |
 | `failed` | Thất bại trong chu kỳ hiện tại; resume thường không tự thử lại. |
 
-References có cả row cấp bài và row cấp trang trong ledger. Retry được tính
+References mới có row snapshot version (offset 0) và row trang; v0 cũ giữ riêng trong ledger. Retry được tính
 riêng cho từng trang; tổng requests của bài nhiều trang có thể lớn hơn ba.
-Dùng `status_counts()` để đếm references theo bài, không đếm trực tiếp mọi row
+Dùng `status_counts()` để đếm references theo version; `legacy_references` đếm v0. Không đếm trực tiếp mọi row
 references trong `jobs.csv`.
 
 Muốn xem trạng thái hiện tại trên Colab:
@@ -134,10 +137,14 @@ data/2504.02525/
 ├── versions/
 │   ├── v1/
 │   │   ├── metadata/
-│   │   └── source/
+│   │   ├── source/
+│   │   ├── references/
+│   │   └── reference-staging/
 │   └── v2/
 │       ├── metadata/
-│       └── source/
+│       ├── source/
+│       ├── references/
+│       └── reference-staging/
 └── history/
 ```
 
@@ -183,6 +190,9 @@ Không lấy compressed bytes trừ kept bytes rồi gọi đó là kích thư�
 
 ### `references/` và `reference-staging/`
 
+Dữ liệu mới ở `versions/vN/`; hai thư mục trực tiếp dưới paper chỉ là legacy.
+Xem [worker và resume](versioned-reference-workers.md) để phân biệt queue SSD với cache Drive.
+
 `reference-staging/<query-fingerprint>/` giữ các file như:
 
 ```text
@@ -199,9 +209,9 @@ Khi toàn bộ chuỗi trang kết thúc hợp lệ, crawler publish snapshot v�
 `references/`, gồm raw pages/marker liên quan, `normalized.json` và `complete.json`.
 
 `normalized.json` giữ references đã chuẩn hóa, unresolved_count, fetched_at và
-query fingerprint ở bản code hiện tại. Raw pages giữ cả reference thiếu arXiv ID
-hoặc `citedPaper=null`. Snapshot references là cấp bài, không tự khẳng định nó
-trùng bibliography của từng phiên bản TeX.
+query fingerprint, snapshot_id, content_sha256, requested_identifier, requested_version, page_provenance và version_correspondence ở bản hiện tại. Raw pages giữ cả reference thiếu arXiv ID
+hoặc `citedPaper=null`. Snapshot mới gắn với truy vấn URL vN, nhưng chưa khẳng định
+nó trùng bibliography lịch sử của phiên bản TeX đó.
 
 Page staging được giữ để resume không phải tải lại page hợp lệ. Không xóa
 `reference-staging/` như cách dọn archive tạm nếu vẫn muốn giữ khả năng đó.
@@ -295,15 +305,17 @@ Chỉ được tạo khi chạy export, không gọi API mạng để thu thập
 |---|---|
 | `papers.parquet` | Bảng ID, title, authors, submission_date, revised_dates và venue. |
 | `references.parquet` | Liên kết citing/cited có arXiv ID, từ snapshot complete hợp lệ, dedup theo cặp ID. |
-| `paper_metrics.csv` | Trạng thái/attempts/reference count cấp bài tại lúc export. |
+| `version_references.parquet` | Liên kết version–reference–snapshot, provenance truy vấn. |
+| `reference_snapshots.parquet` | Snapshot ledger v0/vN; count null khi thiếu, 0 khi hợp lệ rỗng. |
+| `paper_metrics.csv` | Trạng thái legacy, reference count union và tiến độ phiên bản. |
 | `version_metrics.csv` | Trạng thái, attempts, mã lỗi và kích thước nguồn cấp phiên bản. |
 | `run_metrics.json` | Summary/checkpoint của các phiên có provenance. |
 | `reference_conflicts.json` | Audit reference trùng khóa nhưng khác nội dung. |
 | `manifest.json` | Counts, coverage thiếu, mean với sample/missing counts, fingerprints và checksums. |
 
-`papers.parquet` có thể có 5.000 dòng khi mới crawl 10 bài, vì export giữ cả ID
-đầu vào chưa có metadata và để các trường chưa có dữ liệu là null. Số dòng không
-đồng nghĩa số bài đã thu thập xong.
+`papers.parquet` chỉ xuất discovery thành công với normalized metadata hợp lệ.
+ID chưa crawl/không tồn tại vẫn nằm trong ledger và paper_metrics; không tạo
+hàng paper toàn null. Số paper có metadata không đồng nghĩa source/references đã xong.
 
 `references.parquet` chỉ giữ references có ref_arxiv_id; raw JSON vẫn giữ các
 reference không có arXiv ID. Bảng export không phản ánh tất cả raw references.
