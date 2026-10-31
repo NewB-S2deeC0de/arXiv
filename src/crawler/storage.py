@@ -30,14 +30,20 @@ class Storage:
         paper,version,stage,_=key
         base=self.paper_dir(paper)
         return base/'versions'/f'v{version}'/stage if version else base/stage
-    def commit(self,key,staging,status='succeeded'):
+    def commit(self,key,staging,status='succeeded',*,include=None):
         target=self.result_dir(key)
         if target.exists(): self.archive_result(key)
         target.mkdir(parents=True,exist_ok=True)
         marker=target/'complete.json'
         if marker.exists(): marker.unlink()
         hashes={}
-        for source in Path(staging).rglob('*'):
+        if include is not None:
+            for name in include:
+                path=Path(name)
+                if path.is_absolute() or '..' in path.parts: raise ValueError('Invalid publication path')
+                if not (Path(staging)/path).is_file(): raise OSError('Missing publication input')
+        sources=Path(staging).rglob('*') if include is None else (Path(staging)/name for name in include)
+        for source in sources:
             if source.is_file() and source.name not in ('complete.json','verification.json'):
                 rel=source.relative_to(staging); dest=target/rel
                 dest.parent.mkdir(parents=True,exist_ok=True); shutil.copyfile(source,dest)

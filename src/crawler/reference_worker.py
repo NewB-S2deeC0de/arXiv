@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import json
 import uuid
+import time
 from urllib.parse import quote
 from .console import log
 from .metrics import utc_now
@@ -30,9 +31,15 @@ class ReferenceWorker:
     def cached_page(self,base,fingerprint,offset):
         root=self.store.reference_cache_root(*base[:2])
         if root.exists() and any(p.is_dir() and p.name!=fingerprint for p in root.iterdir()):
-            raise ValueError('query_fingerprint_changed_refresh_required')
+            return 'query_fingerprint_changed_refresh_required'
         path=root/fingerprint/f'page-{offset:06d}.json'
         marker=path.with_suffix('.complete.json')
+        try:
+            size=path.stat().st_size
+        except OSError:
+            return None
+        if size>self.config.execution['s2_response_max_bytes']:
+            return 'resource_limit'
         try:
             receipt=json.loads(marker.read_text())
             if receipt.get('fingerprint')!=fingerprint or receipt.get('sha256')!=digest(path): return None
@@ -74,10 +81,14 @@ class ReferenceWorker:
             fetched_at=utc_now(),query_fingerprint=fingerprint,snapshot_id=uuid.uuid4().hex,
             content_sha256=hashlib.sha256(json.dumps(refs,sort_keys=True).encode()).hexdigest(),
             page_provenance=provenance,**query))
-        self.store.storage.commit(base,directory)
+        included=['normalized.json']
+        for item in provenance:
+            included.extend([f"page-{item['offset']:06d}.json",f"page-{item['offset']:06d}.complete.json"])
+        self.store.storage.commit(base,directory,include=included)
         return len(refs)
 
     async def publish(self,base,offset,local,query,fingerprint,final,fetched_at):
+        started=time.monotonic()
         count=await self.io.call(self.publish_page,base,offset,local,query,fingerprint,final,fetched_at)
         def acknowledge():
             if offset: self.store.finish((*base[:3],offset),'succeeded')
@@ -85,6 +96,7 @@ class ReferenceWorker:
                 self.store.reference_counts[base[:2]]=count
                 self.store.finish(base,'succeeded')
         await self.progress.call(acknowledge)
+        await self.telemetry.call(self.metrics.record,'commit',job=base,service='s2',seconds=time.monotonic()-started)
         directory=self.store.reference_cache_root(*base[:2])/fingerprint
         await self.telemetry.call(self.metrics.touch,directory/f'page-{offset:06d}.json',directory/f'page-{offset:06d}.complete.json')
         if final:
@@ -99,10 +111,9 @@ class ReferenceWorker:
         while True:
             key=(*base[:3],offset)
             await self.progress.call(self.store.ensure,key)
-            try:
-                cached=await self.reader.call(self.cached_page,base,fingerprint,offset)
-            except ValueError as exc:
-                await self.progress.call(self.store.finish,base,'failed',str(exc)); return
+            cached=await self.reader.call(self.cached_page,base,fingerprint,offset)
+            if isinstance(cached,str):
+                await self.progress.call(self.store.finish,base,'failed',cached); return
             local=None
             if cached is None:
                 if not await self.progress.call(self.store.recover_reference_page,key):
@@ -119,6 +130,7 @@ class ReferenceWorker:
                 raw,page=result; size=len(raw)
                 local=self.scratch/f'{quote(paper,safe="")}-v{version}-page-{offset}.json'
                 await self.reader.call(local.write_bytes,raw)
+                del raw, result  # The publication queue retains a path, not response bodies.
             else:
                 page,size=cached
             byte_count+=size
@@ -126,10 +138,15 @@ class ReferenceWorker:
                 if local: await self.reader.call(local.unlink,missing_ok=True)
                 await self.progress.call(self.store.finish,base,'failed','resource_limit'); return
             # Includes active publication and its durable progress acknowledgement.
+            queued=time.monotonic()
             await self.queue.submit(self.publish,base,offset,local,query,fingerprint,
                                     page['next'] is None,utc_now(),weight=size)
-            if page['next'] is None: return
-            offset=page['next']
+            await self.telemetry.call(self.metrics.record,'publication_queue_wait',job=key,service='s2',
+                seconds=time.monotonic()-queued,items=self.queue.used_items,bytes=self.queue.used_bytes)
+            next_offset=page['next']
+            page=cached=None
+            if next_offset is None: return
+            offset=next_offset
 
     async def run(self,scheduler,discovery_done):
         async with self.queue:

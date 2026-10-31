@@ -152,3 +152,93 @@ def test_cancel_during_publish_holds_dataset_lock_and_resumes(tmp_path,monkeypat
     monkeypatch.setattr(Storage,'commit',original)
     run(config,handler)
     assert len(calls)==1
+
+
+def test_oversized_response_is_failed_without_publication(tmp_path,monkeypatch):
+    config,_=setup(tmp_path,monkeypatch,versions=1)
+    config.execution['s2_response_max_bytes']=10
+    calls=[]
+    def handler(request): calls.append(request); return httpx.Response(200,json={'data':[]})
+    result=run(config,handler)
+    store=ProgressStore('runtime'); key=(PAPER,1,'references',0)
+    assert store.get(key)['error']=='resource_limit'
+    assert len(calls)==1 and not store.storage.verify(key)
+
+
+def test_cache_exceeding_new_budget_fails_only_its_version(tmp_path,monkeypatch):
+    from crawler.reference_worker import query_identity
+    from crawler.storage import atomic_json,digest
+    config,store=setup(tmp_path,monkeypatch,versions=2)
+    config.execution['s2_response_max_bytes']=20
+    config.execution['s2_publish_queue_bytes']=20
+    fingerprint=query_identity(PAPER,1,100)[1]
+    directory=store.reference_cache_root(PAPER,1)/fingerprint; directory.mkdir(parents=True)
+    path=directory/'page-000000.json'; path.write_text('{"data":[],"padding":"too large for the new queue"}')
+    atomic_json(path.with_suffix('.complete.json'),dict(sha256=digest(path),fingerprint=fingerprint))
+    calls=[]
+    def handler(request): calls.append(request); return httpx.Response(200,json={'data':[]})
+    run(config,handler)
+    store=ProgressStore('runtime')
+    assert store.get((PAPER,1,'references',0))['error']=='resource_limit'
+    assert store.get((PAPER,2,'references',0))['status']=='succeeded'
+    assert len(calls)==1
+
+
+def test_changed_fingerprint_does_not_poison_reader_for_other_versions(tmp_path,monkeypatch):
+    config,store=setup(tmp_path,monkeypatch,versions=2)
+    (store.reference_cache_root(PAPER,1)/'old-fingerprint').mkdir(parents=True)
+    calls=[]
+    def handler(request): calls.append(request); return httpx.Response(200,json={'data':[]})
+    run(config,handler)
+    store=ProgressStore('runtime')
+    assert store.get((PAPER,1,'references',0))['error']=='query_fingerprint_changed_refresh_required'
+    assert store.get((PAPER,2,'references',0))['status']=='succeeded'
+    assert len(calls)==1
+
+
+def test_snapshot_excludes_unreachable_cached_pages(tmp_path,monkeypatch):
+    from crawler.reference_worker import query_identity
+    from crawler.storage import atomic_json,digest
+    config,store=setup(tmp_path,monkeypatch,versions=1)
+    fingerprint=query_identity(PAPER,1,100)[1]
+    directory=store.reference_cache_root(PAPER,1)/fingerprint; directory.mkdir(parents=True)
+    for offset in (0,100):
+        path=directory/f'page-{offset:06d}.json'; path.write_text('{"data":[]}')
+        atomic_json(path.with_suffix('.complete.json'),dict(sha256=digest(path),fingerprint=fingerprint))
+    def handler(request): raise AssertionError('valid cache should be reused')
+    result=run(config,handler)
+    target=store.storage.result_dir((PAPER,1,'references',0))
+    assert (target/'page-000000.json').exists()
+    assert not (target/'page-000100.json').exists()
+    assert result['event_seconds']['commit']>=0
+    assert result['event_seconds']['publication_queue_wait']>=0
+
+
+def test_threaded_writer_ack_and_key_pacing_across_retry_pages_versions(tmp_path,monkeypatch):
+    import threading
+    config,_=setup(tmp_path,monkeypatch,versions=2)
+    monkeypatch.setenv('SEMANTIC_SCHOLAR_API_KEY','offline-test-key')
+    starts=[]; writes=[]; clock=[1000.]; seen_first=[False]
+    original=ProgressStore.save
+    def save(self,*args,**kwargs):
+        writes.append(threading.current_thread().name)
+        return original(self,*args,**kwargs)
+    monkeypatch.setattr(ProgressStore,'save',save)
+    async def scenario():
+        async def sleep(n): clock[0]+=n; await asyncio.sleep(0)
+        def handler(request):
+            version=1 if f'{PAPER}v1' in request.url.path else 2
+            offset=int(request.url.params['offset'])
+            ledger=ProgressStore('runtime')
+            assert ledger.get((PAPER,version,'references',offset))['attempts']>=1
+            starts.append(clock[0])
+            if not seen_first[0]:
+                seen_first[0]=True
+                return httpx.Response(429,headers={'Retry-After':'7'})
+            return httpx.Response(200,json={'data':[],**({'next':100} if version==1 and offset==0 else {})})
+        await run_pipeline(config,{'s2'},transport=httpx.MockTransport(handler),now=lambda:clock[0],sleep=sleep)
+    asyncio.run(scenario())
+    assert len(starts)==4
+    assert starts[1]-starts[0]>=7
+    assert all(b-a>=1.1-1e-9 for a,b in zip(starts,starts[1:]))
+    assert writes and all(name.startswith('progress_') for name in writes)

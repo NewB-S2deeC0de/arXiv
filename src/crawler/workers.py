@@ -89,16 +89,16 @@ class ThreadWorker:
                 async with self._condition:
                     self._error = exc
                     self._failed_event.set()
-                    future.set_exception(exc)
+                    if not future.done(): future.set_exception(exc)
                     while self._queue:
                         _, _, pending = self._queue.popleft()
-                        pending.set_exception(exc)
+                        if not pending.done(): pending.set_exception(exc)
                     self.used_items = self.used_bytes = 0
                     self._condition.notify_all()
                 return
             else:
                 async with self._condition:
-                    future.set_result(result)
+                    if not future.done(): future.set_result(result)
                     self.used_items -= 1
                     self.used_bytes -= weight
                     self._condition.notify_all()

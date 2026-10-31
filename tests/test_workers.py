@@ -73,3 +73,14 @@ def test_failure_monitor_interrupts_waiting_producer():
         with pytest.raises(OSError): await asyncio.wait_for(monitor,1)
         with pytest.raises(OSError): await worker.close()
     asyncio.run(run())
+
+
+def test_cancelled_ack_does_not_kill_worker():
+    async def run():
+        gate=threading.Event()
+        async with ThreadWorker(capacity=2) as worker:
+            ack=await worker.submit(lambda:gate.wait(3))
+            ack.cancel()
+            gate.set()
+            assert await asyncio.wait_for(worker.call(lambda:42),1)==42
+    asyncio.run(run())
