@@ -36,7 +36,7 @@ def test_export_venue_and_no_full_source_hash(tmp_path,monkeypatch):
     row=pq.read_table('runtime/exports/venue/papers.parquet').to_pylist()[0]
     assert row['venue']=='Journal A'
     assert row['venue_source']=='semantic_scholar.citedPaper.venue'
-    assert manifest['schema_version']==2
+    assert manifest['schema_version']==3
 
 
 def test_export_filters_not_found_and_outside_range(tmp_path,monkeypatch):
@@ -73,3 +73,25 @@ def test_conflicting_venues_stay_null_and_corrupt_json_excluded(tmp_path,monkeyp
     (store.storage.result_dir((paper,0,'discovery',0))/'normalized.json').write_text('{"version":1,"title":"modified"}')
     manifest=export_snapshot(c,'corrupt')
     assert manifest['papers']==0 and manifest['missing_metadata']==1
+
+
+def test_version_exports_preserve_provenance_and_dedupe_paper_pairs(tmp_path,monkeypatch):
+    import json
+    monkeypatch.chdir(tmp_path)
+    c=CrawlerConfig(); c.range['end_id']=2523
+    paper='2504.02523'; store=ProgressStore('runtime'); store.initialize([paper])
+    for key,data in [((paper,0,'discovery',0),dict(version=2,title='T'))]+[
+        ((paper,v,'references',0),dict(references=[dict(ref_arxiv_id='2401.00001',ref_title='R')],
+            snapshot_id=f'snapshot-{v}',requested_identifier=f'URL:https://arxiv.org/abs/{paper}v{v}',
+            version_correspondence='unverified')) for v in (1,2)]:
+        store.add(key); staging=tmp_path/f'{key[1]}-{key[2]}'; staging.mkdir()
+        (staging/'normalized.json').write_text(json.dumps(data))
+        store.storage.commit(key,staging); store.finish(key,'succeeded')
+    export_snapshot(c,'versions')
+    assert pq.read_table('runtime/exports/versions/references.parquet').num_rows==1
+    rows=pq.read_table('runtime/exports/versions/version_references.parquet').to_pylist()
+    assert {r['version'] for r in rows}=={1,2}
+    assert {r['snapshot_id'] for r in rows}=={'snapshot-1','snapshot-2'}
+    assert all(r['version_correspondence']=='unverified' for r in rows)
+    snapshots=pq.read_table('runtime/exports/versions/reference_snapshots.parquet').to_pylist()
+    assert len(snapshots)==3  # Includes old v0 ledger, without assigning it to any version.

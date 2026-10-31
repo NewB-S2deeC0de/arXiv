@@ -1,5 +1,7 @@
 # Báo cáo chỉnh sửa references và giãn cách request S2
 
+> Báo cáo lịch sử của bản paper-level. Kiến trúc hiện tại: [references theo version và worker](versioned-reference-workers.md).
+
 ## Phạm vi
 
 Báo cáo trình bày hai mục đã được yêu cầu sửa: phục hồi references khi cache trang bị mất/hỏng và giãn cách request Semantic Scholar (S2) theo thời điểm gửi thực tế. Mốc so sánh là code ngay trước lần sửa này, đã có bản tối ưu backoff S2 trước đó.

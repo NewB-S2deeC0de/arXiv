@@ -105,6 +105,7 @@ def test_failed_pagination_updates_retained_page_counter(tmp_path,monkeypatch):
     from crawler.metrics import MetricsRecorder
     monkeypatch.chdir(tmp_path)
     config=CrawlerConfig(); config.execution['allow_anonymous_s2']=True; config.range['end_id']=2523
+    store=ProgressStore('runtime'); store.initialize(['2504.02523']); store.add(('2504.02523',1,'references',0)); store.save()
     touched=[]; original=MetricsRecorder.touch; clock=[1000.]
     def touch(self,*paths): touched.extend(Path(p).name for p in paths); return original(self,*paths)
     monkeypatch.setattr(MetricsRecorder,'touch',touch)

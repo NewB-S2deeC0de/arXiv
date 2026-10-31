@@ -5,7 +5,13 @@ Metadata và source arXiv dùng chung scheduler nối tiếp; S2 có limiter ri�
 Mỗi request tối đa ba attempts, gồm cả 429; source validation dùng cùng budget.
 Cooldown và attempts được lưu trước khi tiếp tục. Không tự retry failed khi resume.
 
-## Kết quả smoke do người dùng cung cấp
+## Kiến trúc references theo version
+
+Xem [luồng worker, giới hạn queue, chuyển dữ liệu cũ và cách smoke](docs/versioned-reference-workers.md).
+References mới truy vấn URL arXiv vN, lưu riêng từng version; snapshot v0 giữ nguyên.
+Chưa kiểm chứng rằng S2 trả bibliography lịch sử tương ứng từng version.
+
+## Kết quả smoke do người dùng cung cấp (bản paper-level cũ)
 
 Bản đầu đã chạy 10 ID trên Colab: discovery 10, version metadata 14,
 reference snapshots 10, source thành công 7 và thất bại 7.
@@ -37,8 +43,8 @@ Giải thích chi tiết từng file: [docs/runtime-files.md](docs/runtime-files
   cập nhật mới hơn snapshot. Resume dùng cả hai, giữ tương thích dữ liệu cũ.
   Không xóa/sửa tay journal hoặc hạ code về bản không đọc journal.
 - `papers.csv`, `versions.csv`: snapshots theo schema đặc tả, tạo tự động từ
-  ledger khi checkpoint. `status_counts()` đếm references theo bài, không cộng
-  page rows. Đây là lựa chọn tương thích: ledger giữ lịch sử retry chi tiết,
+  ledger khi checkpoint. `status_counts()` đếm references theo version, không cộng
+  page rows; `legacy_references` tách các snapshot v0 cũ. Đây là lựa chọn tương thích: ledger giữ lịch sử retry chi tiết,
   hai snapshots là view tái tạo được, không phải ba nguồn trạng thái độc lập.
 - `services.json`: cooldown và rolling-window S2 tồn tại qua restart.
 - Kết quả chỉ hợp lệ khi marker/checksum khớp. Legacy marker vẫn được đọc;
@@ -65,14 +71,13 @@ sampling có thể bỏ lỡ spike. Các metrics cũ chưa đo không được d
 5. Giữ secret `SEMANTIC_SCHOLAR_API_KEY` trong Colab Secrets, bật Notebook access.
    Cell authentication chỉ in `key` hoặc `anonymous`. Không dán key vào code.
 6. Chạy status/diagnostics. `diagnose_sources(config)` chỉ đọc file tạm, không gọi API.
-7. Bật `RETRY_FAILED_SOURCES = True` trong cell retry để mở chu kỳ mới cho các
-   source failed thuộc 10 ID đầu. Cell chạy nhánh arXiv với `limit=10`, giữ total
-   attempts và cooldown, bỏ qua metadata/source đã complete hợp lệ.
-8. Sau lần thử, đặt lại toggle False. Kiểm tra status và các mã lỗi mới.
-9. Stop giữa phiên rồi resume `limit=10`; kiểm tra file/checksum và tổng attempts.
-   Chỉ dùng `takeover_stale=True` khi chắc chắn runtime cũ đã ngừng.
-10. Sau smoke/interrupt check đạt, có thể chủ động chạy full range qua CLI hoặc
-    `await run_pipeline(config, {'arxiv','s2'}, resume=True, limit=None)`.
+7. Bật cell scratch SSD, rồi bật `RUN_SMOKE=True` tại cell smoke 10 ID.
+   Smoke resume các version của 10 ID đầu; references v0 cũ không thay thế vN.
+8. Đặt lại toggle False, chạy Status; kiểm tra references version và lỗi 429.
+9. Stop một lần, chờ drain worker rồi resume smoke; chỉ bật takeover khi runtime
+   cũ đã dừng và còn active marker. Không reset attempts/cooldown.
+10. Khi smoke đạt, chọn một cell toàn range, arXiv-only hoặc S2-only. Failed jobs
+    cần chủ động retry bằng CLI, không tự được chạy lại khi resume.
 
 Config mẫu yêu cầu key (`allow_anonymous_s2: false`). Chỉ thử anonymous khi chủ động
 bật `execution.allow_anonymous_s2: true`; không dùng cấu hình đó cho full crawl.
@@ -92,7 +97,7 @@ PYTHONPATH=src python -m crawler.cli export --run-id export-001
 ```
 
 CLI `retry-failed` chỉ reset failed stages của service được chọn, không gọi mạng.
-Notebook có lựa chọn source-only. `recheck-not-found` riêng cho not_found.
+Notebook có chế độ chỉ arXiv hoặc chỉ S2. `recheck-not-found` riêng cho not_found.
 `refresh-discovery --limit 10` và `refresh-references --limit 10` mở snapshot mới,
 giữ history; không tự refresh khi resume. `run`/`resume` không có `--limit` chọn
 cả 5.000 ID. Notebook smoke luôn truyền 10; không auto chạy full range.
@@ -334,8 +339,8 @@ print(diagnose_references(config))
 
 Diagnostics read existing event logs and report HTTP counts (especially 429),
 request time, wait time and remaining persisted cooldown. New logs also record
-completed paper snapshots and the actual number of reference entries. A
-references succeeded count in status means papers with a complete snapshot,
+completed version snapshots and the actual number of reference entries. A
+references succeeded count in status means versions with a complete snapshot,
 not the number of referenced publications. These counters must not be confused.
 No local dataset/run logs were available during this investigation, so the
 specific cause of an existing Colab session's slowdown requires its diagnostics.
