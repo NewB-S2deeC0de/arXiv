@@ -104,7 +104,7 @@ nghĩa snapshot rỗng, payload là nguồn dữ liệu. Các cột references c
 - Có marker kết quả hợp lệ nhưng chưa ghi succeeded: recovery xác minh kết quả
   của job đang chạy rồi ghi succeeded; không cần scratch và không tải lại.
 - Chỉ publish vài page: resume dùng cache có checksum/fingerprint hợp lệ rồi
-  tiếp tục từ trang thiếu. Attempts mỗi page được giữ nguyên, tối đa ba/chu kỳ.
+  tiếp tục từ trang thiếu. Attempts mỗi page được giữ nguyên, tạm thời tối đa 50/page/chu kỳ (`network.s2_max_attempts`, gồm lần đầu).
 - Response chỉ nằm trên SSD/queue rồi runtime mất: tải lại trang thiếu nếu còn
   budget. Không có cơ chế cứu RAM/SSD đã mất; không reset attempts tự động.
 - Publisher lỗi: báo lỗi, đánh thức producer đang bị backpressure; không treo
@@ -121,8 +121,15 @@ chạy tiếp quản đặt lại False. Không chạy nhiều runtime dùng cù
 cùng API key; limiter ở một process không phối hợp với process khác.
 
 S2 mặc định giãn start request 1.1 giây, cấu hình không cho dưới 1 giây.
-Pagination, retries và mọi version đi qua cùng limiter. Fallback backoff giữ
-trần 300 giây; `Retry-After` và deadline đã lưu có thể dài hơn và vẫn được tôn trọng.
+Pagination, retries và mọi version đi qua cùng limiter. Với 429, S2 chỉ giữ
+pacing và `Retry-After`, không dùng backoff hoặc delay 10/30. Với lỗi tạm thời
+khác, delay 10 rồi 30 giây vẫn áp dụng, kể cả sau lần thử thứ ba. arXiv vẫn tối đa
+3 attempts. `network.s2_max_backoff_seconds` cũ không còn tác dụng.
+
+Deadline cũ chưa có nguồn chờ được giữ một lần tới khi hết; không xóa nhầm
+cooldown của server. State mới có `retry_policy=retry_after_only`,
+`retry_after_deadline`, `legacy_deadline` và `backoff=0`. Tăng budget không tự
+reset attempts hoặc mở lại job failed; dùng retry-failed khi chủ động thử lại.
 
 ## Export và kiểm tra Colab
 

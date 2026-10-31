@@ -15,6 +15,7 @@ PAYLOAD_CODES={'Truncated gzip':'payload_gzip_truncated','Unrecognized source pa
 
 class Scheduler:
     def __init__(self,config,store,client,now=time.time,sleep=asyncio.sleep,api_key=None,metrics=None,monotonic=None,progress_worker=None,metrics_worker=None,io_worker=None):
+        store.s2_max_attempts=config.network['s2_max_attempts']
         self.progress_worker=progress_worker; self.metrics_worker=metrics_worker; self.io_worker=io_worker
         self.config=config; self.store=store; self.client=client; self.now=now; self.sleep=sleep; self.api_key=api_key; self.metrics=metrics
         # Injected wall clocks also serve as elapsed clocks in deterministic tests.
@@ -22,6 +23,13 @@ class Scheduler:
         self.s2_next_send=0.
         self.path=store.root/'progress'/'services.json'
         self.state=json.loads(self.path.read_text()) if self.path.exists() else {s:dict(deadline=0,backoff=0,recent=[]) for s in ('arxiv','s2')}
+        s2=self.state['s2']
+        if s2.get('retry_policy')!='retry_after_only':
+            # Legacy deadlines do not identify whether the server demanded the wait.
+            s2['legacy_deadline']=s2['deadline']
+            s2['retry_policy']='retry_after_only'
+        s2['backoff']=0
+        s2.setdefault('retry_after_deadline',0)
         if self.state['s2'].get('dispatch_pending'):
             # A crash may have occurred after send but before its timestamp was saved.
             gap=config.network['s2_key_gap_seconds' if api_key else 's2_anonymous_gap_seconds']
@@ -65,6 +73,7 @@ class Scheduler:
         if urlsplit(url).hostname != expected_host or urlsplit(url).scheme!='https': raise ValueError('Disallowed service URL')
         net=self.config.network; state=self.state[service]
         gap = net['arxiv_gap_seconds'] if service == 'arxiv' else net['s2_key_gap_seconds' if self.api_key else 's2_anonymous_gap_seconds']
+        max_attempts=net['s2_max_attempts'] if service=='s2' else net['max_attempts']
         queued = time.monotonic()
 
         batch_keys = key if isinstance(key, list) else [key]
@@ -80,7 +89,7 @@ class Scheduler:
 
         async with self.locks[service]:
             await emit('queue_acquired',job = primary_key,seconds=time.monotonic()-queued)
-            while (await self.store_call('get',primary_key))['attempts']<3:
+            while (await self.store_call('get',primary_key))['attempts']<max_attempts:
                 state['recent'] = [
                     t for t in state['recent']
                     if t > self.now()-net['s2_anonymous_window_seconds']]
@@ -113,16 +122,21 @@ class Scheduler:
                     async with self.client.stream('GET',url,params=params,headers=headers,follow_redirects=False) as response:
                         code=response.status_code
                         retry_after=parse_retry_after(response.headers.get('Retry-After'),datetime.fromtimestamp(self.now(),timezone.utc))
-                        if code==429:
-                            state['backoff'] = state['backoff']*2 or 60
-                            if service=='s2':
-                                state['backoff'] = min(state['backoff'],net['s2_max_backoff_seconds'])
-                            state['deadline'] = max(state['deadline'],self.now()+(retry_after if retry_after is not None else state['backoff']))
-                        else:
-                            state['backoff'] = 0
+                        if service=='s2':
+                            state['backoff']=0
                             if retry_after is not None:
-                                state['deadline'] = max(state['deadline'],self.now()+  retry_after)
+                                state['retry_after_deadline']=max(state['retry_after_deadline'],self.now()+retry_after)
+                                state['deadline']=max(state['deadline'],state['retry_after_deadline'])
+                        elif code==429:
+                            state['backoff']=state['backoff']*2 or 60
+                            state['deadline']=max(state['deadline'],self.now()+(retry_after if retry_after is not None else state['backoff']))
+                        else:
+                            state['backoff']=0
+                            if retry_after is not None:
+                                state['deadline']=max(state['deadline'],self.now()+retry_after)
                         await self.persist_async()
+                        if code==429:
+                            await emit('rate_limited',retry_after_seconds=retry_after,deadline=state['deadline'],computed_backoff_seconds=state['backoff'])
 
                         if code in (301, 302, 303, 307, 308):
                             location=response.headers.get('Location','')
@@ -225,9 +239,10 @@ class Scheduler:
                         await self.metric('sample',force_disk=True)
 
                 attempt=(await self.store_call('get',primary_key))['attempts']
-                if attempt<3:
+                if attempt<max_attempts:
                     if not redirected:
-                        delay = net['retry_delays_seconds'][attempt-1]
+                        # 429 on S2 uses only pacing and the server's Retry-After.
+                        delay = 0 if service=='s2' and code==429 else net['retry_delays_seconds'][min(attempt-1,len(net['retry_delays_seconds'])-1)]
                         state['deadline'] = max(state['deadline'], self.now() + delay)
                         await self.persist_async()
                         await emit(

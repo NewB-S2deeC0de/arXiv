@@ -2,7 +2,8 @@
 
 Python >=3.11, Colab CPU; inclusive range `2504.02523`–`2504.07522`.
 Metadata và source arXiv dùng chung scheduler nối tiếp; S2 có limiter riêng.
-Mỗi request tối đa ba attempts, gồm cả 429; source validation dùng cùng budget.
+arXiv tối đa 3 attempts mỗi job; source validation dùng cùng budget.
+S2 tạm thời tối đa 50 attempts mỗi page (`network.s2_max_attempts`, gồm lần đầu).
 Cooldown và attempts được lưu trước khi tiếp tục. Không tự retry failed khi resume.
 
 ## Kiến trúc references theo version
@@ -305,12 +306,21 @@ member nguy hiểm, tên trùng, link hoặc vượt giới hạn vẫn bị t�
 
 ## S2 throughput investigation and update
 
-S2 429 fallback backoff previously doubled across papers without a ceiling:
-60, 120, 240, 480, 960, 1920, 3840, 7680 seconds. This can make a long
-session mostly wait, even though each page has only three attempts. The new
-`network.s2_max_backoff_seconds` defaults to 300 and bounds only the computed
-fallback; server Retry-After and already persisted cooldown deadlines remain
-respected. Updating code does not erase an existing long cooldown.
+S2 hiện dùng chính sách thử nghiệm: tối đa **50 attempts mỗi page/chu kỳ**.
+Khi gặp 429, chỉ chờ pacing (mặc định 1.1 giây giữa request start) và
+`Retry-After` nếu có. Không còn backoff 60–300 giây và không áp dụng delay 10/30
+cho 429 của S2. `network.s2_max_backoff_seconds` cũ không còn được dùng.
+Lỗi tạm thời khác (5xx, timeout, payload…) vẫn dùng delay 10 rồi 30 giây cho
+các lần retry tiếp theo. 401/403 vẫn dừng S2; 404 vẫn thành not_found.
+
+`services.json` mới ghi `retry_policy`, `retry_after_deadline`, `legacy_deadline`;
+log `rate_limited` ghi Retry-After và deadline của từng 429. Deadline từ code cũ
+không phân biệt nguồn chờ, nên được giữ tới khi hết để tránh xóa nhầm yêu cầu
+của máy chủ. Backoff S2 mới luôn bằng 0; không xóa services.json để bỏ chờ.
+
+Attempts đã dùng không bị reset khi restart. Job đang running/pending tiếp tục
+trong budget 50; job failed cũ không tự mở lại. Muốn thử lại, dùng `retry-failed`
+với đúng config/root và phạm vi, giữ tổng attempts và mở cycle mới.
 
 S2 now paces request starts (1.1 seconds with key by default), so response
 latency does not get an additional full gap appended. Drive result publication

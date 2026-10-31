@@ -10,6 +10,7 @@ paths:
   persistent_root: runtime
   scratch_root: runtime/temp
 network:
+  s2_max_attempts: 50  # Temporary experiment; per page, including the first request.
   discovery_batch_size: 50
   metadata_batch_size: 50
 execution:

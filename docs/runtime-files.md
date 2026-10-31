@@ -38,7 +38,7 @@ riêng; nhiều run có thể tiếp tục cùng dataset.
 | `jobs.bak.json` | Checksum, số dòng và journal sequence của snapshot dự phòng. |
 | `papers.csv` | Bảng tổng hợp tiến độ theo bài. |
 | `versions.csv` | Bảng tổng hợp tiến độ theo phiên bản. |
-| `services.json` | Cooldown từng dịch vụ, backoff 429 và lịch request cho limiter anonymous S2. |
+| `services.json` | Cooldown từng dịch vụ, backoff arXiv, Retry-After/legacy deadline và lịch anonymous S2. |
 | `active_run.json` | Marker phiên ghi dataset đã bắt đầu; được xóa khi thoát bình thường. |
 | `backups/` | Bản trước của các bảng tổng hợp `papers.csv` và `versions.csv`. |
 | `takeovers/` | Audit khi chủ động tiếp quản marker phiên cũ bằng `takeover_stale=True`. |
@@ -114,7 +114,8 @@ thành công không tự chứng minh metadata cũng thành công.
 | `failed` | Thất bại trong chu kỳ hiện tại; resume thường không tự thử lại. |
 
 References mới có row snapshot version (offset 0) và row trang; v0 cũ giữ riêng trong ledger. Retry được tính
-riêng cho từng trang; tổng requests của bài nhiều trang có thể lớn hơn ba.
+riêng cho từng trang; S2 hiện có tối đa 50 attempts/page/chu kỳ (gồm lần đầu).
+Tổng requests của version nhiều trang có thể lớn hơn 50; arXiv vẫn giữ 3 attempts.
 Dùng `status_counts()` để đếm references theo version; `legacy_references` đếm v0. Không đếm trực tiếp mọi row
 references trong `jobs.csv`.
 

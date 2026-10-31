@@ -6,18 +6,19 @@ from crawler.progress import ProgressStore
 from crawler.scheduler import Scheduler
 
 
-def test_repeated_429_backoff_bounded_but_retry_after_preserved(tmp_path):
+def test_repeated_429_has_no_backoff_but_retry_after_preserved(tmp_path):
     async def run():
         ids=['2504.00001','2504.00002','2504.00003']
         store=ProgressStore(tmp_path); store.initialize(ids)
         clock=[1000.]; delays=[]
+        config=CrawlerConfig(); config.network['s2_max_attempts']=3
         async def sleep(n): clock[0]+=n
         async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r:httpx.Response(429))) as client:
-            scheduler=Scheduler(CrawlerConfig(),store,client,api_key='test',now=lambda:clock[0],sleep=sleep)
+            scheduler=Scheduler(config,store,client,api_key='test',now=lambda:clock[0],sleep=sleep)
             for paper in ids:
                 await scheduler.request((paper,0,'references',0),'s2','https://api.semanticscholar.org/graph/v1/paper/test/references')
                 delays.append(scheduler.state['s2']['backoff'])
-            assert delays==[240,300,300]
+            assert delays==[0,0,0]
             client._transport=httpx.MockTransport(lambda r:httpx.Response(429,headers={'Retry-After':'900'}))
             store.reset('failed')
             await scheduler.request((ids[0],0,'references',0),'s2','https://api.semanticscholar.org/graph/v1/paper/test/references')
