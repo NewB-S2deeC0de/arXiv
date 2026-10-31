@@ -216,9 +216,6 @@ class ProgressStore:
         with self.lock:
             for key,row in list(self.rows.items()):
                 if ids is not None and key[0] not in ids: continue
-                if stages is not None and key[2] not in stages: continue
-                if recovery_only and row['status'] not in ('running','pending'): continue
-                if recovery_only and row['attempts']==0: continue
                 if key[2]!=stage or key[3]!=0 or (ids is not None and key[0] not in ids): continue
                 self.storage.archive_result(key)
                 if stage=='references':
@@ -232,6 +229,17 @@ class ProgressStore:
                 else: row.update(status='pending',attempts=0,cycle=row['cycle']+1,error='')
             self.save()
 
+    def recover_reference_page(self,key):
+        """Reopen a successful page whose cache is invalid, without a new retry cycle."""
+        if key[2]!='references': raise ValueError('Expected references job')
+        with self.lock:
+            row=self.rows[key]
+            if row['status']=='succeeded':
+                row.update(status='pending' if row['attempts']<3 else 'failed',
+                           error='integrity_missing_result')
+                self.save()
+            return row['status'] in ('pending','running') and row['attempts']<3
+
     def valid_reference_page(self,paper,offset):
         from .semantic_scholar import parse_page
         root=self.storage.paper_dir(paper)/'reference-staging'
@@ -243,7 +251,7 @@ class ProgressStore:
             data=json.loads(marker.read_text())
             if data.get('fingerprint')!=directory.name or data.get('sha256')!=digest(raw): return None
             return parse_page(raw.read_bytes(),offset)
-        except (OSError,ValueError,TypeError): return None
+        except (OSError,ValueError,TypeError,AttributeError): return None
 
     def reference_resume_offset(self,paper):
         offset=0

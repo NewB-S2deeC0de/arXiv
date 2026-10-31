@@ -296,3 +296,51 @@ giới hạn kích thước; hợp lệ thì no_tex với inventory. HTML/ZIP kh
 được và payload hỏng vẫn là lỗi, không tự biến thành no_tex. Chỉ giữ .tex/.bib;
 không convert Word, .bbl hay parsing bibliography ở M1. Các archive chứa
 member nguy hiểm, tên trùng, link hoặc vượt giới hạn vẫn bị từ chối theo đặc tả.
+
+
+## S2 throughput investigation and update
+
+S2 429 fallback backoff previously doubled across papers without a ceiling:
+60, 120, 240, 480, 960, 1920, 3840, 7680 seconds. This can make a long
+session mostly wait, even though each page has only three attempts. The new
+`network.s2_max_backoff_seconds` defaults to 300 and bounds only the computed
+fallback; server Retry-After and already persisted cooldown deadlines remain
+respected. Updating code does not erase an existing long cooldown.
+
+S2 now paces request starts (1.1 seconds with key by default), so response
+latency does not get an additional full gap appended. Drive result publication
+(copy/checksum/readback) runs in joined worker threads, allowing the other
+service and RAM sampler to run while a large source is published. Cancellation
+waits for publication before releasing the dataset lock. Reference disk accounting
+only scans the references result, rather than rescanning the paper's TeX tree.
+Request attempts are still durably checkpointed before network I/O.
+
+After stopping the previous crawler, pull the update and restart Python before
+importing it. Keep the existing persistent root, range, journal and services.json.
+Resume skips terminal jobs; explicitly retry failed S2 jobs when ready:
+
+```bash
+PYTHONPATH=src python -m crawler.cli diagnose-references
+PYTHONPATH=src python -m crawler.cli retry-failed --stages s2
+PYTHONPATH=src python -m crawler.cli resume --stages s2
+```
+
+In Colab, after loading config, diagnostics can be called directly:
+
+```python
+from crawler.diagnostics import diagnose_references
+print(diagnose_references(config))
+```
+
+Diagnostics read existing event logs and report HTTP counts (especially 429),
+request time, wait time and remaining persisted cooldown. New logs also record
+completed paper snapshots and the actual number of reference entries. A
+references succeeded count in status means papers with a complete snapshot,
+not the number of referenced publications. These counters must not be confused.
+No local dataset/run logs were available during this investigation, so the
+specific cause of an existing Colab session's slowdown requires its diagnostics.
+This patch has no live Colab throughput benchmark.
+
+
+Details of the reference-page recovery and S2 dispatch-pacing update:
+[change report](docs/reference-resume-and-s2-pacing.md).

@@ -12,10 +12,19 @@ from .storage import atomic_json, digest
 PAYLOAD_CODES={'Truncated gzip':'payload_gzip_truncated','Unrecognized source payload':'payload_unrecognized','Invalid gzip':'payload_invalid_gzip','Invalid tar':'payload_invalid_tar','Unsafe archive member':'payload_unsafe_member','Non-regular archive member':'payload_nonregular_member','Truncated archive member':'payload_truncated_member'}
 
 class Scheduler:
-    def __init__(self,config,store,client,now=time.time,sleep=asyncio.sleep,api_key=None,metrics=None):
+    def __init__(self,config,store,client,now=time.time,sleep=asyncio.sleep,api_key=None,metrics=None,monotonic=None):
         self.config=config; self.store=store; self.client=client; self.now=now; self.sleep=sleep; self.api_key=api_key; self.metrics=metrics
+        # Injected wall clocks also serve as elapsed clocks in deterministic tests.
+        self.monotonic=monotonic or (time.monotonic if now is time.time else now)
+        self.s2_next_send=0.
         self.path=store.root/'progress'/'services.json'
         self.state=json.loads(self.path.read_text()) if self.path.exists() else {s:dict(deadline=0,backoff=0,recent=[]) for s in ('arxiv','s2')}
+        if self.state['s2'].get('dispatch_pending'):
+            # A crash may have occurred after send but before its timestamp was saved.
+            gap=config.network['s2_key_gap_seconds' if api_key else 's2_anonymous_gap_seconds']
+            self.state['s2']['deadline']=max(self.state['s2']['deadline'],self.now()+gap)
+            if self.state['s2']['recent']:
+                self.state['s2']['recent'][-1]=self.now()
         self.locks={s:asyncio.Lock() for s in ('arxiv','s2')}; self.stopped=set()
     def event(self,name,**fields):
         if self.metrics: self.metrics.record(name,**fields)
@@ -45,7 +54,7 @@ class Scheduler:
         primary_key = batch_keys[0]
         def emit(name,**fields):
             fields.pop('job',None)
-            self.event(name,job=primary_key,jobs=batch_keys,**fields)
+            self.event(name,job=primary_key,jobs=batch_keys,service=service,**{k:v for k,v in fields.items() if k!='service'})
 
         async with self.locks[service]:
             emit('queue_acquired',job = primary_key,seconds=time.monotonic()-queued)
@@ -61,6 +70,8 @@ class Scheduler:
                 self.store.start_attempts(batch_keys)
                 if service == 's2':
                     state['recent'].append(self.now())
+                    # Reserve before send; resume treats an interrupted dispatch conservatively.
+                    state['dispatch_pending']=True
                 self.persist()
                 headers={'User-Agent':net['user_agent']}
                 if service=='s2' and self.api_key: headers['x-api-key']=self.api_key
@@ -68,11 +79,22 @@ class Scheduler:
                 started=time.monotonic()
                 emit('request_start',job = primary_key, service=service,attempt=self.store.get(primary_key)['attempts'],journal_directory_sync=self.store.journal.directory_sync_supported)
                 try:
+                    if service=='s2':
+                        # Check again AFTER durable writes/logging; their latency can vary.
+                        while self.monotonic()<self.s2_next_send or self.now()<deadline:
+                            remaining=max(self.s2_next_send-self.monotonic(),deadline-self.now(),0)
+                            await self.wait(self.now()+remaining,primary_key,reason='dispatch_pacing',jobs=batch_keys)
+                        sent_at=self.now()
+                        self.s2_next_send=self.monotonic()+gap
+                        state['deadline']=max(state['deadline'],sent_at+gap)
+                        state['recent'][-1]=sent_at
                     async with self.client.stream('GET',url,params=params,headers=headers,follow_redirects=False) as response:
                         code=response.status_code
                         retry_after=parse_retry_after(response.headers.get('Retry-After'),datetime.fromtimestamp(self.now(),timezone.utc))
                         if code==429:
                             state['backoff'] = state['backoff']*2 or 60
+                            if service=='s2':
+                                state['backoff'] = min(state['backoff'],net['s2_max_backoff_seconds'])
                             state['deadline'] = max(state['deadline'],self.now()+(retry_after if retry_after is not None else state['backoff']))
                         else:
                             state['backoff'] = 0
@@ -155,7 +177,10 @@ class Scheduler:
                     code=0
                     error_code = PAYLOAD_CODES.get(str(exc),'payload_'+type(exc).__name__)
                 finally:
-                    state['deadline'] = max(state['deadline'], self.now()+gap)
+                    if service!='s2':
+                        state['deadline'] = max(state['deadline'], self.now()+gap)
+                    # Cleared only when the actual dispatch timestamp/cooldown is persisted.
+                    if service=='s2': state['dispatch_pending']=False
                     self.persist()
                     emit(
                         'request_end', job=primary_key,

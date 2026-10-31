@@ -13,7 +13,7 @@ from .locking import DatasetLock
 
 def main():
     parser=argparse.ArgumentParser()
-    parser.add_argument('command',choices=['init','run','resume','status','retry-failed','recheck-not-found','refresh-discovery','refresh-references','diagnose','export'])
+    parser.add_argument('command',choices=['init','run','resume','status','retry-failed','recheck-not-found','refresh-discovery','refresh-references','diagnose','diagnose-references','export'])
     parser.add_argument('--config',type=Path,default=Path('config/crawler.yaml'))
     parser.add_argument('--run-id')
     parser.add_argument('--limit',type=int,default=None)
@@ -26,6 +26,9 @@ def main():
     elif args.command=='diagnose':
         from .diagnostics import diagnose_sources
         result=diagnose_sources(config)
+    elif args.command=='diagnose-references':
+        from .diagnostics import diagnose_references
+        result=diagnose_references(config)
     elif args.command=='status': result=ProgressStore(config.paths['persistent_root']).status_counts()
     else:
         with DatasetLock(config.paths['persistent_root'],'admin-'+uuid.uuid4().hex,args.takeover_stale):

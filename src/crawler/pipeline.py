@@ -53,6 +53,16 @@ async def _run_pipeline(config,stages=None,resume=True,*,limit=None,takeover_sta
     scratch=Path(config.paths['scratch_root'])/run_id
     log('Startup: preparing scratch directory')
     scratch.mkdir(parents=True,exist_ok=True)
+    async def publish(key, staging, status='succeeded'):
+        # Slow Drive copies/checksums must not block the other service or RAM sampler.
+        # Join the writer on cancellation before releasing the dataset lock.
+        task=asyncio.create_task(asyncio.to_thread(store.storage.commit,key,staging,status))
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
+
     async def metadata_batch(keys,scheduler):
         identifiers=[f'{key[0]}v{key[1]}' for key in keys]
         artifact=await scheduler.request(keys,'arxiv','https://export.arxiv.org/api/query',params={'id_list':','.join(identifiers),'max_results':len(keys)},validate=lambda raw:(raw,parse_version_batch(raw,identifiers)))
@@ -67,7 +77,7 @@ async def _run_pipeline(config,stages=None,resume=True,*,limit=None,takeover_sta
             atomic_json(staging/'normalized.json',parsed)
             before=time.monotonic()
             status='not_found' if parsed.get('not_found') else 'succeeded'
-            store.storage.commit(key,staging,status)
+            await publish(key,staging,status)
             metrics.touch(store.storage.paper_dir(key[0]),staging)
             metrics.record('commit',job=key,seconds=time.monotonic()-before)
             shutil.rmtree(staging); metrics.touch(staging)
@@ -108,7 +118,7 @@ async def _run_pipeline(config,stages=None,resume=True,*,limit=None,takeover_sta
             if result:
                 response_info=archive.with_suffix('.response.json')
                 if response_info.exists(): shutil.copyfile(response_info,staging/'response.json')
-                before=time.monotonic(); store.storage.commit(key,staging,result['status']); store.finish(key,result['status']); archive.unlink(missing_ok=True)
+                before=time.monotonic(); await publish(key,staging,result['status']); store.finish(key,result['status']); archive.unlink(missing_ok=True)
                 metrics.record('commit',job=key,seconds=time.monotonic()-before)
                 metrics.touch(store.storage.paper_dir(key[0]),archive,staging,root/'progress')
                 shutil.rmtree(staging); metrics.touch(staging)
@@ -130,15 +140,18 @@ async def _run_pipeline(config,stages=None,resume=True,*,limit=None,takeover_sta
                 store.add(key); store.save()
                 page_path=staging/f'page-{offset:06d}.json'
                 marker_path=staging/f'page-{offset:06d}.complete.json'
-                cached=False
+                page=None
                 if marker_path.exists() and page_path.exists():
                     try:
                         marker=json.loads(marker_path.read_text())
-                        cached=marker.get('sha256')==digest(page_path) and marker.get('fingerprint')==fingerprint
-                    except (OSError,ValueError): cached=False
-                if cached:
-                    raw=page_path.read_bytes(); page=parse_page(raw,offset)
-                else:
+                        raw=page_path.read_bytes()
+                        if marker.get('sha256')==hashlib.sha256(raw).hexdigest() and marker.get('fingerprint')==fingerprint:
+                            page=parse_page(raw,offset)
+                    except (OSError,ValueError,TypeError,AttributeError): page=None
+                if page is None:
+                    if not store.recover_reference_page(key):
+                        store.finish(base,'failed','integrity_missing_result')
+                        break
                     raw=await scheduler.request(key,'s2',f'https://api.semanticscholar.org/graph/v1/paper/ARXIV:{paper}/references',params={'fields':FIELDS,'limit':config.network['s2_page_size'],'offset':offset},validate=lambda raw:(raw,parse_page(raw,offset)))
                     if raw is None:
                         store.finish(base,'not_found' if store.get(key)['status']=='not_found' else 'failed',store.get(key)['error'] or 'missing_page_result'); break
@@ -151,9 +164,11 @@ async def _run_pipeline(config,stages=None,resume=True,*,limit=None,takeover_sta
                 refs.extend(page['references']); unresolved+=page['unresolved_count']
                 if page['next'] is None:
                     atomic_json(staging/'normalized.json',dict(references=refs,unresolved_count=unresolved,fetched_at=utc_now(),query_fingerprint=fingerprint))
-                    before=time.monotonic(); store.storage.commit(base,staging); store.reference_counts[paper]=len(refs); store.finish(base,'succeeded')
-                    metrics.touch(store.storage.paper_dir(base[0]),root/'progress')
+                    before=time.monotonic(); await publish(base,staging); store.reference_counts[paper]=len(refs); store.finish(base,'succeeded')
+                    metrics.touch(store.storage.result_dir(base),root/'progress')
                     metrics.record('commit',job=base,seconds=time.monotonic()-before)
+                    metrics.record('reference_snapshot',job=base,service='s2',references=len(refs))
+                    log(f'S2: {paper} complete, {len(refs)} references')
                     break
                 offset=page['next']
                 
@@ -181,7 +196,7 @@ async def _run_pipeline(config,stages=None,resume=True,*,limit=None,takeover_sta
             atomic_json(staging/'normalized.json',parsed)
             before=time.monotonic()
             status='not_found' if parsed.get('not_found') else 'succeeded'
-            store.storage.commit(key,staging,status)
+            await publish(key,staging,status)
             # Marker first, then version rows, then terminal CSV state. Recovery
             # reconstructs missing rows from any valid discovery marker.
             for version in range(1,parsed.get('version',0)+1):

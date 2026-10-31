@@ -7,7 +7,7 @@ from .ids import generate_ids
 class CrawlerConfig:
     range: dict = field(default_factory=lambda: dict(start_month='2025-04',start_id=2523,end_month='2025-04',end_id=7522))
     paths: dict = field(default_factory=lambda: dict(persistent_root='runtime',scratch_root='runtime/temp'))
-    network: dict = field(default_factory=lambda: dict(connect_timeout_seconds=20,read_timeout_seconds=120,max_attempts=3,discovery_batch_size=50,metadata_batch_size=50,retry_delays_seconds=[10,30],arxiv_gap_seconds=3.0,s2_key_gap_seconds=1.1,s2_anonymous_gap_seconds=3.1,s2_anonymous_window_seconds=300,s2_anonymous_window_requests=100,s2_page_size=100,user_agent='HCMUS-DS-Course-Crawler/1.0'))
+    network: dict = field(default_factory=lambda: dict(connect_timeout_seconds=20,read_timeout_seconds=120,max_attempts=3,discovery_batch_size=50,metadata_batch_size=50,retry_delays_seconds=[10,30],arxiv_gap_seconds=3.0,s2_key_gap_seconds=1.1,s2_anonymous_gap_seconds=3.1,s2_anonymous_window_seconds=300,s2_anonymous_window_requests=100,s2_page_size=100,s2_max_backoff_seconds=300,user_agent='HCMUS-DS-Course-Crawler/1.0'))
     execution: dict = field(default_factory=lambda: dict(queue_capacity=100,ram_sample_seconds=1,disk_sample_seconds=10,allow_anonymous_s2=False,max_member_bytes=268435456,max_unpacked_bytes=1073741824,min_free_disk_bytes=1073741824))
     schema_version: int = 1
 
@@ -18,7 +18,7 @@ class CrawlerConfig:
         if self.schema_version!=1: raise ValueError('Unsupported config schema')
         for name in ('queue_capacity','max_member_bytes','max_unpacked_bytes','ram_sample_seconds','disk_sample_seconds'):
             if self.execution[name]<=0: raise ValueError(f'{name} must be positive')
-        for name in ('connect_timeout_seconds','read_timeout_seconds','s2_key_gap_seconds','s2_anonymous_gap_seconds','s2_anonymous_window_seconds','s2_anonymous_window_requests'):
+        for name in ('connect_timeout_seconds','read_timeout_seconds','s2_key_gap_seconds','s2_anonymous_gap_seconds','s2_anonymous_window_seconds','s2_anonymous_window_requests','s2_max_backoff_seconds'):
             if self.network[name]<=0: raise ValueError(f'{name} must be positive')
         if len(self.network['retry_delays_seconds'])!=2 or any(v<0 for v in self.network['retry_delays_seconds']): raise ValueError('Expected two nonnegative retry delays')
         generate_ids(**self.range)
