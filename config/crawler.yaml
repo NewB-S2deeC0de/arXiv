@@ -14,3 +14,8 @@ network:
   metadata_batch_size: 50
 execution:
   allow_anonymous_s2: false
+  progress_queue_capacity: 100
+  s2_publish_queue_capacity: 8
+  s2_publish_queue_bytes: 33554432  # Includes the active publication (32 MiB).
+  s2_response_max_bytes: 8388608   # One extra response may await queue admission (8 MiB).
+  s2_snapshot_max_bytes: 67108864  # Raw pages per version (64 MiB).

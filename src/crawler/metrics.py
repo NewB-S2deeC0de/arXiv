@@ -98,6 +98,8 @@ class MetricsRecorder:
         paper_rows=[]
         for paper,start in self.paper_start.items():
             rows=[r for k,r in store.rows.items() if k[0]==paper and (k[2]!='references' or k[3]==0)] if store else []
+            if any(r['stage']=='references' and r['version']>0 for r in rows):
+                rows=[r for r in rows if r['stage']!='references' or r['version']>0]
             complete=bool(rows) and all(r['status'] in ('succeeded','no_tex','not_found','failed') for r in rows)
             paper_rows.append(dict(arxiv_id=paper,run_id=self.run_id,elapsed_seconds=self.paper_end[paper]-start,complete=complete))
         with (self.directory/'paper_metrics.csv').open('w',newline='',encoding='utf8') as f:
@@ -124,7 +126,9 @@ class MetricsRecorder:
             counts=store.status_counts()
             def rate(n,d): return dict(numerator=n,denominator=d,value=n/d if d else None)
             papers=sum(counts['discovery'].values()); versions=sum(counts['source'].values())
-            queried=sum(1 for k,r in store.rows.items() if k[2]=='references' and k[3]==0 and r['total']>0)
+            versioned='legacy_references' in counts
+            queried=sum(1 for k,r in store.rows.items() if k[2]=='references' and k[3]==0 and r['total']>0 and (not versioned or k[1]>0))
+            summary['reference_unit']='arxiv_version' if versioned else 'paper_legacy'
             summary['rates']=dict(metadata_success=rate(counts['discovery'].get('succeeded',0),papers),source_coverage=rate(counts['source'].get('succeeded',0)+counts['source'].get('no_tex',0),versions),tex_availability=rate(counts['source'].get('succeeded',0),versions),s2_query_success=rate(counts['references'].get('succeeded',0),queried))
         atomic_json(self.directory/'summary.json',summary)
         self.resources.close(); self.log.close()

@@ -24,9 +24,10 @@ async def join(task):
 
 
 class ThreadWorker:
-    def __init__(self, capacity=100, max_bytes=None, name='filesystem'):
+    def __init__(self, capacity=100, max_bytes=None, name='filesystem', async_handler=False):
         if capacity < 1 or (max_bytes is not None and max_bytes < 1):
             raise ValueError('Worker budgets must be positive')
+        self.async_handler = async_handler
         self.capacity = capacity
         self.max_bytes = max_bytes
         self.name = name
@@ -36,8 +37,13 @@ class ThreadWorker:
         self.peak_items = 0
         self._queue = deque()
         self._condition = asyncio.Condition()
+        self._failed_event = asyncio.Event()
         self._closing = False
         self._error = None
+
+    @property
+    def failed(self):
+        return self._error is not None
 
     async def __aenter__(self):
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=self.name)
@@ -78,10 +84,11 @@ class ThreadWorker:
                     return
                 function, weight, future = self._queue.popleft()
             try:
-                result = await asyncio.get_running_loop().run_in_executor(self._executor, function)
+                result = await function() if self.async_handler else await asyncio.get_running_loop().run_in_executor(self._executor, function)
             except BaseException as exc:
                 async with self._condition:
                     self._error = exc
+                    self._failed_event.set()
                     future.set_exception(exc)
                     while self._queue:
                         _, _, pending = self._queue.popleft()
@@ -96,6 +103,10 @@ class ThreadWorker:
                     self.used_bytes -= weight
                     self._condition.notify_all()
 
+    async def wait_failure(self):
+        await self._failed_event.wait()
+        raise self._error
+
     async def close(self):
         async with self._condition:
             self._closing = True
@@ -108,4 +119,8 @@ class ThreadWorker:
             raise self._error
 
     async def __aexit__(self, exc_type, exc, tb):
-        await self.close()
+        try:
+            await self.close()
+        except BaseException:
+            # Do not replace the TaskGroup traceback with the same worker error.
+            if exc is None or self._error is None: raise

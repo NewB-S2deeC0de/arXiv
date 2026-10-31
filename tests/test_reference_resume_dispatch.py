@@ -10,6 +10,7 @@ from crawler.pipeline import run_pipeline
 from crawler.progress import ProgressStore
 from crawler.scheduler import Scheduler
 from crawler.semantic_scholar import FIELDS
+from crawler.reference_worker import query_identity
 from crawler.storage import atomic_json, digest
 
 
@@ -19,10 +20,10 @@ def test_resume_repairs_completed_page_without_resetting_budget(tmp_path, monkey
     config=CrawlerConfig(); config.range['end_id']=2523
     config.execution['allow_anonymous_s2']=True
     store=ProgressStore('runtime'); paper='2504.02523'
-    store.initialize([paper]); base=(paper,0,'references',0); page=(paper,0,'references',100)
+    store.initialize([paper]); base=(paper,1,'references',0); page=(paper,1,'references',100); store.add(base)
     store.start_attempt(base); store.add(page); store.start_attempt(page); store.finish(page,'succeeded')
-    fingerprint=hashlib.sha256(f'{FIELDS}:100'.encode()).hexdigest()
-    directory=store.storage.paper_dir(paper)/'reference-staging'/fingerprint
+    fingerprint=query_identity(base[0],1,100)[1]
+    directory=store.reference_cache_root(paper,1)/fingerprint
     directory.mkdir(parents=True)
     for offset, data in [(0, {'data':[], 'next':100}), (100, {'data':[], 'next':200})]:
         raw=directory/f'page-{offset:06d}.json'
@@ -54,12 +55,13 @@ def test_exhausted_missing_page_does_not_stop_other_papers(tmp_path, monkeypatch
     monkeypatch.chdir(tmp_path)
     config=CrawlerConfig(); config.range['end_id']=2524; config.execution['allow_anonymous_s2']=True
     store=ProgressStore('runtime'); ids=['2504.02523','2504.02524']; store.initialize(ids)
-    base=(ids[0],0,'references',0); page=(ids[0],0,'references',100)
+    base=(ids[0],1,'references',0); page=(ids[0],1,'references',100)
+    for paper in ids: store.add((paper,1,'references',0))
     store.start_attempt(base); store.add(page)
     for _ in range(3): store.start_attempt(page)
     store.finish(page,'succeeded')
-    fingerprint=hashlib.sha256(f'{FIELDS}:100'.encode()).hexdigest()
-    directory=store.storage.paper_dir(ids[0])/'reference-staging'/fingerprint; directory.mkdir(parents=True)
+    fingerprint=query_identity(base[0],1,100)[1]
+    directory=store.reference_cache_root(ids[0],1)/fingerprint; directory.mkdir(parents=True)
     raw=directory/'page-000000.json'; raw.write_text('{"data":[],"next":100}')
     atomic_json(directory/'page-000000.complete.json',dict(sha256=digest(raw),fingerprint=fingerprint))
     calls=[]
@@ -68,7 +70,7 @@ def test_exhausted_missing_page_does_not_stop_other_papers(tmp_path, monkeypatch
     restored=ProgressStore('runtime')
     assert restored.get(base)['status']=='failed'
     assert restored.get(page)['attempts']==3 and restored.get(page)['total']==3
-    assert restored.get((ids[1],0,'references',0))['status']=='succeeded'
+    assert restored.get((ids[1],1,'references',0))['status']=='succeeded'
     assert len(calls)==1 and ids[1] in calls[0]
 
 

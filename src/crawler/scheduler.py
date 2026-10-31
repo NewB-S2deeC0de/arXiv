@@ -1,18 +1,21 @@
 """Single-flight service schedulers with durable attempt and cooldown accounting."""
 import asyncio
+import copy
 import json
 import shutil
 import time
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlsplit
 import httpx
+from .workers import join
 from .retry import parse_retry_after
 from .storage import atomic_json, digest
 
 PAYLOAD_CODES={'Truncated gzip':'payload_gzip_truncated','Unrecognized source payload':'payload_unrecognized','Invalid gzip':'payload_invalid_gzip','Invalid tar':'payload_invalid_tar','Unsafe archive member':'payload_unsafe_member','Non-regular archive member':'payload_nonregular_member','Truncated archive member':'payload_truncated_member'}
 
 class Scheduler:
-    def __init__(self,config,store,client,now=time.time,sleep=asyncio.sleep,api_key=None,metrics=None,monotonic=None):
+    def __init__(self,config,store,client,now=time.time,sleep=asyncio.sleep,api_key=None,metrics=None,monotonic=None,progress_worker=None,metrics_worker=None,io_worker=None):
+        self.progress_worker=progress_worker; self.metrics_worker=metrics_worker; self.io_worker=io_worker
         self.config=config; self.store=store; self.client=client; self.now=now; self.sleep=sleep; self.api_key=api_key; self.metrics=metrics
         # Injected wall clocks also serve as elapsed clocks in deterministic tests.
         self.monotonic=monotonic or (time.monotonic if now is time.time else now)
@@ -29,13 +32,32 @@ class Scheduler:
     def event(self,name,**fields):
         if self.metrics: self.metrics.record(name,**fields)
     def persist(self): atomic_json(self.path,self.state)
+    async def store_call(self,name,*args):
+        method=getattr(self.store,name)
+        if self.progress_worker:
+            return await self.progress_worker.call(lambda: copy.deepcopy(method(*args)))
+        return method(*args)
+    async def persist_async(self):
+        if self.progress_worker:
+            await self.progress_worker.call(atomic_json,self.path,copy.deepcopy(self.state))
+        else: self.persist()
+    async def event_async(self,name,**fields):
+        if self.metrics_worker: await self.metrics_worker.call(self.event,name,**fields)
+        else: self.event(name,**fields)
+    async def metric(self,name,*args,**kwargs):
+        if not self.metrics: return
+        if self.metrics_worker: return await self.metrics_worker.call(getattr(self.metrics,name),*args,**kwargs)
+        return getattr(self.metrics,name)(*args,**kwargs)
+    async def io(self,function,*args,**kwargs):
+        if self.io_worker: return await self.io_worker.call(function,*args,**kwargs)
+        return function(*args,**kwargs)
     async def wait(self,deadline,job=None,reason='service_cooldown',jobs=None):
         while self.now()<deadline:
             duration=min(30,deadline-self.now())
-            self.event('waiting',job=job,jobs=jobs,reason=reason,remaining_seconds=deadline-self.now())
+            await self.event_async('waiting',job=job,jobs=jobs,reason=reason,remaining_seconds=deadline-self.now())
             before=time.monotonic()
             await self.sleep(duration)
-            self.event('wait_end',job=job,jobs=jobs,reason=reason,seconds=time.monotonic()-before)
+            await self.event_async('wait_end',job=job,jobs=jobs,reason=reason,seconds=time.monotonic()-before)
     async def request(self, key, service, url, params=None, target=None, validate=None):
         if service in self.stopped:
             return None
@@ -47,18 +69,18 @@ class Scheduler:
 
         batch_keys = key if isinstance(key, list) else [key]
         if not batch_keys or len(set(batch_keys))!=len(batch_keys): raise ValueError('Expected distinct job keys')
-        attempts={self.store.get(k)['attempts'] for k in batch_keys}
+        attempts={(await self.store_call('get',k))['attempts'] for k in batch_keys}
         if len(attempts)!=1: raise ValueError('Batch members must have the same attempt count')
         if len(batch_keys)>1 and (service!='arxiv' or len({k[2] for k in batch_keys})!=1 or any(k[2] not in ('discovery','metadata') for k in batch_keys)):
             raise ValueError('Batch requests support homogeneous arXiv metadata stages only')
         primary_key = batch_keys[0]
-        def emit(name,**fields):
+        async def emit(name,**fields):
             fields.pop('job',None)
-            self.event(name,job=primary_key,jobs=batch_keys,service=service,**{k:v for k,v in fields.items() if k!='service'})
+            await self.event_async(name,job=primary_key,jobs=batch_keys,service=service,**{k:v for k,v in fields.items() if k!='service'})
 
         async with self.locks[service]:
-            emit('queue_acquired',job = primary_key,seconds=time.monotonic()-queued)
-            while self.store.get(primary_key)['attempts']<3:
+            await emit('queue_acquired',job = primary_key,seconds=time.monotonic()-queued)
+            while (await self.store_call('get',primary_key))['attempts']<3:
                 state['recent'] = [
                     t for t in state['recent']
                     if t > self.now()-net['s2_anonymous_window_seconds']]
@@ -67,17 +89,17 @@ class Scheduler:
                     deadline = max(
                         deadline, state['recent'][0] + net['s2_anonymous_window_seconds'])
                 await self.wait(deadline, primary_key,jobs=batch_keys)
-                self.store.start_attempts(batch_keys)
+                await self.store_call('start_attempts',batch_keys)
                 if service == 's2':
                     state['recent'].append(self.now())
                     # Reserve before send; resume treats an interrupted dispatch conservatively.
                     state['dispatch_pending']=True
-                self.persist()
+                await self.persist_async()
                 headers={'User-Agent':net['user_agent']}
                 if service=='s2' and self.api_key: headers['x-api-key']=self.api_key
                 code=0; error_code='unknown'; received=0; redirected=False
                 started=time.monotonic()
-                emit('request_start',job = primary_key, service=service,attempt=self.store.get(primary_key)['attempts'],journal_directory_sync=self.store.journal.directory_sync_supported)
+                await emit('request_start',job = primary_key, service=service,attempt=(await self.store_call('get',primary_key))['attempts'],journal_directory_sync=self.store.journal.directory_sync_supported)
                 try:
                     if service=='s2':
                         # Check again AFTER durable writes/logging; their latency can vary.
@@ -100,20 +122,20 @@ class Scheduler:
                             state['backoff'] = 0
                             if retry_after is not None:
                                 state['deadline'] = max(state['deadline'],self.now()+  retry_after)
-                        self.persist()
+                        await self.persist_async()
 
                         if code in (301, 302, 303, 307, 308):
                             location=response.headers.get('Location','')
                             redirect=urljoin(str(response.url),location)
                             parsed=urlsplit(redirect)
                             if not location or parsed.scheme!='https' or parsed.hostname!=expected_host or parsed.username or parsed.password:
-                                self.store.finish_many([(k,'failed','redirect_disallowed') for k in batch_keys])
+                                await self.store_call('finish_many',[(k,'failed','redirect_disallowed') for k in batch_keys])
                                 return None
-                            emit('redirect',job=primary_key,host=parsed.hostname)
+                            await emit('redirect',job=primary_key,host=parsed.hostname)
                             url=redirect; params=None; redirected=True
                         elif code==200:
                             if target:
-                                target.parent.mkdir(parents=True,exist_ok=True)
+                                await self.io(target.parent.mkdir,parents=True,exist_ok=True)
                                 metadata = dict(
                                     status_code=code,
                                     content_type=response.headers.get('content-type'),
@@ -122,28 +144,40 @@ class Scheduler:
                                     effective_url=str(response.url.copy_with(query=None)),
                                     bytes_received=0,
                                     complete=False)
-                                atomic_json(target.with_suffix('.response.json'),metadata)
-                                with target.open('wb') as f:
+                                await self.io(atomic_json,target.with_suffix('.response.json'),metadata)
+                                f=await self.io(target.open,'wb')
+                                try:
                                     # Preserve the actual compressed entity; extraction owns gzip validation.
                                     async for chunk in response.aiter_raw():
-                                        if shutil.disk_usage(target.parent).free < len(chunk) + self.config.execution['min_free_disk_bytes']:
+                                        if (await self.io(shutil.disk_usage,target.parent)).free < len(chunk) + self.config.execution['min_free_disk_bytes']:
                                             raise OSError('Insufficient disk space during download')
-                                        f.write(chunk)
+                                        await self.io(f.write,chunk)
                                         received+=len(chunk)
-                                        if self.metrics: self.metrics.touch(target)
+                                finally:
+                                    await self.io(f.close)
                                 metadata.update(
                                     bytes_received = received,
                                     complete = True,
-                                    sha256 = digest(target),
+                                    sha256 = await self.io(digest,target),
                                     download_seconds = time.monotonic()-started
                                 )
-                                atomic_json(target.with_suffix('.response.json'),metadata)
+                                await self.io(atomic_json,target.with_suffix('.response.json'),metadata)
                                 result=target
                             else:
-                                result = await response.aread()
-                                received=len(result)
+                                if service=='s2':
+                                    chunks=[]
+                                    async for chunk in response.aiter_bytes():
+                                        received+=len(chunk)
+                                        if received>self.config.execution['s2_response_max_bytes']:
+                                            await self.store_call('finish_many',[(k,'failed','resource_limit') for k in batch_keys])
+                                            return None
+                                        chunks.append(chunk)
+                                    result=b''.join(chunks)
+                                else:
+                                    result = await response.aread()
+                                    received=len(result)
 
-                            emit(
+                            await emit(
                                 'download_end', job = primary_key,
                                 bytes_received = received,
                                 seconds = time.monotonic()-started
@@ -152,12 +186,8 @@ class Scheduler:
                             if validate:
                                 extract_started = time.monotonic()
                                 task = asyncio.create_task(asyncio.to_thread(validate, result))
-                                try:
-                                    result = await asyncio.shield(task)
-                                except asyncio.CancelledError:
-                                    await task
-                                    raise
-                                emit(
+                                result = await join(task)
+                                await emit(
                                     'validation_end', job = key,
                                     seconds = time.monotonic() - extract_started
                                 )
@@ -165,7 +195,7 @@ class Scheduler:
                         elif code not in (408,429) and code<500:
                             if code in (401,403):
                                 self.stopped.add(service)
-                            self.store.finish_many([(k,'not_found' if code==404 else 'failed',f'http_{code}') for k in batch_keys])
+                            await self.store_call('finish_many',[(k,'not_found' if code==404 else 'failed',f'http_{code}') for k in batch_keys])
                             return None
                 except httpx.TransportError as exc:
                     code=0;
@@ -181,8 +211,8 @@ class Scheduler:
                         state['deadline'] = max(state['deadline'], self.now()+gap)
                     # Cleared only when the actual dispatch timestamp/cooldown is persisted.
                     if service=='s2': state['dispatch_pending']=False
-                    self.persist()
-                    emit(
+                    await self.persist_async()
+                    await emit(
                         'request_end', job=primary_key,
                         service = service, status_code = code,
                         error_code = error_code if code == 0 else None,
@@ -190,22 +220,22 @@ class Scheduler:
                         seconds = time.monotonic()-started
                     )
                     if self.metrics:
-                        if target: self.metrics.touch(target,target.with_suffix('.response.json'))
-                        self.metrics.touch(self.store.root/'progress')
-                        self.metrics.sample(force_disk=True)
+                        if target: await self.metric('touch',target,target.with_suffix('.response.json'))
+                        await self.metric('touch',self.path,self.store.journal.path)
+                        await self.metric('sample',force_disk=True)
 
-                attempt=self.store.get(primary_key)['attempts']
+                attempt=(await self.store_call('get',primary_key))['attempts']
                 if attempt<3:
                     if not redirected:
                         delay = net['retry_delays_seconds'][attempt-1]
                         state['deadline'] = max(state['deadline'], self.now() + delay)
-                        self.persist()
-                        emit(
+                        await self.persist_async()
+                        await emit(
                             'retry', job=primary_key,
                             error_code=f'http_{code}' if code else error_code,
                             backoff_seconds = delay)
                 else:
-                    self.store.finish_many([(k,'failed',f'http_{code}' if code else error_code) for k in batch_keys])
-            unfinished=[(k,'failed','attempts_exhausted') for k in batch_keys if self.store.get(k)['status'] in ('pending','running')]
-            if unfinished: self.store.finish_many(unfinished)
+                    await self.store_call('finish_many',[(k,'failed',f'http_{code}' if code else error_code) for k in batch_keys])
+            unfinished=[(k,'failed','attempts_exhausted') for k in batch_keys if (await self.store_call('get',k))['status'] in ('pending','running')]
+            if unfinished: await self.store_call('finish_many',unfinished)
             return None

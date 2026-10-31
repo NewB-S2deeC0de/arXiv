@@ -44,6 +44,7 @@ def test_slow_arxiv_publish_does_not_block_s2(tmp_path,monkeypatch):
     from crawler.storage import Storage
     monkeypatch.chdir(tmp_path)
     c=CrawlerConfig(); c.range['end_id']=2523; c.execution['allow_anonymous_s2']=True
+    store=ProgressStore('runtime'); store.initialize(['2504.02523']); store.add(('2504.02523',1,'references',0)); store.save()
     entered=threading.Event(); s2_seen=threading.Event(); observed=[]
     original=Storage.commit
     def commit(self,key,*args,**kwargs):

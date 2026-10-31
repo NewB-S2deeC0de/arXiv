@@ -61,3 +61,15 @@ def test_oversize_does_not_deadlock():
             with pytest.raises(ValueError,match='budget'): await worker.submit(lambda:None,weight=5)
             assert await worker.call(lambda:42)==42
     asyncio.run(run())
+
+
+def test_failure_monitor_interrupts_waiting_producer():
+    async def run():
+        worker=ThreadWorker()
+        await worker.__aenter__()
+        monitor=asyncio.create_task(worker.wait_failure())
+        def fail(): raise OSError('publisher failed')
+        await worker.submit(fail)
+        with pytest.raises(OSError): await asyncio.wait_for(monitor,1)
+        with pytest.raises(OSError): await worker.close()
+    asyncio.run(run())

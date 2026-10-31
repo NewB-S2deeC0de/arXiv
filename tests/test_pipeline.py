@@ -11,14 +11,16 @@ def test_broadcast(tmp_path,monkeypatch):
         seen.append(request.url.host)
         return httpx.Response(404)
     result=asyncio.run(run_pipeline(c,{'arxiv','s2'},False,limit=1,transport=httpx.MockTransport(handler)))
-    assert set(seen)=={'export.arxiv.org','api.semanticscholar.org'}
-    assert result['jobs']==2
+    assert set(seen)=={'export.arxiv.org'}  # No known versions after discovery 404.
+    assert result['jobs']==1
 
 def test_reference_page_resume(tmp_path,monkeypatch):
     import json
     from crawler.progress import ProgressStore
     monkeypatch.chdir(tmp_path)
     c=CrawlerConfig(); c.execution['allow_anonymous_s2']=True; c.range['end_id']=2523
+    store=ProgressStore('runtime'); store.initialize(['2504.02523'])
+    store.add(('2504.02523',1,'references',0)); store.save()
     calls=[]
     def handler(request):
         offset=int(request.url.params['offset']); calls.append(offset)

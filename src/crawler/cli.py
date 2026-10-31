@@ -43,7 +43,7 @@ def main():
                 stages=set()
                 if 'arxiv' in args.stages: stages.update(('discovery','metadata','source'))
                 if 's2' in args.stages: stages.add('references')
-                if args.command=='init': store.initialize(ids)
+                if args.command=='init': store.initialize(ids,versioned=True)
                 elif args.command=='retry-failed': store.reset('failed',stages,selected)
                 elif args.command=='recheck-not-found': store.reset('not_found',stages,selected)
                 elif args.command=='refresh-discovery': store.refresh('discovery',selected)
