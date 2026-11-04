@@ -14,6 +14,7 @@ class ParseNode:
     source_spans: list[SourceSpan]
     children: list['ParseNode'] = field(default_factory=list)
     attrs: dict = field(default_factory=dict)
+    content: str | None = None
     warnings: list[str] = field(default_factory=list)
 
 
@@ -45,9 +46,60 @@ _LEVELS = {'chapter': 1, 'section': 2, 'subsection': 3,
            'subsubsection': 4, 'paragraph': 5, 'subparagraph': 6}
 _LISTS = frozenset({'itemize', 'enumerate'})
 _OPAQUE_ENVS = frozenset({'figure', 'figure*', 'table', 'table*', 'equation',
-                          'equation*', 'align', 'align*', 'lstlisting', 'minted',
+                          'equation*', 'align', 'align*', 'algorithm', 'algorithm*',
+                          'lstlisting', 'minted',
                           'verbatim', 'verbatim*', 'comment'})
 _REFERENCES = frozenset({'references', 'bibliography'})
+
+
+def _environment_end(text, start, environment):
+    """Find the matching end command outside comments, verb and command arguments."""
+    if environment in ('verbatim', 'verbatim*', 'comment', 'lstlisting', 'minted'):
+        closing = f'\\end{{{environment}}}'
+        position = text.find(closing, start)
+        return None if position < 0 else position + len(closing)
+    depth = 1
+    i = start
+    while i < len(text):
+        if text[i] == '%':
+            newline = text.find('\n', i)
+            i = len(text) if newline < 0 else newline + 1
+            continue
+        if text[i] != '\\':
+            i += 1
+            continue
+        i += 1
+        command = _COMMAND_NAME.match(text, i)
+        if command:
+            name = command.group()
+            i = command.end()
+        elif i < len(text):
+            name = text[i]
+            i += 1
+        else:
+            break
+        if name == 'verb':
+            if i < len(text) and text[i] == '*': i += 1
+            if i < len(text):
+                closing = text.find(text[i], i + 1)
+                i = len(text) if closing < 0 else closing + 1
+            continue
+        arg_at = i
+        while arg_at < len(text) and text[arg_at].isspace(): arg_at += 1
+        end = _braced_end(text, arg_at)
+        if end is None: continue
+        argument = text[arg_at + 1:end - 1]
+        i = end
+        if name == 'begin' and argument in ('verbatim', 'verbatim*', 'comment', 'lstlisting', 'minted'):
+            literal_end = text.find(f'\\end{{{argument}}}', i)
+            if literal_end < 0: return None
+            i = literal_end + len(f'\\end{{{argument}}}')
+        elif argument == environment and name == 'begin':
+            depth += 1
+        elif argument == environment and name == 'end':
+            depth -= 1
+            if depth == 0: return i
+    return None
 
 
 def _tokens(text):
@@ -123,6 +175,15 @@ def _tokens(text):
         if name == 'appendix':
             yield name, start, i, None, False
             continue
+        if name == 'printbibliography':
+            end = i
+            while end < len(text) and text[end].isspace(): end += 1
+            if end < len(text) and text[end] == '[':
+                close = text.find(']', end + 1)
+                if close >= 0: end = close + 1
+            i = end
+            yield 'bibliography', start, end, None, False
+            continue
         if name == 'item':
             end = i
             while end < len(text) and text[end].isspace(): end += 1
@@ -147,17 +208,15 @@ def _tokens(text):
         argument = text[arg_at + 1:end - 1]
         i = end
         if name == 'begin' and argument in _OPAQUE_ENVS:
-            closing = f'\\end{{{argument}}}'
-            close = text.find(closing, i)
-            i = len(text) if close < 0 else close + len(closing)
-            yield ('protected' if close >= 0 else 'unclosed_protected',
+            close = _environment_end(text, i, argument)
+            i = len(text) if close is None else close
+            yield ('protected' if close is not None else 'unclosed_protected',
                    start, i, argument, False)
             continue
         if name == 'begin' and argument == 'thebibliography':
-            closing = r'\end{thebibliography}'
-            close = text.find(closing, i)
-            i = len(text) if close < 0 else close + len(closing)
-            yield ('bibliography' if close >= 0 else 'unclosed_protected',
+            close = _environment_end(text, i, argument)
+            i = len(text) if close is None else close
+            yield ('bibliography' if close is not None else 'unclosed_protected',
                    start, i, argument, False)
             continue
         if name in ('bibliography', 'addbibresource'):
@@ -302,7 +361,7 @@ def build_hierarchy(gathered: GatheredVersion) -> HierarchyResult:
         elif name == 'bibliography':
             bib_start = start
             if (len(headings) > 1 and headings[-1].attrs['title'].strip().lower() in _REFERENCES
-                    and not headings[-1].children):
+                    and all(child.kind == 'paragraph' for child in headings[-1].children)):
                 previous = headings.pop()
                 headings[-1].children.remove(previous)
                 bib_start = heading_starts[previous.occurrence_id]
@@ -314,6 +373,7 @@ def build_hierarchy(gathered: GatheredVersion) -> HierarchyResult:
         result.diagnostics.append(ParseDiagnostic('unclosed_list', 'List has no matching end', []))
     for heading in _walk(root):
         if heading.kind == 'heading' and heading.attrs['title'].strip().lower() in _REFERENCES:
+            result.status = 'partial'
             result.diagnostics.append(ParseDiagnostic(
                 'uncertain_references', 'References heading retained without a certain bibliography boundary',
                 heading.source_spans))

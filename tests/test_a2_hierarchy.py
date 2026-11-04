@@ -52,6 +52,7 @@ def test_bibliography_is_separate_but_uncertain_references_heading_is_kept(tmp_p
     assert r'\section*{References}' in result.bibliography[0].raw
     assert r'\bibitem{x}' in result.bibliography[0].raw
     uncertain = _tree(tmp_path, r'\documentclass{article}\begin{document}\section{References}Discussion.\end{document}')
+    assert uncertain.status == 'partial'
     assert uncertain.root.children[0].attrs['title'] == 'References'
     assert 'uncertain_references' in [d.code for d in uncertain.diagnostics]
 
@@ -159,3 +160,66 @@ def test_unclosed_bibliography_is_partial_and_keeps_raw(tmp_path):
     assert 'unclosed_protected' in [d.code for d in result.diagnostics]
     assert len(result.bibliography) == 0
     assert r'\bibitem{x}' in result.root.children[0].raw
+
+
+def test_algorithm_block_keeps_caption_blank_lines_and_fake_heading(tmp_path):
+    result = _tree(tmp_path, r'''\documentclass{article}\begin{document}\section{Method}
+\begin{algorithm}\caption{Training}
+
+\begin{algorithmic}\STATE Start\end{algorithmic}
+\section{Fake}\end{algorithm}\section{Real}Text.\end{document}''')
+    assert [n.attrs['title'] for n in result.root.children if n.kind == 'heading'] == ['Method', 'Real']
+    block = result.root.children[0].children
+    assert len(block) == 1 and r'\end{algorithm}' in block[0].raw
+
+
+def test_protected_end_in_comment_or_verb_is_not_a_real_terminator(tmp_path):
+    result = _tree(tmp_path, r'''\documentclass{article}\begin{document}
+\begin{figure}
+% \end{figure}
+\verb|\end{figure}|
+
+\caption{Actual}\end{figure}\section{After}Text.\end{document}''')
+    assert result.status == 'ready'
+    assert [n.attrs['title'] for n in result.root.children if n.kind == 'heading'] == ['After']
+    assert len(result.root.children[0:1]) == 1
+    assert r'\caption{Actual}' in result.root.children[0].raw
+
+
+def test_bibliography_end_in_comment_does_not_truncate_block(tmp_path):
+    result = _tree(tmp_path, r'''\documentclass{article}\begin{document}
+\section{References}\begin{thebibliography}{9}
+% \end{thebibliography}
+\bibitem{x} Real.\end{thebibliography}\section{After}More.\end{document}''')
+    assert result.status == 'ready'
+    assert len(result.bibliography) == 1
+    assert r'\bibitem{x} Real.' in result.bibliography[0].raw
+    assert [n.attrs['title'] for n in result.root.children if n.kind == 'heading'] == ['After']
+
+
+def test_references_intro_and_printbibliography_move_to_bib_block(tmp_path):
+    result = _tree(tmp_path, r'''\documentclass{article}\begin{document}
+\section{Body}Text.\section{References}
+Introductory references note.
+
+\printbibliography\section{After}More.\end{document}''')
+    assert [n.attrs['title'] for n in result.root.children if n.kind == 'heading'] == ['Body', 'After']
+    assert len(result.bibliography) == 1
+    assert 'Introductory references note.' in result.bibliography[0].raw
+    assert r'\printbibliography' in result.bibliography[0].raw
+
+
+def test_a2_keeps_raw_immutable_and_leaves_content_for_b1(tmp_path):
+    result = _tree(tmp_path, r'\documentclass{article}\begin{document}\section{Intro}Raw text.\end{document}')
+    heading = result.root.children[0]
+    assert heading.raw == r'\section{Intro}'
+    assert heading.content is None
+    assert heading.children[0].raw == 'Raw text.'
+    assert heading.children[0].content is None
+
+
+def test_literal_verbatim_does_not_nest_on_printed_begin_command(tmp_path):
+    result = _tree(tmp_path, r'''\documentclass{article}\begin{document}
+\begin{verbatim}\begin{verbatim} printed text\end{verbatim}\section{After}Done.\end{document}''')
+    assert result.status == 'ready'
+    assert [n.attrs['title'] for n in result.root.children if n.kind == 'heading'] == ['After']

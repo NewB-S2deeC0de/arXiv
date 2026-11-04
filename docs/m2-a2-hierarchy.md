@@ -11,7 +11,8 @@ have `attrs.level` (`chapter=1`, `section=2`, `subsection=3`,
 nodes own `item` nodes, including nested lists. Text between structural
 commands becomes raw `paragraph` nodes; A3 will split it into finer leaves.
 Each node has a deterministic, version-local `occurrence_id`, `raw`, ordered
-`source_spans`, `children`, `attrs`, and `warnings`. These occurrence IDs are
+`source_spans`, `children`, `attrs`, `content=None`, and `warnings`. A2 leaves
+`content` for normalization after A3 and never overwrites `raw`. These occurrence IDs are
 not final, deduplicated `element_id` values.
 
 Only a recognized `thebibliography` environment is separated into
@@ -22,6 +23,11 @@ An explicit `\bibliography{...}` or `\addbibresource{...}` command inside
 the document body is also separated. Preamble `\addbibresource` remains in
 A1 raw source for B2/C1. An unclosed `thebibliography` stays in the body with
 `partial` and an `unclosed_protected` diagnostic.
+`\printbibliography` is treated as an explicit bibliography boundary. A
+References/Bibliography heading with introductory paragraphs is transferred
+with a following explicit bibliography command. A heading with that title but
+no clear boundary stays in the body with `partial` and
+`uncertain_references`.
 Acknowledgements and appendices remain in the body. `.bib` files still belong
 to the A1 result; A2 does not parse them.
 
@@ -30,6 +36,10 @@ environments, and inside `$...$`, `$$...$$`, `\(...\)`, `\[...\]`, do not split
 paragraphs. Unclosed protected regions retain their raw text and set
 `partial` with a diagnostic. A3 receives these blocks in raw paragraph nodes
 and owns fine-grained leaf extraction.
+The protected environment set includes `algorithm` and `algorithm*` in
+addition to figure/table/math/verbatim. Matching environment ends are found
+outside comments and `\verb` spans; a missing end does not silently truncate
+the block.
 
 `unparseable` A1 input yields no root. `partial` A1 status propagates. A2 also
 sets `partial` for unbalanced lists, orphan items, or headings encountered in
