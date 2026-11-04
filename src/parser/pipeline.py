@@ -33,13 +33,52 @@ from .integration import load_services
 from .validation import ValidationError, validate_or_raise, validate_output
 
 PARSER_VERSION = '1.0.0'
-CHECKPOINT_SCHEMA = 1
+CHECKPOINT_SCHEMA = 2
 MANIFEST_SCHEMA = 1
 TABLES = (('elements', ELEMENTS_SCHEMA), ('hierarchy', HIERARCHY_SCHEMA), ('bibtex', BIBTEX_SCHEMA))
 
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode('utf8')).hexdigest()
+
+
+def _policy_fingerprint(include_partial: bool) -> str:
+    return _sha256_text(json.dumps(dict(
+        parser_version=PARSER_VERSION,
+        include_partial=include_partial,
+        table_names=sorted(name for name, _ in TABLES),
+    ), sort_keys=True))
+
+
+def _status_text(status) -> str:
+    return status.value if hasattr(status, 'value') else str(status)
+
+
+def _publication_input_fingerprint(arxiv_id: str, records) -> str:
+    parts = [arxiv_id]
+    for record in sorted(records, key=lambda item: item.version):
+        parts.append(f"v{record.version}:{_status_text(record.status)}:{record.error or ''}")
+        base = record.source_path
+        for tf in sorted(record.tex_files or []):
+            try:
+                rel = tf.relative_to(base) if base is not None else tf.name
+            except ValueError:
+                rel = tf.name
+            try:
+                st = tf.stat()
+                parts.append(f"{rel.as_posix()}:{st.st_size}:{int(st.st_mtime)}")
+            except OSError:
+                parts.append(f"{rel.as_posix()}:missing")
+    return _sha256_text('|'.join(parts))
+
+
+def _spans_of(diagnostic) -> list[dict]:
+    spans = getattr(diagnostic, 'source_spans', None)
+    if spans:
+        return [{'path': s.path, 'start': s.start, 'end': s.end} for s in spans]
+    return [{'path': getattr(diagnostic, 'path', None),
+               'start': getattr(diagnostic, 'start', None),
+               'end': getattr(diagnostic, 'end', None)}]
 
 
 def _atomic_json(path: Path, value) -> None:
@@ -135,11 +174,15 @@ def _process_publication(arxiv_id: str, records, services: ParserServices,
                                error=f'gather:{type(exc).__name__}:{exc}'))
             continue
         for diagnostic in gathered.diagnostics:
+            spans = _spans_of(diagnostic)
+            first = spans[0] if spans else {}
             warnings.append(dict(
                 arxiv_id=arxiv_id, version=record.version, status='gather_warning',
+                stage='gather',
                 code=diagnostic.code, message=diagnostic.message,
-                severity=diagnostic.severity, path=diagnostic.path,
-                start=diagnostic.start, end=diagnostic.end,
+                severity=diagnostic.severity,
+                path=first.get('path'), start=first.get('start'), end=first.get('end'),
+                spans=spans,
             ))
         if gathered.status == 'unparseable':
             stats['gather_failed'] += 1
@@ -170,14 +213,15 @@ def _process_publication(arxiv_id: str, records, services: ParserServices,
                                status='failed', error=f'parse:{type(exc).__name__}:{exc}'))
             continue
         for diagnostic in parsed.result.diagnostics:
-            first = diagnostic.source_spans[0] if diagnostic.source_spans else None
+            spans = _spans_of(diagnostic)
+            first = spans[0] if spans else {}
             warnings.append(dict(
                 arxiv_id=arxiv_id, version=version, status='parse_warning',
+                stage='parse',
                 code=diagnostic.code, message=diagnostic.message,
                 severity=diagnostic.severity,
-                path=first.path if first else None,
-                start=first.start if first else None,
-                end=first.end if first else None,
+                path=first.get('path'), start=first.get('start'), end=first.get('end'),
+                spans=spans,
             ))
         if parsed.result.status == 'unparseable':
             stats['versions_failed'] += 1
@@ -195,9 +239,17 @@ def _process_publication(arxiv_id: str, records, services: ParserServices,
             continue
         parsed_versions.append((version, gathered, parsed))
 
-    # BibTeX entries come from A2/A3 bibliography blocks first, falling back to
-    # the gathered text only when no block is exposed, to avoid duplicate rows.
+    # Only eligible versions (ready, or partial with include_partial=True) are
+    # exported to the three tables and used for BibTeX unification. Partial
+    # versions skipped by policy keep diagnostics/warnings but produce no rows.
+    versioned_bib = []
+    eligible_parsed: list[tuple[int, GatheredSource, ParsedDocument]] = []
     for version, gathered, parsed in parsed_versions:
+        is_partial = gathered.status == 'partial' or parsed.result.status == 'partial'
+        if is_partial and not include_partial:
+            stats['versions_partial'] += 1
+            continue
+        eligible_parsed.append((version, gathered, parsed))
         bib_texts = [block.raw for block in parsed.result.bibliography] or [gathered.text]
         for text in bib_texts:
             for entry in services.extract_bibitems(text, arxiv_id):
@@ -206,11 +258,7 @@ def _process_publication(arxiv_id: str, records, services: ParserServices,
     unified, mapping, bib_stats = services.unify_bibentries(versioned_bib)
 
     # Second pass: remap citations and store only finalized content.
-    for version, gathered, parsed in parsed_versions:
-        is_partial = gathered.status == 'partial' or parsed.result.status == 'partial'
-        if is_partial and not include_partial:
-            stats['versions_partial'] += 1
-            continue
+    for version, _, parsed in eligible_parsed:
         if parsed.tree is None:
             stats['versions_failed'] += 1
             errors.append(dict(arxiv_id=arxiv_id, version=version,
@@ -341,10 +389,15 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
     if services is None and publications:
         services = load_services()
 
+    policy_fingerprint = _policy_fingerprint(include_partial)
     checkpoint = _read_json(checkpoint_path, {'schema_version': CHECKPOINT_SCHEMA,
+                                              'policy_fingerprint': policy_fingerprint,
                                               'processed': {}, 'errors': []})
-    if checkpoint.get('schema_version') != CHECKPOINT_SCHEMA:
-        checkpoint = {'schema_version': CHECKPOINT_SCHEMA, 'processed': {}, 'errors': []}
+    if (checkpoint.get('schema_version') != CHECKPOINT_SCHEMA
+            or checkpoint.get('policy_fingerprint') != policy_fingerprint):
+        checkpoint = {'schema_version': CHECKPOINT_SCHEMA,
+                      'policy_fingerprint': policy_fingerprint,
+                      'processed': {}, 'errors': []}
     selected = set(input_ids)
     processed: dict = {arxiv_id: item for arxiv_id, item in checkpoint.get('processed', {}).items()
                        if arxiv_id in selected}
@@ -352,7 +405,10 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
     dirty = False
     flush_every = 25
     for index, (arxiv_id, records) in enumerate(publications, start=1):
-        if resume and arxiv_id in processed and _shards_exist(parts_root, arxiv_id):
+        input_fingerprint = _publication_input_fingerprint(arxiv_id, records)
+        if (resume and arxiv_id in processed and _shards_exist(parts_root, arxiv_id)
+                and processed[arxiv_id].get('input_fingerprint') == input_fingerprint
+                and processed[arxiv_id].get('policy_fingerprint') == policy_fingerprint):
             if log:
                 log(f'[{index}/{len(publications)}] skip {arxiv_id} (checkpoint)')
             continue
@@ -364,7 +420,9 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
         )
         stats['seconds'] = round(time.perf_counter() - publication_started, 3)
         _write_shards(parts_root, arxiv_id, rows)
-        processed[arxiv_id] = dict(stats=stats, errors=errors, warnings=warnings)
+        processed[arxiv_id] = dict(stats=stats, errors=errors, warnings=warnings,
+                                   input_fingerprint=input_fingerprint,
+                                   policy_fingerprint=policy_fingerprint)
         dirty = True
         if index % flush_every == 0 or index == len(publications):
             checkpoint['processed'] = processed
@@ -389,16 +447,20 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
         for name in aggregate:
             aggregate[name] += item['stats'].get(name, 0)
 
+    input_fingerprints = {arxiv_id: item.get('input_fingerprint')
+                          for arxiv_id, item in processed.items()}
     config_payload = dict(persistent_root=str(root), output_root=str(output),
                           limit=limit, resume=resume, include_partial=include_partial)
     manifest = {
         'schema_version': MANIFEST_SCHEMA,
         'parser_version': PARSER_VERSION,
+        'input_fingerprints': input_fingerprints,
         'parser_policy': dict(include_partial=include_partial,
                               policy_fingerprint=_sha256_text(json.dumps(
                                   dict(parser_version=PARSER_VERSION,
                                        include_partial=include_partial,
                                        table_names=sorted(name for name, _ in TABLES),
+                                       inputs=sorted(input_fingerprints.items()),
                                        sort_keys=True), sort_keys=True))),
         'generated_at': datetime.now(timezone.utc).isoformat(),
         'started_at': started_at.isoformat(),
