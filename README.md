@@ -1,5 +1,7 @@
 # Milestone 1 arXiv crawler
 
+M2 A1 standalone multi-file gathering: [interface, example, and current limits](docs/m2-a1-gather.md).
+
 Python >=3.11, Colab CPU; inclusive range `2504.02523`–`2504.07522`.
 Metadata và source arXiv dùng chung scheduler nối tiếp; S2 có limiter riêng.
 Mỗi request tối đa ba attempts, gồm cả 429; source validation dùng cùng budget.
