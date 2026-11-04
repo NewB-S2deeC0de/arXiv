@@ -9,8 +9,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .contract import (BibEntry, GatherDiagnostic, GatheredSource,
-                       ParseDiagnostic, ParsedDocument, ParserServices,
+from .contract import (BibEntry, BibliographyBlock, GatherDiagnostic,
+                       GatheredSource, HierarchyResult, ParseDiagnostic,
+                       ParseNode, ParsedDocument, ParserServices, SourceSpan,
                        TreeNode)
 
 
@@ -18,29 +19,61 @@ class ParserDependencyError(RuntimeError):
     """Raised when the A/B parsing components are not available yet."""
 
 
+def _to_span(span) -> SourceSpan:
+    return SourceSpan(path=str(span.path), start=int(span.start), end=int(span.end))
+
+
+def _to_node(node) -> ParseNode:
+    return ParseNode(
+        occurrence_id=int(getattr(node, 'occurrence_id', 0)),
+        kind=str(node.kind),
+        raw=str(node.raw),
+        source_spans=tuple(_to_span(s) for s in getattr(node, 'source_spans', ())),
+        children=tuple(_to_node(child) for child in getattr(node, 'children', ())),
+        attrs=dict(getattr(node, 'attrs', {})),
+        content=getattr(node, 'content', None),
+        warnings=tuple(getattr(node, 'warnings', ())),
+    )
+
+
+def _to_block(block) -> BibliographyBlock:
+    return BibliographyBlock(
+        raw=str(block.raw),
+        source_spans=tuple(_to_span(s) for s in getattr(block, 'source_spans', ())),
+    )
+
+
+def _to_result(result) -> HierarchyResult:
+    return HierarchyResult(
+        arxiv_id=str(result.arxiv_id),
+        version=int(result.version),
+        status=str(result.status),
+        root=_to_node(result.root) if result.root is not None else None,
+        bibliography=tuple(_to_block(block) for block in getattr(result, 'bibliography', ())),
+        diagnostics=tuple(_parse_diagnostic(item) for item in getattr(result, 'diagnostics', ())),
+    )
+
+
+def _parse_diagnostic(item) -> ParseDiagnostic:
+    spans = tuple(_to_span(s) for s in getattr(item, 'source_spans', ()))
+    return ParseDiagnostic(code=str(item.code), message=str(item.message),
+                           severity=str(getattr(item, 'severity', 'warning')),
+                           source_spans=spans)
+
+
 def _as_tree(node, diagnostics: list[ParseDiagnostic]) -> TreeNode:
+    """Convert a rich node to C2 TreeNode only after content is finalized."""
     for warning in getattr(node, 'warnings', ()):
-        diagnostics.append(ParseDiagnostic('node_warning', str(warning)))
+        diagnostics.append(ParseDiagnostic('node_warning', str(warning),
+                                           source_spans=tuple(
+                                               _to_span(s) for s in getattr(node, 'source_spans', ()))))
     content = getattr(node, 'content', None)
     if content is None:
         content = getattr(node, 'raw', '')
     return TreeNode(
         kind=str(node.kind),
         content=content,
-        children=[_as_tree(child, diagnostics) for child in node.children],
-    )
-
-
-def _parse_diagnostic(item) -> ParseDiagnostic:
-    spans = getattr(item, 'source_spans', ())
-    first = spans[0] if spans else None
-    return ParseDiagnostic(
-        code=item.code,
-        message=item.message,
-        severity=item.severity,
-        path=first.path if first else None,
-        start=first.start if first else None,
-        end=first.end if first else None,
+        children=[_as_tree(child, diagnostics) for child in getattr(node, 'children', ())],
     )
 
 
@@ -75,18 +108,20 @@ class DefaultParserServices:
 
     def parse_document(self, gathered: GatheredSource, arxiv_id: str,
                        version: int) -> ParsedDocument:
-        from .hierarchy import build_hierarchy
+        from . import hierarchy
 
         if gathered.raw is None:
             raise ParserDependencyError(
                 'A2 requires the raw A1 GatheredVersion. '
                 'Use DefaultParserServices.gather() or inject a test service.'
             )
-        result = build_hierarchy(gathered.raw)
-        diagnostics = [_parse_diagnostic(item) for item in result.diagnostics]
-        tree = (_as_tree(result.root, diagnostics) if result.root is not None
-                else TreeNode('document', ''))
-        return ParsedDocument(tree=tree, status=result.status, diagnostics=tuple(diagnostics))
+        if not hasattr(hierarchy, 'build_hierarchy'):
+            raise ParserDependencyError(
+                'A2 build_hierarchy is not available yet. '
+                'Merge A2/A3/B1 or pass services=... to run_parser().'
+            )
+        result = hierarchy.build_hierarchy(gathered.raw)
+        return ParsedDocument(result=_to_result(result))
 
     def extract_bibitems(self, text: str, arxiv_id: str) -> list[BibEntry]:
         from .bibtex import extract_bibitems
