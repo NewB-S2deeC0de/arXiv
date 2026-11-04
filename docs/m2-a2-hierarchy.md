@@ -48,6 +48,8 @@ Balanced optional arguments (`[...]`) are also skipped while locating an
 environment end, including nested brackets and escaped delimiters. An
 unclosed optional argument leaves the environment `partial` with its raw
 content retained.
+For ordinary starred commands, both scanners skip the `*` before optional
+or braced arguments; heading commands still record `attrs.starred=True`.
 
 `unparseable` A1 input yields no root. `partial` A1 status propagates. A2 also
 sets `partial` for unbalanced lists, orphan items, or headings encountered in

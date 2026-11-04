@@ -132,6 +132,8 @@ def _environment_end(text, start, environment):
         if name in _MACRO_DEFINITIONS:
             i = _skip_macro_definition(text, i)
             continue
+        if name not in ('begin', 'end') and i < len(text) and text[i] == '*':
+            i += 1
         arg_at = i
         while arg_at < len(text) and text[arg_at].isspace(): arg_at += 1
         while arg_at < len(text) and text[arg_at] == '[':
@@ -241,8 +243,8 @@ def _tokens(text):
             yield name, start, i, None, False
             continue
         starred = False
-        if name in _LEVELS and i < len(text) and text[i] == '*':
-            starred = True
+        if name not in ('begin', 'end') and i < len(text) and text[i] == '*':
+            starred = name in _LEVELS
             i += 1
         arg_at = i
         while arg_at < len(text) and text[arg_at].isspace(): arg_at += 1

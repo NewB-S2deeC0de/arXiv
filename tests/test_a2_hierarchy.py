@@ -292,3 +292,30 @@ def test_unclosed_optional_argument_keeps_block_partial(tmp_path):
     assert result.status == 'partial'
     assert 'unclosed_protected' in [item.code for item in result.diagnostics]
     assert r'\begin{figure}' in result.root.children[0].raw
+
+
+def test_starred_optional_argument_cannot_close_figure(tmp_path):
+    result = _tree(tmp_path, r'''\documentclass{article}\begin{document}
+\begin{figure}\somecommand*[metadata={\end{figure}}]{content}
+
+\section{Fake}\caption{Actual}\end{figure}\section{Real}Text.\end{document}''')
+    assert result.status == 'ready'
+    assert [node.attrs['title'] for node in result.root.children
+            if node.kind == 'heading'] == ['Real']
+    assert r'\caption{Actual}' in result.root.children[0].raw
+
+
+def test_starred_braced_argument_cannot_close_figure(tmp_path):
+    result = _tree(tmp_path, r'''\documentclass{article}\begin{document}
+\begin{figure}\somecommand*{literal \end{figure} text}
+\section{Fake}\caption{Actual}\end{figure}\section{Real}Text.\end{document}''')
+    assert result.status == 'ready'
+    assert [node.attrs['title'] for node in result.root.children
+            if node.kind == 'heading'] == ['Real']
+
+
+def test_starred_command_argument_does_not_create_fake_heading(tmp_path):
+    result = _tree(tmp_path, r'''\documentclass{article}\begin{document}
+\somecommand*{\section{Fake}}\section{Real}Text.\end{document}''')
+    assert [node.attrs['title'] for node in result.root.children
+            if node.kind == 'heading'] == ['Real']
