@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import hashlib
 
 from .contract import (BibEntry, BibliographyBlock, GatherDiagnostic,
                        GatheredSource, HierarchyResult, ParseDiagnostic,
@@ -17,6 +18,10 @@ from .contract import (BibEntry, BibliographyBlock, GatherDiagnostic,
 
 class ParserDependencyError(RuntimeError):
     """Raised when the A/B parsing components are not available yet."""
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode('utf8')).hexdigest()
 
 
 def _to_span(span) -> SourceSpan:
@@ -108,23 +113,28 @@ class DefaultParserServices:
 
     def parse_document(self, gathered: GatheredSource, arxiv_id: str,
                        version: int) -> ParsedDocument:
-        from . import hierarchy
-
         if gathered.raw is None:
             raise ParserDependencyError(
                 'A2 requires the raw A1 GatheredVersion. '
                 'Use DefaultParserServices.gather() or inject a test service.'
             )
-        if not hasattr(hierarchy, 'build_hierarchy'):
+        from .hierarchy import build_hierarchy
+
+        try:
+            from .leaves import refine_hierarchy
+        except ImportError as exc:
             raise ParserDependencyError(
-                'A2 build_hierarchy is not available yet. '
-                'Merge A2/A3/B1 or pass services=... to run_parser().'
-            )
-        a2_result = hierarchy.build_hierarchy(gathered.raw)
-        result = a2_result
-        if hasattr(hierarchy, 'refine_hierarchy'):
-            result = hierarchy.refine_hierarchy(a2_result)
-        return ParsedDocument(result=_to_result(result))
+                'A3 refine_hierarchy is not available yet. '
+                'Merge A3/B1 or pass services=... to run_parser().'
+            ) from exc
+
+        a2_result = build_hierarchy(gathered.raw)
+        a3_result = refine_hierarchy(a2_result)
+        return ParsedDocument(result=_to_result(a3_result))
+
+    def cache_fingerprint(self) -> str:
+        """Fingerprint of the A/B service implementation for cache invalidation."""
+        return _sha256_text('A1+A2+A3+B1+B2+B3 provisional'.encode('utf8'))
 
     def extract_bibitems(self, text: str, arxiv_id: str) -> list[BibEntry]:
         from .bibtex import extract_bibitems

@@ -194,8 +194,8 @@ def test_pipeline_writes_typed_tables_and_manifest(runtime, services):
     assert manifest['papers_total'] == 2 and manifest['papers_processed'] == 2
     assert manifest['versions'] == dict(versions_total=3, versions_parsed=2,
                                         versions_empty=1, versions_partial=0,
-                                        versions_failed=0, missing=0,
-                                        gather_failed=0)
+                                        versions_pending=0, versions_failed=0,
+                                        missing=0, gather_failed=0)
     assert manifest['elements']['before_dedup'] > manifest['elements']['after_dedup']
     assert manifest['bibtex'] == dict(before_dedup=2, after_dedup=1, deduplicated=1)
     assert manifest['read_only_m1'] is True
@@ -435,6 +435,7 @@ def test_ready_tree_none_bibtex_not_exported(tmp_path, make_source):
     manifest = run_parser(root, services=TreeNoneServices(), include_partial=True)
     assert manifest['versions']['versions_failed'] == 0
     assert manifest['versions']['versions_parsed'] == 0
+    assert manifest['versions']['versions_pending'] == 1
     output = root / 'parsed'
     assert pq.read_table(output / 'elements.parquet').num_rows == 0
     assert pq.read_table(output / 'hierarchy.parquet').num_rows == 0
@@ -458,10 +459,36 @@ def test_partial_tree_none_bibtex_not_exported(tmp_path, make_source):
     manifest = run_parser(root, services=PartialTreeNoneServices(), include_partial=True)
     assert manifest['versions']['versions_failed'] == 0
     assert manifest['versions']['versions_parsed'] == 0
+    assert manifest['versions']['versions_pending'] == 1
     output = root / 'parsed'
     assert pq.read_table(output / 'elements.parquet').num_rows == 0
     assert pq.read_table(output / 'hierarchy.parquet').num_rows == 0
     assert pq.read_table(output / 'bibtex.parquet').num_rows == 0
+
+
+def test_resume_reprocesses_on_service_fingerprint_change(tmp_path, make_source):
+    root = tmp_path / 'runtime'
+    make_source(root, '2410.23025', 1, {'main.tex': V1}, 'succeeded')
+
+    class ServiceV1(FakeServices):
+        def cache_fingerprint(self):
+            return 'service-v1'
+
+    class ServiceV2(FakeServices):
+        def cache_fingerprint(self):
+            return 'service-v2'
+
+    log1 = []
+    run_parser(root, services=ServiceV1(), log=log1.append)
+    assert any('skip' not in line and 'parse' in line for line in log1), log1
+
+    log2 = []
+    run_parser(root, services=ServiceV1(), log=log2.append)
+    assert any('skip' in line for line in log2), log2
+
+    log3 = []
+    run_parser(root, services=ServiceV2(), log=log3.append)
+    assert any('skip' not in line and 'parse' in line for line in log3), log3
 
 
 def test_input_fingerprint_changes_when_content_changes(tmp_path, make_source):

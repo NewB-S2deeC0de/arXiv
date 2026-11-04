@@ -88,13 +88,13 @@ manifest = run_parser('runtime', limit=10)
    warnings. Raw A1 `GatheredVersion` is forwarded to A2, not just joined text.
 3. **Hierarchy (A2/A3).** A2 consumes the raw A1 result via
    `build_hierarchy(gathered)` and returns a rich `HierarchyResult` with
-   `ParseNode` trees, `BibliographyBlock`s, and `ParseDiagnostic`s. C3 keeps the
-   rich tree/provenance until B1 finalizes content; it converts to C2 `TreeNode`
-   only after normalization and citation remapping, and never falls back to raw
-   as final content. A3 turns prose into sentence, block-math, figure/table and
-   code leaves while preserving order, occurrence, and source spans. A2/A3
-   diagnostics are normalized to multi-span records and written to manifest
-   warnings.
+   `ParseNode` trees, `BibliographyBlock`s, and `ParseDiagnostic`s. A3 then runs
+   `refine_hierarchy()` (from `parser.leaves`) to add sentence, block-math,
+   figure/table and code leaves while preserving order, occurrence, and source
+   spans. C3 keeps the rich tree/provenance until B1 finalizes content; it
+   converts to C2 `TreeNode` only after normalization and citation remapping,
+   and never falls back to raw as final content. A2/A3 diagnostics are normalized
+   to multi-span records and written to manifest warnings.
 4. **Standardization (B1 dependency).** B1 normalizes raw leaves without changing
    the tree or provenance. LaTeX commands, braces, spacing and math delimiters
    are normalized, and paragraphs are split into sentences without breaking
@@ -149,12 +149,13 @@ runtime/parsed/
 
 `elements`, `hierarchy`, and `bibtex` use the schemas from `contract.py` and
 match the Milestone 2 specification. `coverage.csv` has one row per publication
-with versions total/parsed/empty/failed/missing, gather failures, element and
-BibTeX counts before/after deduplication, and parse time in seconds.
+with versions total/parsed/empty/pending/failed/missing, gather failures,
+element and BibTeX counts before/after deduplication, and parse time in seconds.
 
 `manifest.json` contains:
 
-- `papers_total` / `papers_processed`, version and empty-version counts;
+- `papers_total` / `papers_processed`, version counts including
+  `versions_pending` (ready but B1 content not finalized yet);
 - element and BibTeX counts before/after deduplication;
 - `timing.elapsed_seconds` and `timing.average_seconds_per_publication`;
 - `memory.peak_rss_bytes` (when `resource` is available, e.g. Colab Linux);
@@ -210,14 +211,22 @@ output guard.
   version instead of being silently ignored.
 - Missing citation keys are warnings, not hard failures, because sources may
   contain intentionally undefined references.
+- `versions_pending` counts versions that are `ready` from A1 but have no
+  finalized `tree` yet (A3/B1 not merged). These versions produce diagnostics
+  and BibTeX are skipped, but no element/hierarchy rows are written. They are
+  not counted as failed or parsed.
 - `manifest.parser_policy.policy_fingerprint` hashes parser version, schemas,
-  `include_partial` policy and the input fingerprints of processed publications.
-  `manifest.input_fingerprints` records per-publication input fingerprints
-  (version, status, source file size/mtime). The checkpoint stores the same
-  fingerprints and refuses to reuse a shard when policy or input changed; resume
-  is reset automatically when the checkpoint schema or policy fingerprint differs.
+  `include_partial` policy, the A/B service `cache_fingerprint` (when the
+  injected service exposes one), and the input fingerprints of processed
+  publications. `manifest.input_fingerprints` records per-publication input
+  fingerprints (version, status, source file content hash). The checkpoint
+  stores the same fingerprints and refuses to reuse a shard when policy or
+  input changed; resume is reset automatically when the checkpoint schema or
+  policy fingerprint differs.
 - `peak_rss_bytes` is process peak RSS, not a per-publication measurement.
-- `peak_rss_bytes` is process peak RSS, not a per-publication measurement.
+- BibTeX extraction handles `\bibitem`-style bibliographies. `\bibitem`-free
+  setups that rely on external `.bib` files still produce hierarchy content but
+  no `bibtex` rows; `.bib` parsing is not part of this milestone.
 - BibTeX extraction handles `\bibitem`-style bibliographies. `\bibitem`-free
   setups that rely on external `.bib` files still produce hierarchy content but
   no `bibtex` rows; `.bib` parsing is not part of this milestone.

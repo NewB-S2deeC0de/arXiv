@@ -46,12 +46,16 @@ def _schema_fingerprint() -> str:
     return _sha256_text(str(ELEMENTS_SCHEMA) + str(HIERARCHY_SCHEMA) + str(BIBTEX_SCHEMA))
 
 
-def _policy_fingerprint(include_partial: bool) -> str:
-    return _sha256_text(json.dumps(dict(
+def _policy_fingerprint(include_partial: bool,
+                        services: ParserServices | None = None) -> str:
+    payload = dict(
         parser_version=PARSER_VERSION,
         include_partial=include_partial,
         schema=_schema_fingerprint(),
-    ), sort_keys=True))
+    )
+    if services is not None and hasattr(services, 'cache_fingerprint'):
+        payload['services'] = services.cache_fingerprint()
+    return _sha256_text(json.dumps(payload, sort_keys=True))
 
 
 def _status_text(status) -> str:
@@ -125,8 +129,8 @@ def resolve_output(persistent_root: str | Path, output_root: str | Path | None) 
 
 def _version_stats() -> dict:
     return dict(versions_total=0, versions_parsed=0, versions_empty=0,
-                versions_partial=0, versions_failed=0, missing=0,
-                gather_failed=0,
+                versions_partial=0, versions_pending=0, versions_failed=0,
+                missing=0, gather_failed=0,
                 elements_before=0, elements_after=0,
                 bibtex_before=0, bibtex_after=0, bibtex_duplicates=0,
                 seconds=0.0)
@@ -250,8 +254,8 @@ def _process_publication(arxiv_id: str, records, services: ParserServices,
     # Only eligible versions (ready, or partial with include_partial=True) and a
     # finalized tree are exported to the three tables and used for BibTeX
     # unification. Partial versions skipped by policy keep diagnostics/warnings
-    # but produce no rows. A version without finalized tree is reported failed
-    # before BibTeX extraction so its entries never leak into the output tables.
+    # but produce no rows. A version without finalized tree is counted as
+    # pending (A3/B1 not merged yet) and never leaks BibTeX into the output.
     versioned_bib = []
     eligible_parsed: list[tuple[int, GatheredSource, ParsedDocument]] = []
     for version, gathered, parsed in parsed_versions:
@@ -260,8 +264,14 @@ def _process_publication(arxiv_id: str, records, services: ParserServices,
             stats['versions_partial'] += 1
             continue
         if parsed.tree is None:
-            # Content chưa được finalize (B1 chưa hợp nhất). Chỉ bỏ qua lưu
-            # element; diagnostics và BibTeX đã được ghi ở trên.
+            stats['versions_pending'] += 1
+            warnings.append(dict(
+                arxiv_id=arxiv_id, version=version, status='parse_warning',
+                stage='parse', code='no_finalized_tree',
+                message='Version ready but B1 has not finalized content yet; '
+                        'element rows are skipped until B1 merges.',
+                path=None, start=None, end=None, spans=[],
+            ))
             continue
         eligible_parsed.append((version, gathered, parsed))
         bib_texts = [block.raw for block in parsed.result.bibliography] or [gathered.text]
@@ -272,12 +282,9 @@ def _process_publication(arxiv_id: str, records, services: ParserServices,
     unified, mapping, bib_stats = services.unify_bibentries(versioned_bib)
 
     # Second pass: remap citations and store only finalized content.
-    # parsed.tree is None when A3/B1 has not finalized content yet (expected
-    # before B1 merges). Diagnostics and BibTeX are already recorded above;
-    # only element storage is skipped.
+    # Versions with tree=None were already counted as pending above; only
+    # finalized trees reach here.
     for version, _, parsed in eligible_parsed:
-        if parsed.tree is None:
-            continue
         _remap_tree(parsed.tree, mapping, services.remap_citations)
         store.add_tree(version, parsed.tree)
         stats['versions_parsed'] += 1
@@ -403,7 +410,7 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
     if services is None and publications:
         services = load_services()
 
-    policy_fingerprint = _policy_fingerprint(include_partial)
+    policy_fingerprint = _policy_fingerprint(include_partial, services)
     checkpoint = _read_json(checkpoint_path, {'schema_version': CHECKPOINT_SCHEMA,
                                               'policy_fingerprint': policy_fingerprint,
                                               'processed': {}, 'errors': []})
@@ -470,7 +477,7 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
         'parser_version': PARSER_VERSION,
         'input_fingerprints': input_fingerprints,
         'parser_policy': dict(include_partial=include_partial,
-                              policy_fingerprint=_policy_fingerprint(include_partial),
+                              policy_fingerprint=policy_fingerprint,
                               input_fingerprints=input_fingerprints),
         'generated_at': datetime.now(timezone.utc).isoformat(),
         'started_at': started_at.isoformat(),
@@ -482,8 +489,8 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
         'papers_processed': len(processed),
         'versions': {key: aggregate[key] for key in (
             'versions_total', 'versions_parsed', 'versions_empty',
-            'versions_partial', 'versions_failed', 'missing',
-            'gather_failed')},
+            'versions_partial', 'versions_pending', 'versions_failed',
+            'missing', 'gather_failed')},
         'elements': dict(before_dedup=aggregate['elements_before'],
                          after_dedup=aggregate['elements_after'],
                          deduplicated=aggregate['elements_before'] - aggregate['elements_after']),
