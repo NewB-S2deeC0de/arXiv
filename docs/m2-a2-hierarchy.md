@@ -36,8 +36,10 @@ environments, and inside `$...$`, `$$...$$`, `\(...\)`, `\[...\]`, do not split
 paragraphs. Unclosed protected regions retain their raw text and set
 `partial` with a diagnostic. A3 receives these blocks in raw paragraph nodes
 and owns fine-grained leaf extraction.
-The protected environment set includes `algorithm` and `algorithm*` in
-addition to figure/table/math/verbatim. Matching environment ends are found
+The protected environment set includes `algorithm` and `algorithm*` plus
+all A3 formula environments (`equation`, `align`, `gather`, `multline`,
+`displaymath` and supported starred forms). A2 retains their delimiters in
+raw paragraphs so A3 can identify complete blocks. Matching environment ends are found
 outside comments and `\verb` spans; a missing end does not silently truncate
 the block.
 Both structural scanning and end matching skip the unevaluated bodies of

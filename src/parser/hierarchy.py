@@ -45,8 +45,11 @@ class HierarchyResult:
 _LEVELS = {'chapter': 1, 'section': 2, 'subsection': 3,
            'subsubsection': 4, 'paragraph': 5, 'subparagraph': 6}
 _LISTS = frozenset({'itemize', 'enumerate'})
-_OPAQUE_ENVS = frozenset({'figure', 'figure*', 'table', 'table*', 'equation',
-                          'equation*', 'align', 'align*', 'algorithm', 'algorithm*',
+_FORMULA_ENVS = frozenset({'equation', 'equation*', 'align', 'align*',
+                           'gather', 'gather*', 'multline', 'multline*',
+                           'displaymath'})
+_OPAQUE_ENVS = _FORMULA_ENVS | frozenset({'figure', 'figure*', 'table', 'table*',
+                          'algorithm', 'algorithm*',
                           'lstlisting', 'minted',
                           'verbatim', 'verbatim*', 'comment'})
 _REFERENCES = frozenset({'references', 'bibliography'})
