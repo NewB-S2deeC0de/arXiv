@@ -26,6 +26,12 @@ for segment in result.segments:
 A1 recognizes `\documentclass` (including `[options]`) outside comments and
 literal text, then expands braced `\input`/`\include` relative to the current
 file. It ignores commented commands, `\verb`, and common verbatim environments.
+For an extensionless include name it tries the literal file, then `.tex`.
+It follows simple `\iftrue`/`\iffalse` branches, and applies a static
+`\includeonly{a,b}` list. Unknown conditionals and dynamic `\includeonly`
+lists are `partial`; their uncertain include targets are not expanded.
+The root must contain one `\documentclass`, `\begin{document}`, and
+`\end{document}` in that order to be `ready`.
 No/multiple roots are `unparseable`. Missing, cyclic, dynamic or unsafe
 includes, invalid UTF-8, and include chains deeper than 64 files are reported
 with `partial` where useful content remains. Include commands that cannot be
@@ -38,7 +44,7 @@ Each input file is limited to 32 MiB and expanded output to 64 MiB by default;
 bound produces a `resource_limit` diagnostic.
 
 This is a static gatherer, not a TeX engine. It does not evaluate macro
-expansion, conditional compilation, `\includeonly`, generated files, or TeX
-search paths. These constructs require a follow-up policy before claiming exact
-PDF compilation coverage. A2/B1/B2/C1 interfaces are still provisional in the
-out-of-repo coordination document.
+expansion, arbitrary conditional expressions, generated files, or TeX search
+paths. Source using those constructs may require manual review before claiming
+exact PDF compilation coverage. A2/B1/B2/C1 interfaces are still provisional
+in the out-of-repo coordination document.
