@@ -25,7 +25,8 @@ from crawler.storage import digest
 
 from .adapter import publications_with_records
 from .contract import (BIBTEX_SCHEMA, ELEMENTS_SCHEMA, HIERARCHY_SCHEMA,
-                       GatherError, ParserServices, SourceStatus, TreeNode,
+                       GatheredSource, GatherError, ParsedDocument,
+                       ParserServices, SourceStatus, TreeNode,
                        bibtex_rows, element_rows, hierarchy_rows)
 from .dedup import ElementStore
 from .integration import load_services
@@ -77,7 +78,8 @@ def resolve_output(persistent_root: str | Path, output_root: str | Path | None) 
 
 def _version_stats() -> dict:
     return dict(versions_total=0, versions_parsed=0, versions_empty=0,
-                versions_failed=0, missing=0, gather_failed=0,
+                versions_partial=0, versions_failed=0, missing=0,
+                gather_failed=0,
                 elements_before=0, elements_after=0,
                 bibtex_before=0, bibtex_after=0, bibtex_duplicates=0,
                 seconds=0.0)
@@ -89,7 +91,8 @@ def _remap_tree(node: TreeNode, mapping: dict[str, str], remap) -> None:
         _remap_tree(child, mapping, remap)
 
 
-def _process_publication(arxiv_id: str, records, services: ParserServices
+def _process_publication(arxiv_id: str, records, services: ParserServices,
+                         include_partial: bool = False
                          ) -> tuple[dict, list[dict], list[dict], dict[str, list[dict]]]:
     stats = _version_stats()
     errors: list[dict] = []
@@ -155,12 +158,9 @@ def _process_publication(arxiv_id: str, records, services: ParserServices
                                status='failed', error=f'gather:invalid_status:{gathered.status}'))
             continue
         gathered_versions.append((record.version, gathered))
-        for entry in services.extract_bibitems(gathered.text, arxiv_id):
-            versioned_bib.append((record.version, entry))
 
-    unified, mapping, bib_stats = services.unify_bibentries(versioned_bib)
-
-    # Second pass: parse the hierarchy and store content after citation remapping.
+    # Parse gathered sources and collect bibliography blocks before unification.
+    parsed_versions: list[tuple[int, GatheredSource, ParsedDocument]] = []
     for version, gathered in gathered_versions:
         try:
             parsed = services.parse_document(gathered, arxiv_id, version)
@@ -169,26 +169,52 @@ def _process_publication(arxiv_id: str, records, services: ParserServices
             errors.append(dict(arxiv_id=arxiv_id, version=version,
                                status='failed', error=f'parse:{type(exc).__name__}:{exc}'))
             continue
-        for diagnostic in parsed.diagnostics:
+        for diagnostic in parsed.result.diagnostics:
+            first = diagnostic.source_spans[0] if diagnostic.source_spans else None
             warnings.append(dict(
                 arxiv_id=arxiv_id, version=version, status='parse_warning',
                 code=diagnostic.code, message=diagnostic.message,
-                severity=diagnostic.severity, path=diagnostic.path,
-                start=diagnostic.start, end=diagnostic.end,
+                severity=diagnostic.severity,
+                path=first.path if first else None,
+                start=first.start if first else None,
+                end=first.end if first else None,
             ))
-        if parsed.status == 'unparseable':
+        if parsed.result.status == 'unparseable':
             stats['versions_failed'] += 1
             detail = '; '.join(
                 f'{diagnostic.code}: {diagnostic.message}'
-                for diagnostic in parsed.diagnostics
+                for diagnostic in parsed.result.diagnostics
             ) or 'unparseable source'
             errors.append(dict(arxiv_id=arxiv_id, version=version,
                                status='failed', error=f'parse:unparseable:{detail}'))
             continue
-        if parsed.status not in ('ready', 'partial'):
+        if parsed.result.status not in ('ready', 'partial'):
             stats['versions_failed'] += 1
             errors.append(dict(arxiv_id=arxiv_id, version=version,
-                               status='failed', error=f'parse:invalid_status:{parsed.status}'))
+                               status='failed', error=f'parse:invalid_status:{parsed.result.status}'))
+            continue
+        parsed_versions.append((version, gathered, parsed))
+
+    # BibTeX entries come from A2/A3 bibliography blocks first, falling back to
+    # the gathered text only when no block is exposed, to avoid duplicate rows.
+    for version, gathered, parsed in parsed_versions:
+        bib_texts = [block.raw for block in parsed.result.bibliography] or [gathered.text]
+        for text in bib_texts:
+            for entry in services.extract_bibitems(text, arxiv_id):
+                versioned_bib.append((version, entry))
+
+    unified, mapping, bib_stats = services.unify_bibentries(versioned_bib)
+
+    # Second pass: remap citations and store only finalized content.
+    for version, gathered, parsed in parsed_versions:
+        is_partial = gathered.status == 'partial' or parsed.result.status == 'partial'
+        if is_partial and not include_partial:
+            stats['versions_partial'] += 1
+            continue
+        if parsed.tree is None:
+            stats['versions_failed'] += 1
+            errors.append(dict(arxiv_id=arxiv_id, version=version,
+                               status='failed', error='parse:no_finalized_tree'))
             continue
         _remap_tree(parsed.tree, mapping, services.remap_citations)
         store.add_tree(version, parsed.tree)
@@ -288,7 +314,8 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
                limit: int | None = None,
                resume: bool = True,
                log=None,
-               services: ParserServices | None = None) -> dict:
+               services: ParserServices | None = None,
+               include_partial: bool = False) -> dict:
     """Parse all Milestone 1 publications and write the three M2 tables.
 
     ``services`` injects the A1/A2/A3/B1/B2/B3 boundary. When omitted, the real
@@ -332,7 +359,9 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
         if log:
             log(f'[{index}/{len(publications)}] parse {arxiv_id} ({len(records)} versions)')
         publication_started = time.perf_counter()
-        stats, errors, warnings, rows = _process_publication(arxiv_id, records, services)
+        stats, errors, warnings, rows = _process_publication(
+            arxiv_id, records, services, include_partial=include_partial
+        )
         stats['seconds'] = round(time.perf_counter() - publication_started, 3)
         _write_shards(parts_root, arxiv_id, rows)
         processed[arxiv_id] = dict(stats=stats, errors=errors, warnings=warnings)
@@ -375,7 +404,8 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
         'papers_processed': len(processed),
         'versions': {key: aggregate[key] for key in (
             'versions_total', 'versions_parsed', 'versions_empty',
-            'versions_failed', 'missing', 'gather_failed')},
+            'versions_partial', 'versions_failed', 'missing',
+            'gather_failed')},
         'elements': dict(before_dedup=aggregate['elements_before'],
                          after_dedup=aggregate['elements_after'],
                          deduplicated=aggregate['elements_before'] - aggregate['elements_after']),
