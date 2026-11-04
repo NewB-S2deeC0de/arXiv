@@ -7,9 +7,10 @@ import pyarrow.parquet as pq
 import pytest
 
 from crawler.storage import digest
-from parser.contract import (BibEntry, GatherDiagnostic, GatheredSource,
-                             GatherError, HierarchyResult, ParseDiagnostic,
-                             ParsedDocument, SourceSpan, TreeNode)
+from parser.contract import (BibEntry, BibliographyBlock, GatherDiagnostic,
+                             GatheredSource, GatherError, HierarchyResult,
+                             ParseDiagnostic, ParsedDocument, SourceSpan,
+                             TreeNode)
 from parser.pipeline import run_parser
 
 V1 = r'''
@@ -415,6 +416,75 @@ def test_parse_warning_keeps_all_spans(tmp_path, make_source):
     assert len(parse_warnings[0]['spans']) == 2
     assert parse_warnings[0]['spans'][0] == {'path': 'main.tex', 'start': 0, 'end': 5}
     assert parse_warnings[0]['spans'][1] == {'path': 'part.tex', 'start': 10, 'end': 15}
+
+
+def test_ready_tree_none_bibtex_not_exported(tmp_path, make_source):
+    root = tmp_path / 'runtime'
+    make_source(root, '2410.23025', 1, {'main.tex': V1}, 'succeeded')
+
+    class TreeNoneServices(FakeServices):
+        def parse_document(self, gathered, arxiv_id, version):
+            base = super().parse_document(gathered, arxiv_id, version)
+            block = BibliographyBlock(raw=gathered.text,
+                                      source_spans=tuple(SourceSpan('main.tex', 0, 5),))
+            result = HierarchyResult(
+                arxiv_id=arxiv_id, version=version, status='ready', root=None,
+                bibliography=(block,), diagnostics=(),
+            )
+            return ParsedDocument(result=result, tree=None)
+
+    manifest = run_parser(root, services=TreeNoneServices(), include_partial=True)
+    assert manifest['versions']['versions_failed'] == 1
+    assert manifest['versions']['versions_parsed'] == 0
+    output = root / 'parsed'
+    assert pq.read_table(output / 'elements.parquet').num_rows == 0
+    assert pq.read_table(output / 'hierarchy.parquet').num_rows == 0
+    assert pq.read_table(output / 'bibtex.parquet').num_rows == 0
+
+
+def test_partial_tree_none_bibtex_not_exported(tmp_path, make_source):
+    root = tmp_path / 'runtime'
+    make_source(root, '2410.23025', 1, {'main.tex': V1}, 'succeeded')
+
+    class PartialTreeNoneServices(FakeServices):
+        def parse_document(self, gathered, arxiv_id, version):
+            base = super().parse_document(gathered, arxiv_id, version)
+            block = BibliographyBlock(raw=gathered.text,
+                                      source_spans=tuple(SourceSpan('main.tex', 0, 5),))
+            result = HierarchyResult(
+                arxiv_id=arxiv_id, version=version, status='partial', root=None,
+                bibliography=(block,), diagnostics=(),
+            )
+            return ParsedDocument(result=result, tree=None)
+
+    manifest = run_parser(root, services=PartialTreeNoneServices(), include_partial=True)
+    assert manifest['versions']['versions_failed'] == 1
+    assert manifest['versions']['versions_parsed'] == 0
+    output = root / 'parsed'
+    assert pq.read_table(output / 'elements.parquet').num_rows == 0
+    assert pq.read_table(output / 'hierarchy.parquet').num_rows == 0
+    assert pq.read_table(output / 'bibtex.parquet').num_rows == 0
+
+
+def test_input_fingerprint_changes_when_content_changes(tmp_path, make_source):
+    root = tmp_path / 'runtime'
+    make_source(root, '2410.23025', 1, {'main.tex': V1, 'refs.bib': '@misc{x}'}, 'succeeded')
+
+    from parser.pipeline import _publication_input_fingerprint
+    from parser.adapter import read_source_record
+    version_dir = root / 'data' / '2410.23025' / 'versions' / 'v1'
+    recs = [read_source_record('2410.23025', 1, version_dir)]
+
+    import os
+    tex = version_dir / 'source' / 'tex' / 'main.tex'
+
+    fp_a = _publication_input_fingerprint('2410.23025', recs)
+    tex.write_text('xxxxxx', encoding='utf8')
+    fp_b = _publication_input_fingerprint('2410.23025', recs)
+    tex.write_text('yyyyyy', encoding='utf8')
+    fp_c = _publication_input_fingerprint('2410.23025', recs)
+
+    assert fp_a != fp_b != fp_c
 
 
 def test_pipeline_rejects_writes_into_milestone1(runtime, services):

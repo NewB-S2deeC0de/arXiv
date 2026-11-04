@@ -42,11 +42,15 @@ def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode('utf8')).hexdigest()
 
 
+def _schema_fingerprint() -> str:
+    return _sha256_text(str(ELEMENTS_SCHEMA) + str(HIERARCHY_SCHEMA) + str(BIBTEX_SCHEMA))
+
+
 def _policy_fingerprint(include_partial: bool) -> str:
     return _sha256_text(json.dumps(dict(
         parser_version=PARSER_VERSION,
         include_partial=include_partial,
-        table_names=sorted(name for name, _ in TABLES),
+        schema=_schema_fingerprint(),
     ), sort_keys=True))
 
 
@@ -54,21 +58,25 @@ def _status_text(status) -> str:
     return status.value if hasattr(status, 'value') else str(status)
 
 
+def _file_content_fingerprint(path: Path) -> str:
+    try:
+        with path.open('rb') as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except OSError:
+        return 'missing'
+
+
 def _publication_input_fingerprint(arxiv_id: str, records) -> str:
     parts = [arxiv_id]
     for record in sorted(records, key=lambda item: item.version):
         parts.append(f"v{record.version}:{_status_text(record.status)}:{record.error or ''}")
         base = record.source_path
-        for tf in sorted(record.tex_files or []):
+        for path in sorted((record.tex_files or ()) + (record.bib_files or ())):
             try:
-                rel = tf.relative_to(base) if base is not None else tf.name
+                rel = path.relative_to(base) if base is not None else path.name
             except ValueError:
-                rel = tf.name
-            try:
-                st = tf.stat()
-                parts.append(f"{rel.as_posix()}:{st.st_size}:{int(st.st_mtime)}")
-            except OSError:
-                parts.append(f"{rel.as_posix()}:missing")
+                rel = path.name
+            parts.append(f"{rel.as_posix()}:{_file_content_fingerprint(path)}")
     return _sha256_text('|'.join(parts))
 
 
@@ -239,15 +247,22 @@ def _process_publication(arxiv_id: str, records, services: ParserServices,
             continue
         parsed_versions.append((version, gathered, parsed))
 
-    # Only eligible versions (ready, or partial with include_partial=True) are
-    # exported to the three tables and used for BibTeX unification. Partial
-    # versions skipped by policy keep diagnostics/warnings but produce no rows.
+    # Only eligible versions (ready, or partial with include_partial=True) and a
+    # finalized tree are exported to the three tables and used for BibTeX
+    # unification. Partial versions skipped by policy keep diagnostics/warnings
+    # but produce no rows. A version without finalized tree is reported failed
+    # before BibTeX extraction so its entries never leak into the output tables.
     versioned_bib = []
     eligible_parsed: list[tuple[int, GatheredSource, ParsedDocument]] = []
     for version, gathered, parsed in parsed_versions:
         is_partial = gathered.status == 'partial' or parsed.result.status == 'partial'
         if is_partial and not include_partial:
             stats['versions_partial'] += 1
+            continue
+        if parsed.tree is None:
+            stats['versions_failed'] += 1
+            errors.append(dict(arxiv_id=arxiv_id, version=version,
+                               status='failed', error='parse:no_finalized_tree'))
             continue
         eligible_parsed.append((version, gathered, parsed))
         bib_texts = [block.raw for block in parsed.result.bibliography] or [gathered.text]
@@ -456,12 +471,8 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
         'parser_version': PARSER_VERSION,
         'input_fingerprints': input_fingerprints,
         'parser_policy': dict(include_partial=include_partial,
-                              policy_fingerprint=_sha256_text(json.dumps(
-                                  dict(parser_version=PARSER_VERSION,
-                                       include_partial=include_partial,
-                                       table_names=sorted(name for name, _ in TABLES),
-                                       inputs=sorted(input_fingerprints.items()),
-                                       sort_keys=True), sort_keys=True))),
+                              policy_fingerprint=_policy_fingerprint(include_partial),
+                              input_fingerprints=input_fingerprints),
         'generated_at': datetime.now(timezone.utc).isoformat(),
         'started_at': started_at.isoformat(),
         'read_only_m1': True,
