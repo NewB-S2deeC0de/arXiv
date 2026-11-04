@@ -262,3 +262,33 @@ def test_protected_end_inside_unbraced_macro_definition_is_ignored(tmp_path):
             if node.kind == 'heading'] == ['Real']
     assert len([node for node in result.root.children if node.kind == 'paragraph']) == 1
     assert r'\caption{Actual}' in result.root.children[0].raw
+
+
+def test_protected_end_inside_nested_optional_argument_is_ignored(tmp_path):
+    result = _tree(tmp_path, r'''\documentclass{article}\begin{document}
+\begin{figure}\somecommand[metadata={\end{figure}}, nested=[x]]{content}
+
+\caption{Actual figure}\end{figure}\section{Real}Text.\end{document}''')
+    assert result.status == 'ready'
+    assert [node.attrs['title'] for node in result.root.children
+            if node.kind == 'heading'] == ['Real']
+    assert len([node for node in result.root.children if node.kind == 'paragraph']) == 1
+    assert r'\caption{Actual figure}' in result.root.children[0].raw
+
+
+def test_balanced_optional_argument_without_fake_end_keeps_figure_ready(tmp_path):
+    result = _tree(tmp_path, r'''\documentclass{article}\begin{document}
+\begin{figure}\somecommand[meta={a[b]}]{content}\caption{Actual}\end{figure}
+\section{Real}Text.\end{document}''')
+    assert result.status == 'ready'
+    assert [node.attrs['title'] for node in result.root.children
+            if node.kind == 'heading'] == ['Real']
+    assert r'\caption{Actual}' in result.root.children[0].raw
+
+
+def test_unclosed_optional_argument_keeps_block_partial(tmp_path):
+    result = _tree(tmp_path, r'''\documentclass{article}\begin{document}
+\begin{figure}\somecommand[meta={value}\caption{Text}\end{figure}\end{document}''')
+    assert result.status == 'partial'
+    assert 'unclosed_protected' in [item.code for item in result.diagnostics]
+    assert r'\begin{figure}' in result.root.children[0].raw

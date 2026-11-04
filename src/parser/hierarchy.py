@@ -52,6 +52,31 @@ _OPAQUE_ENVS = frozenset({'figure', 'figure*', 'table', 'table*', 'equation',
 _REFERENCES = frozenset({'references', 'bibliography'})
 
 
+def _optional_end(text, start):
+    """Return end of a balanced optional argument, skipping escaped brackets."""
+    if start >= len(text) or text[start] != '[': return None
+    brackets = 1
+    braces = 0
+    i = start + 1
+    while i < len(text):
+        char = text[i]
+        if char == '\\' and i + 1 < len(text):
+            i += 2
+            continue
+        if char == '%':
+            newline = text.find('\n', i)
+            i = len(text) if newline < 0 else newline + 1
+            continue
+        if char == '{': braces += 1
+        elif char == '}' and braces: braces -= 1
+        elif not braces and char == '[': brackets += 1
+        elif not braces and char == ']':
+            brackets -= 1
+            if not brackets: return i + 1
+        i += 1
+    return None
+
+
 def _skip_macro_definition(text, i):
     """Skip a definition's name, optional arguments, and unevaluated body."""
     if i < len(text) and text[i] == '*': i += 1
@@ -65,8 +90,8 @@ def _skip_macro_definition(text, i):
     for _ in range(2):
         while i < len(text) and text[i].isspace(): i += 1
         if i < len(text) and text[i] == '[':
-            close = text.find(']', i + 1)
-            if close >= 0: i = close + 1
+            close = _optional_end(text, i)
+            if close is not None: i = close
     while i < len(text) and text[i].isspace(): i += 1
     body_end = _braced_end(text, i)
     return body_end if body_end is not None else i
@@ -109,8 +134,15 @@ def _environment_end(text, start, environment):
             continue
         arg_at = i
         while arg_at < len(text) and text[arg_at].isspace(): arg_at += 1
+        while arg_at < len(text) and text[arg_at] == '[':
+            optional_end = _optional_end(text, arg_at)
+            if optional_end is None: return None
+            arg_at = optional_end
+            while arg_at < len(text) and text[arg_at].isspace(): arg_at += 1
         end = _braced_end(text, arg_at)
-        if end is None: continue
+        if end is None:
+            i = arg_at
+            continue
         argument = text[arg_at + 1:end - 1]
         i = end
         if name == 'begin' and argument in ('verbatim', 'verbatim*', 'comment', 'lstlisting', 'minted'):
@@ -194,8 +226,8 @@ def _tokens(text):
             end = i
             while end < len(text) and text[end].isspace(): end += 1
             if end < len(text) and text[end] == '[':
-                close = text.find(']', end + 1)
-                if close >= 0: end = close + 1
+                close = _optional_end(text, end)
+                if close is not None: end = close
             i = end
             yield 'bibliography', start, end, None, False
             continue
@@ -203,8 +235,8 @@ def _tokens(text):
             end = i
             while end < len(text) and text[end].isspace(): end += 1
             if end < len(text) and text[end] == '[':
-                close = text.find(']', end + 1)
-                if close >= 0: end = close + 1
+                close = _optional_end(text, end)
+                if close is not None: end = close
             i = end
             yield name, start, i, None, False
             continue
@@ -215,8 +247,8 @@ def _tokens(text):
         arg_at = i
         while arg_at < len(text) and text[arg_at].isspace(): arg_at += 1
         if arg_at < len(text) and text[arg_at] == '[':
-            close = text.find(']', arg_at + 1)
-            if close >= 0: arg_at = close + 1
+            close = _optional_end(text, arg_at)
+            if close is not None: arg_at = close
         while arg_at < len(text) and text[arg_at].isspace(): arg_at += 1
         end = _braced_end(text, arg_at)
         if end is None: continue

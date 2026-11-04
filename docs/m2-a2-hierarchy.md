@@ -44,6 +44,10 @@ Both structural scanning and end matching skip the unevaluated bodies of
 common `\newcommand` variants and braced arguments of ordinary commands, so
 an `\end{figure}` printed inside a definition or argument cannot close the
 figure early. This remains a static approximation of TeX macro expansion.
+Balanced optional arguments (`[...]`) are also skipped while locating an
+environment end, including nested brackets and escaped delimiters. An
+unclosed optional argument leaves the environment `partial` with its raw
+content retained.
 
 `unparseable` A1 input yields no root. `partial` A1 status propagates. A2 also
 sets `partial` for unbalanced lists, orphan items, or headings encountered in
