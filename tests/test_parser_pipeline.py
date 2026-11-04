@@ -9,7 +9,7 @@ import pytest
 from crawler.storage import digest
 from parser.contract import (BibEntry, GatherDiagnostic, GatheredSource,
                              GatherError, HierarchyResult, ParseDiagnostic,
-                             ParsedDocument, TreeNode)
+                             ParsedDocument, SourceSpan, TreeNode)
 from parser.pipeline import run_parser
 
 V1 = r'''
@@ -341,6 +341,80 @@ def test_pipeline_empty_runtime_does_not_require_ab_services(tmp_path):
     assert manifest['papers_processed'] == 0
     assert manifest['validation']['ok'] is True
     assert (tmp_path / 'runtime' / 'parsed' / 'elements.parquet').is_file()
+
+
+def test_partial_only_version_produces_no_rows_when_not_included(tmp_path, make_source):
+    root = tmp_path / 'runtime'
+    make_source(root, '2410.23025', 1, {'main.tex': V1}, 'succeeded')
+    manifest = run_parser(root, services=PartialServices())
+    assert manifest['versions']['versions_partial'] == 1
+    assert manifest['versions']['versions_parsed'] == 0
+    output = root / 'parsed'
+    assert pq.read_table(output / 'elements.parquet').num_rows == 0
+    assert pq.read_table(output / 'hierarchy.parquet').num_rows == 0
+    assert pq.read_table(output / 'bibtex.parquet').num_rows == 0
+    warnings = manifest['validation']['warnings']
+    assert any(w['stage'] == 'gather' and w['code'] == 'missing_include'
+               for w in warnings)
+
+
+def test_partial_only_version_exported_when_flagged(tmp_path, make_source):
+    root = tmp_path / 'runtime'
+    make_source(root, '2410.23025', 1, {'main.tex': V1}, 'succeeded')
+    manifest = run_parser(root, services=PartialServices(), include_partial=True)
+    assert manifest['versions']['versions_parsed'] == 1
+    assert manifest['versions']['versions_partial'] == 0
+    output = root / 'parsed'
+    assert pq.read_table(output / 'elements.parquet').num_rows >= 1
+    assert pq.read_table(output / 'bibtex.parquet').num_rows == 1
+    assert pq.read_table(output / 'bibtex.parquet').to_pylist()[0]['citation_key'] == 'old'
+
+
+def test_resume_skips_same_policy(tmp_path, make_source, services):
+    root = tmp_path / 'runtime'
+    make_source(root, '2410.23025', 1, {'main.tex': V1}, 'succeeded')
+    run_parser(root, services=services)
+    log = []
+    run_parser(root, services=services, log=log.append)
+    assert any('skip' in line for line in log), log
+
+
+def test_resume_reprocesses_on_partial_policy_change(tmp_path, make_source, services):
+    root = tmp_path / 'runtime'
+    make_source(root, '2410.23025', 1, {'main.tex': V1}, 'succeeded')
+    log1 = []
+    run_parser(root, services=services, log=log1.append)
+    assert any('parse' in line and 'skip' not in line for line in log1), log1
+    log2 = []
+    run_parser(root, services=services, include_partial=True, log=log2.append)
+    assert any('parse' in line and 'skip' not in line for line in log2), log2
+
+
+def test_parse_warning_keeps_all_spans(tmp_path, make_source):
+    root = tmp_path / 'runtime'
+    make_source(root, '2410.23025', 1, {'main.tex': V1}, 'succeeded')
+
+    class MultiSpanServices(FakeServices):
+        def parse_document(self, gathered, arxiv_id, version):
+            base = super().parse_document(gathered, arxiv_id, version)
+            diagnostic = ParseDiagnostic(
+                'multi_span', 'references two files', 'warning',
+                source_spans=(SourceSpan('main.tex', 0, 5),
+                              SourceSpan('part.tex', 10, 15)),
+            )
+            result = HierarchyResult(
+                arxiv_id=arxiv_id, version=version, status='ready', root=None,
+                bibliography=(), diagnostics=(diagnostic,),
+            )
+            return ParsedDocument(result=result, tree=base.tree)
+
+    manifest = run_parser(root, services=MultiSpanServices(), include_partial=True)
+    warnings = manifest['validation']['warnings']
+    parse_warnings = [w for w in warnings if w.get('stage') == 'parse']
+    assert len(parse_warnings) == 1
+    assert len(parse_warnings[0]['spans']) == 2
+    assert parse_warnings[0]['spans'][0] == {'path': 'main.tex', 'start': 0, 'end': 5}
+    assert parse_warnings[0]['spans'][1] == {'path': 'part.tex', 'start': 10, 'end': 15}
 
 
 def test_pipeline_rejects_writes_into_milestone1(runtime, services):

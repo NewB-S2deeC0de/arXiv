@@ -17,12 +17,15 @@ def main() -> None:
                         help='Process at most N publications')
     parser.add_argument('--no-resume', action='store_true',
                         help='Discard the parser checkpoint and per-publication shards')
+    parser.add_argument('--include-partial', action='store_true',
+                        help='Also export partial versions to the three tables')
     parser.add_argument('--quiet', action='store_true', help='Do not print per-publication progress')
     args = parser.parse_args()
 
     log = None if args.quiet else (lambda message: print(message, flush=True))
     manifest = run_parser(args.persistent_root, output_root=args.out, limit=args.limit,
-                          resume=not args.no_resume, log=log)
+                          resume=not args.no_resume, log=log,
+                          include_partial=args.include_partial)
     summary = {key: manifest[key] for key in ('papers_processed', 'versions', 'elements', 'bibtex')}
     print(json.dumps(summary, indent=2, ensure_ascii=False))
 

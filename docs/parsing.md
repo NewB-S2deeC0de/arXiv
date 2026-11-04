@@ -59,6 +59,7 @@ PYTHONPATH=src python -m parser.cli --persistent-root runtime
 | `--out` | Output directory (default `<persistent-root>/parsed`) |
 | `--limit N` | Process at most `N` publications, not versions |
 | `--no-resume` | Discard `checkpoint.json` and `_parts/`, then reparse |
+| `--include-partial` | Also export `partial` versions to the three tables |
 | `--quiet` | Suppress per-publication progress lines |
 
 The same entry point is available from Python:
@@ -209,9 +210,13 @@ output guard.
   version instead of being silently ignored.
 - Missing citation keys are warnings, not hard failures, because sources may
   contain intentionally undefined references.
-- `manifest.parser_policy.policy_fingerprint` hashes parser version, schemas, and
-  `include_partial` policy. After changing A2/A3/B1 or the partial policy, old
-  shards must not be reused as the same parser version; resume should be reset.
+- `manifest.parser_policy.policy_fingerprint` hashes parser version, schemas,
+  `include_partial` policy and the input fingerprints of processed publications.
+  `manifest.input_fingerprints` records per-publication input fingerprints
+  (version, status, source file size/mtime). The checkpoint stores the same
+  fingerprints and refuses to reuse a shard when policy or input changed; resume
+  is reset automatically when the checkpoint schema or policy fingerprint differs.
+- `peak_rss_bytes` is process peak RSS, not a per-publication measurement.
 - `peak_rss_bytes` is process peak RSS, not a per-publication measurement.
 - BibTeX extraction handles `\bibitem`-style bibliographies. `\bibitem`-free
   setups that rely on external `.bib` files still produce hierarchy content but
