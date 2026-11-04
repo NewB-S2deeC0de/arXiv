@@ -1,6 +1,7 @@
 from parser.gather import gather_version
 from parser.hierarchy import build_hierarchy
 from parser.leaves import refine_hierarchy
+import pytest
 
 
 def _parse(tmp_path, body):
@@ -94,3 +95,51 @@ def test_block_spans_across_input_files_and_fake_delimiter_in_command(tmp_path):
     assert [s.path for s in figure.source_spans] == ['main.tex', 'part.tex', 'main.tex']
     assert figure.attrs['label'] == 'real'
     assert sum(s.end - s.start for s in figure.source_spans) == len(figure.raw)
+
+
+@pytest.mark.parametrize('environment', [
+    'gather', 'gather*', 'multline', 'multline*', 'displaymath',
+])
+def test_a2_preserves_all_a3_formula_environments(tmp_path, environment):
+    body = f'\\begin{{{environment}}}a=b\\end{{{environment}}}'
+    a2, a3 = _parse(tmp_path, body)
+    assert a2.root.children[0].raw == body
+    assert a3.status == 'ready'
+    assert len(a3.root.children) == 1
+    formula = a3.root.children[0]
+    assert (formula.kind, formula.attrs['environment'], formula.raw) == (
+        'block_formula', environment, body)
+
+
+def test_url_terminal_period_still_ends_sentence(tmp_path):
+    _, result = _parse(tmp_path, 'See https://example.org. Next sentence.')
+    assert [n.raw for n in result.root.children[0].children] == [
+        'See https://example.org.', 'Next sentence.']
+    _, internal = _parse(tmp_path, 'See https://example.org/a.b?x=1. Next sentence.')
+    assert len(internal.root.children[0].children) == 2
+
+
+def test_figure_attrs_ignore_comment_verb_and_macro_argument(tmp_path):
+    _, result = _parse(tmp_path, r'''\begin{figure}
+% \caption{Fake comment}
+\verb|\caption{Fake verb}|
+\begin{verbatim}\caption{Fake literal}\end{verbatim}
+\somecommand{\caption{Fake argument}}
+\% escaped percent is not a comment
+\caption[Short]{Actual {nested} caption}\label{fig:real}
+\end{figure}''')
+    figure = result.root.children[0]
+    assert figure.attrs['caption'] == 'Actual {nested} caption'
+    assert figure.attrs['label'] == 'fig:real'
+
+
+def test_initials_do_not_split_name_but_standalone_letter_can_end_sentence(tmp_path):
+    _, result = _parse(tmp_path, 'A. Smith and J. R. Smith wrote this. Results followed.')
+    assert [n.raw for n in result.root.children[0].children] == [
+        'A. Smith and J. R. Smith wrote this.', 'Results followed.']
+    _, standalone = _parse(tmp_path, 'The answer was A. Then we moved on.')
+    assert [n.raw for n in standalone.root.children[0].children] == [
+        'The answer was A.', 'Then we moved on.']
+    _, acronym = _parse(tmp_path, 'The U.S. team arrived. Results followed.')
+    assert [n.raw for n in acronym.root.children[0].children] == [
+        'The U.S. team arrived.', 'Results followed.']

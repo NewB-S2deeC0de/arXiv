@@ -25,9 +25,14 @@ Each environment is one leaf, with its label/tag and original delimiters in
 `attrs.subtype` distinguishes them, and `attrs.caption`/`attrs.label` are
 best effort extractions. Caption text remains in the figure's `raw` only and
 does not also become a sentence. Bibliography blocks are not processed by A3.
+Caption/label extraction skips comments, literal spans and nested command
+arguments; the figure's exact source remains in `raw`.
 
 Sentence splitting is conservative around common abbreviations, URLs,
 decimal numbers, comments, LaTeX command arguments, cites and inline math.
+Terminal `.` or `!` after a URL can end a sentence; punctuation inside the URL
+remains protected. Initials before likely names and `U.S.` are protected by
+heuristics, so ambiguous initials may still need downstream review.
 Inline `$…$` and `\(…\)` remain in sentence raw. Each leaf keeps exact raw
 spelling and slices its `source_spans` from the A2 paragraph, including spans
 across included files. `content` stays `None`; B1 normalization belongs after

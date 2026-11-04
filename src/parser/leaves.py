@@ -9,16 +9,14 @@ import re
 
 from .gather import SourceSpan, _braced_end, _COMMAND_NAME, _MACRO_DEFINITIONS
 from .hierarchy import (HierarchyResult, ParseDiagnostic, ParseNode, _environment_end,
-                        _optional_end, _skip_macro_definition, _walk)
+                        _optional_end, _skip_macro_definition, _walk, _FORMULA_ENVS)
 
 
-_FORMULAS = frozenset({'equation', 'equation*', 'align', 'align*', 'gather',
-                       'gather*', 'multline', 'multline*', 'displaymath'})
 _FIGURES = frozenset({'figure', 'figure*', 'table', 'table*', 'algorithm', 'algorithm*'})
 _LITERALS = frozenset({'verbatim', 'verbatim*', 'lstlisting', 'minted', 'comment'})
 _URL = re.compile(r'https?://[^\s{}\\]+')
 _ABBREVIATIONS = ('i.e.', 'e.g.', 'et al.', 'fig.', 'figs.', 'eq.', 'eqs.',
-                  'dr.', 'mr.', 'mrs.', 'prof.', 'vs.', 'cf.', 'no.')
+                  'dr.', 'mr.', 'mrs.', 'prof.', 'vs.', 'cf.', 'no.', 'u.s.')
 
 
 def _spans(parent: ParseNode, start: int, end: int) -> list[SourceSpan]:
@@ -111,12 +109,12 @@ def _blocks(text: str):
             arg_end = _braced_end(text, i + len(r'\begin'))
             if arg_end is not None:
                 env = text[i + len(r'\begin{'):arg_end - 1]
-                if env in _FORMULAS | _FIGURES | _LITERALS:
+                if env in _FORMULA_ENVS | _FIGURES | _LITERALS:
                     end = _environment_end(text, arg_end, env)
                     if end is None: return found, 'unclosed_block'
                     if env in _LITERALS:
                         return found, 'unsupported_literal'
-                    kind = 'block_formula' if env in _FORMULAS else 'figure'
+                    kind = 'block_formula' if env in _FORMULA_ENVS else 'figure'
                     attrs = {'environment': env}
                     if kind == 'figure':
                         attrs['subtype'] = env.rstrip('*')
@@ -130,12 +128,47 @@ def _blocks(text: str):
 
 def _figure_attrs(raw: str) -> dict:
     attrs = {}
-    for key in ('caption', 'label'):
-        match = re.search(r'\\' + key + r'\*?(?:\[[^\]]*\])?\s*\{', raw)
-        if match:
-            start = match.end() - 1
-            end = _braced_end(raw, start)
-            if end is not None: attrs[key] = raw[start + 1:end - 1]
+    i = 0
+    while i < len(raw) and len(attrs) < 2:
+        if raw[i] == '$' and (i == 0 or raw[i - 1] != '\\'):
+            marker = '$$' if raw.startswith('$$', i) else '$'
+            i = _math_end(raw, i, marker) or len(raw)
+            continue
+        if raw[i] == '%':
+            newline = raw.find('\n', i)
+            i = len(raw) if newline < 0 else newline + 1
+            continue
+        if raw[i] != '\\':
+            i += 1
+            continue
+        if raw.startswith(r'\begin{', i):
+            end_arg = _braced_end(raw, i + len(r'\begin'))
+            if end_arg is not None:
+                environment = raw[i + len(r'\begin{'):end_arg - 1]
+                if environment in _LITERALS:
+                    i = _environment_end(raw, end_arg, environment) or len(raw)
+                    continue
+        if raw.startswith((r'\(', r'\['), i):
+            i = _math_end(raw, i, raw[i:i + 2]) or len(raw)
+            continue
+        if raw.startswith(r'\%', i):
+            i += 2
+            continue
+        match = _COMMAND_NAME.match(raw, i + 1)
+        name = match.group() if match else ''
+        if name in ('caption', 'label') and name not in attrs:
+            arg = match.end()
+            if arg < len(raw) and raw[arg] == '*': arg += 1
+            while arg < len(raw) and raw[arg].isspace(): arg += 1
+            if arg < len(raw) and raw[arg] == '[':
+                arg = _optional_end(raw, arg) or len(raw)
+            while arg < len(raw) and raw[arg].isspace(): arg += 1
+            end = _braced_end(raw, arg)
+            if end is not None:
+                attrs[name] = raw[arg + 1:end - 1]
+                i = end
+                continue
+        _, i = _command_end(raw, i)
     return attrs
 
 
@@ -150,7 +183,11 @@ def _sentence_ranges(text: str, start: int, end: int):
             continue
         url = _URL.match(text, i)
         if url:
-            i = min(url.end(), end)
+            url_end = min(url.end(), end)
+            # A URL's trailing sentence punctuation belongs to prose, while
+            # punctuation inside its host/path/query remains protected.
+            while url_end > i and text[url_end - 1] in '.!': url_end -= 1
+            i = url_end if url_end > i else min(url.end(), end)
             continue
         if text[i] == '$' and (i == 0 or text[i - 1] != '\\'):
             marker = '$$' if text.startswith('$$', i) else '$'
@@ -167,6 +204,16 @@ def _sentence_ranges(text: str, start: int, end: int):
         if char in '.?!' and (not next_char or next_char.isspace()):
             prefix = text[max(cursor, i - 16):i + 1].lower()
             abbreviation = char == '.' and any(prefix.endswith(a) for a in _ABBREVIATIONS)
+            if char == '.' and not abbreviation:
+                before = text[cursor:i].rstrip()
+                after = text[i + 1:end].lstrip()
+                initial = re.search(r'\b([A-Z])$', before)
+                next_name = re.match(r'[A-Z][a-z]+\b', after)
+                next_initial = re.match(r'[A-Z]\.\s+[A-Z]', after)
+                previous = before[:initial.start()].rstrip() if initial else ''
+                likely_name = (not previous or previous.endswith(('.', ' and', ' by'))
+                               or bool(re.search(r'\b[A-Z]\.$', previous)))
+                abbreviation = bool(initial and likely_name and (next_name or next_initial))
             if not abbreviation:
                 a, b = cursor, i + 1
                 while a < b and text[a].isspace(): a += 1
