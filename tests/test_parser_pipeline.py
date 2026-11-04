@@ -8,8 +8,8 @@ import pytest
 
 from crawler.storage import digest
 from parser.contract import (BibEntry, GatherDiagnostic, GatheredSource,
-                             GatherError, ParseDiagnostic, ParsedDocument,
-                             TreeNode)
+                             GatherError, HierarchyResult, ParseDiagnostic,
+                             ParsedDocument, TreeNode)
 from parser.pipeline import run_parser
 
 V1 = r'''
@@ -66,7 +66,13 @@ class FakeServices:
                      if part.strip()]
         root = TreeNode('document', 'Paper A')
         root.children = [TreeNode('sentence', sentence) for sentence in sentences]
-        return ParsedDocument(root)
+        return ParsedDocument(
+            result=HierarchyResult(
+                arxiv_id=arxiv_id, version=version, status='ready', root=None,
+                bibliography=(), diagnostics=(),
+            ),
+            tree=root,
+        )
 
     def extract_bibitems(self, text, arxiv_id):
         entries = []
@@ -150,9 +156,15 @@ class PartialParseServices(FakeServices):
         parsed = super().parse_document(gathered, arxiv_id, version)
         diagnostic = ParseDiagnostic(
             'uncertain_references', 'References heading kept in body',
-            'warning', 'main.tex', 2, 8,
+            'warning', source_spans=(),
         )
-        return ParsedDocument(parsed.tree, 'partial', (diagnostic,))
+        return ParsedDocument(
+            result=HierarchyResult(
+                arxiv_id=arxiv_id, version=version, status='partial', root=None,
+                bibliography=(), diagnostics=(diagnostic,),
+            ),
+            tree=parsed.tree,
+        )
 
 
 @pytest.fixture
@@ -180,8 +192,9 @@ def test_pipeline_writes_typed_tables_and_manifest(runtime, services):
 
     assert manifest['papers_total'] == 2 and manifest['papers_processed'] == 2
     assert manifest['versions'] == dict(versions_total=3, versions_parsed=2,
-                                        versions_empty=1, versions_failed=0,
-                                        missing=0, gather_failed=0)
+                                        versions_empty=1, versions_partial=0,
+                                        versions_failed=0, missing=0,
+                                        gather_failed=0)
     assert manifest['elements']['before_dedup'] > manifest['elements']['after_dedup']
     assert manifest['bibtex'] == dict(before_dedup=2, after_dedup=1, deduplicated=1)
     assert manifest['read_only_m1'] is True
@@ -227,7 +240,15 @@ def test_pipeline_reports_partial_gather_diagnostics(runtime):
     gather_warnings = [item for item in warnings if item['status'] == 'gather_warning']
     assert len(gather_warnings) == 2
     assert {item['code'] for item in gather_warnings} == {'missing_include'}
+    assert manifest['versions']['versions_parsed'] == 0
+    assert manifest['versions']['versions_partial'] == 2
+    assert manifest['versions']['versions_failed'] == 0
+
+
+def test_pipeline_includes_partial_when_flagged(runtime):
+    manifest = run_parser(runtime, services=PartialServices(), include_partial=True)
     assert manifest['versions']['versions_parsed'] == 2
+    assert manifest['versions']['versions_partial'] == 0
     assert manifest['versions']['versions_failed'] == 0
 
 
@@ -243,7 +264,7 @@ def test_pipeline_fails_unparseable_gather(runtime):
 
 
 def test_pipeline_reports_partial_parse_diagnostics(runtime):
-    manifest = run_parser(runtime, services=PartialParseServices())
+    manifest = run_parser(runtime, services=PartialParseServices(), include_partial=True)
     warnings = manifest['validation']['warnings']
     parse_warnings = [item for item in warnings if item['status'] == 'parse_warning']
     assert len(parse_warnings) == 2

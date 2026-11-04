@@ -8,9 +8,11 @@ from parser.contract import (
     GatherDiagnostic,
     GatheredSource,
     HierarchyEdge,
+    HierarchyResult,
     KIND_PREFIX,
     ParseDiagnostic,
     ParsedDocument,
+    SourceSpan,
     TreeNode,
     bibtex_rows,
     element_rows,
@@ -73,10 +75,15 @@ def test_shared_tree_and_gathered_types_are_plain_data():
                                   'main.tex', 10, 20)
     gathered = GatheredSource('body', 'partial', 'main.tex', ('main.tex',),
                               ('refs.bib',), (diagnostic,))
-    parsed = ParsedDocument(root, 'partial', (
-        ParseDiagnostic('uncertain_references', 'References kept', 'warning',
-                        'main.tex', 1, 2),
-    ))
+    parse_diag = ParseDiagnostic(
+        'uncertain_references', 'References kept', 'warning',
+        source_spans=(SourceSpan('main.tex', 1, 2),),
+    )
+    result = HierarchyResult(
+        arxiv_id='2410.23025', version=1, status='partial', root=None,
+        bibliography=(), diagnostics=(parse_diag,),
+    )
+    parsed = ParsedDocument(result=result, tree=root)
 
     assert root.children == [child]
     assert gathered.text == 'body'
@@ -86,5 +93,8 @@ def test_shared_tree_and_gathered_types_are_plain_data():
     assert gathered.diagnostics[0].code == 'missing_include'
     assert gathered.diagnostics[0].path == 'main.tex'
     assert gathered.diagnostics[0].start == 10 and gathered.diagnostics[0].end == 20
-    assert parsed.tree is root and parsed.status == 'partial'
-    assert parsed.diagnostics[0].code == 'uncertain_references'
+    assert parsed.tree is root
+    assert parsed.result.status == 'partial'
+    assert parsed.result.diagnostics[0].code == 'uncertain_references'
+    assert parsed.result.diagnostics[0].path == 'main.tex'
+    assert parsed.result.diagnostics[0].start == 1 and parsed.result.diagnostics[0].end == 2

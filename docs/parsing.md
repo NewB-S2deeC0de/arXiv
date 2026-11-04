@@ -31,7 +31,7 @@ The A/B boundary is the `ParserServices` protocol:
 | Method | Owner | Contract |
 |:--|:--|:--|
 | `gather(arxiv_id, version, source_dir)` | A1 | wraps `gather_version()`; returns `GatheredSource(text, status, root_file, files, bib_files, diagnostics, raw)` |
-| `parse_document(gathered, arxiv_id, version)` | A2/A3 + B1 | returns `ParsedDocument(tree, status, diagnostics)` |
+| `parse_document(gathered, arxiv_id, version)` | A2/A3 + B1 | returns `ParsedDocument(result=HierarchyResult, tree=None)`; `tree` is filled only after content is finalized by B1/remap |
 | `extract_bibitems(text, arxiv_id)` | B2 | returns `list[BibEntry]` |
 | `unify_bibentries(versioned)` | B3 | returns `(entries, citation_key_map, stats)` |
 | `remap_citations(text, mapping)` | B3 | rewrites `\cite...` keys |
@@ -86,15 +86,21 @@ manifest = run_parser('runtime', limit=10)
    while `partial` versions are parsed and their diagnostics are kept as
    warnings. Raw A1 `GatheredVersion` is forwarded to A2, not just joined text.
 3. **Hierarchy (A2/A3).** A2 consumes the raw A1 result via
-   `build_hierarchy(gathered)` and returns version-local `ParseNode` trees,
-   bibliography blocks, and `ParseDiagnostic`s. A3 turns prose into sentence,
-   block-math, figure/table and code leaves while preserving order, occurrence,
-   and source spans. A2/A3 diagnostics are written to the manifest warnings.
+   `build_hierarchy(gathered)` and returns a rich `HierarchyResult` with
+   `ParseNode` trees, `BibliographyBlock`s, and `ParseDiagnostic`s. C3 keeps the
+   rich tree/provenance until B1 finalizes content; it converts to C2 `TreeNode`
+   only after normalization and citation remapping, and never falls back to raw
+   as final content. A3 turns prose into sentence, block-math, figure/table and
+   code leaves while preserving order, occurrence, and source spans. A2/A3
+   diagnostics are normalized to multi-span records and written to manifest
+   warnings.
 4. **Standardization (B1 dependency).** B1 normalizes raw leaves without changing
    the tree or provenance. LaTeX commands, braces, spacing and math delimiters
    are normalized, and paragraphs are split into sentences without breaking
    mathematics, initials, abbreviations, decimals, or URLs. `\cite` commands are
-   preserved for reference remapping.
+   preserved for reference remapping. BibTeX entries are taken from
+   `HierarchyResult.bibliography` first, falling back to gathered text only when
+   no block is exposed.
 5. **Elements and cross-version deduplication (`dedup.py`, C2).** A publication
    has a single element store. Content equality is evaluated *after* B1 cleanup;
    an optional `normalize` callback compares content without rewriting the stored
@@ -114,6 +120,10 @@ manifest = run_parser('runtime', limit=10)
    publications and at the end. At the end the shards are streamed into the final
    Parquet files, so the whole dataset is never loaded into RAM. A read-only guard
    rejects outputs under `data/`, `progress/`, or `exports/`.
+   `partial` versions are recorded with diagnostics and coverage but are not
+   written to the three tables by default; use `include_partial=True` to opt in.
+   `unparseable` and `no_tex` versions are recorded separately and never abort
+   remaining publications.
 8. **Validation (`validation.py`, C3).** Before a shard is written, the
    publication is checked for unique `element_id`s, valid kinds, hierarchy foreign
    keys in the same publication, positive versions, duplicate edges, and duplicate
