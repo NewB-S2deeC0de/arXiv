@@ -390,10 +390,16 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
             aggregate[name] += item['stats'].get(name, 0)
 
     config_payload = dict(persistent_root=str(root), output_root=str(output),
-                          limit=limit, resume=resume)
+                          limit=limit, resume=resume, include_partial=include_partial)
     manifest = {
         'schema_version': MANIFEST_SCHEMA,
         'parser_version': PARSER_VERSION,
+        'parser_policy': dict(include_partial=include_partial,
+                              policy_fingerprint=_sha256_text(json.dumps(
+                                  dict(parser_version=PARSER_VERSION,
+                                       include_partial=include_partial,
+                                       table_names=sorted(name for name, _ in TABLES),
+                                       sort_keys=True), sort_keys=True))),
         'generated_at': datetime.now(timezone.utc).isoformat(),
         'started_at': started_at.isoformat(),
         'read_only_m1': True,
