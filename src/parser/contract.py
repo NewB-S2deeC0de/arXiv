@@ -70,6 +70,15 @@ class GatherError(ValueError):
 
 
 @dataclass(frozen=True)
+class SourceSpan:
+    """Relative file path and [start, end) Unicode offsets on decoded file text."""
+
+    path: str
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
 class GatherDiagnostic:
     """Normalized A1 diagnostic consumed by the C3 pipeline."""
 
@@ -104,24 +113,67 @@ class TreeNode:
 
 
 @dataclass(frozen=True)
+class BibliographyBlock:
+    """Raw bibliography block kept by A2/A3 with provenance spans."""
+
+    raw: str
+    source_spans: tuple[SourceSpan, ...] = ()
+
+
+@dataclass(frozen=True)
+class ParseNode:
+    """Rich A2/A3 tree node; raw/provenance immutable, content filled by B1."""
+
+    occurrence_id: int
+    kind: str
+    raw: str
+    source_spans: tuple[SourceSpan, ...] = ()
+    children: tuple['ParseNode', ...] = ()
+    attrs: dict = field(default_factory=dict)
+    content: str | None = None
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class ParseDiagnostic:
     """Normalized A2/A3 diagnostic consumed by the C3 pipeline."""
 
     code: str
     message: str
     severity: str = 'warning'
-    path: str | None = None
-    start: int | None = None
-    end: int | None = None
+    source_spans: tuple[SourceSpan, ...] = ()
+
+    @property
+    def path(self) -> str | None:
+        return self.source_spans[0].path if self.source_spans else None
+
+    @property
+    def start(self) -> int | None:
+        return self.source_spans[0].start if self.source_spans else None
+
+    @property
+    def end(self) -> int | None:
+        return self.source_spans[0].end if self.source_spans else None
+
+
+@dataclass(frozen=True)
+class HierarchyResult:
+    """A2/A3 hierarchy result retained by C3 until B1/C3 finalize content."""
+
+    arxiv_id: str
+    version: int
+    status: str
+    root: ParseNode | None = None
+    bibliography: tuple[BibliographyBlock, ...] = ()
+    diagnostics: tuple[ParseDiagnostic, ...] = ()
 
 
 @dataclass(frozen=True)
 class ParsedDocument:
-    """Hierarchy result with diagnostics retained for the C3 manifest."""
+    """A2/A3 hierarchy result plus optional C2-ready TreeNode after normalization."""
 
-    tree: TreeNode
-    status: str = 'ready'
-    diagnostics: tuple[ParseDiagnostic, ...] = ()
+    result: HierarchyResult
+    tree: TreeNode | None = None
 
 
 @dataclass(frozen=True)
