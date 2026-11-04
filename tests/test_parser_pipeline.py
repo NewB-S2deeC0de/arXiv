@@ -1,0 +1,329 @@
+import csv
+import json
+import re
+from pathlib import Path
+
+import pyarrow.parquet as pq
+import pytest
+
+from crawler.storage import digest
+from parser.contract import (BibEntry, GatherDiagnostic, GatheredSource,
+                             GatherError, ParseDiagnostic, ParsedDocument,
+                             TreeNode)
+from parser.pipeline import run_parser
+
+V1 = r'''
+\documentclass{article}
+\title{Paper A}
+\begin{document}
+\section{Introduction}
+Shared sentence. Only v1 sentence with \cite{old}.
+\begin{thebibliography}{1}
+\bibitem{old} A. Author. Same Title. 2020.
+\end{thebibliography}
+\end{document}
+'''
+
+V2 = r'''
+\documentclass{article}
+\title{Paper A}
+\begin{document}
+\section{Introduction}
+Shared sentence. Only v2 sentence with \cite{new}.
+\begin{thebibliography}{1}
+\bibitem{new} A. Author. Same Title. 2021.
+\end{thebibliography}
+\end{document}
+'''
+
+CITE_RE = re.compile(
+    r'(\\(?:cite|citep|citet|citealp|citealt|citeauthor|citeyear|nocite)'
+    r'\*?(?:\[[^\]]*\])*\{)([^}]*)(\})'
+)
+
+
+class FakeServices:
+    """Minimal A/B stand-in so C3 orchestration is tested independently."""
+
+    def gather(self, arxiv_id, version, source_dir):
+        root = Path(source_dir)
+        files = tuple(sorted(root.rglob('*.tex')))
+        if not files:
+            raise GatherError('no tex files')
+        text = '\n'.join(path.read_text(encoding='utf8') for path in files)
+        return GatheredSource(
+            text=text, status='ready', root_file=files[0].name,
+            files=tuple(path.relative_to(root).as_posix() for path in files),
+        )
+
+    def parse_document(self, gathered, arxiv_id, version):
+        body = gathered.text.split(r'\begin{document}', 1)[-1]
+        body = body.split(r'\end{document}', 1)[0]
+        body = body.split(r'\begin{thebibliography}', 1)[0]
+        body = re.sub(r'\\(?:sub)*section\*?(?:\[[^\]]*\])?\{[^}]*\}', '', body)
+        body = re.sub(r'\\title(?:\[[^\]]*\])?\{[^}]*\}', '', body)
+        sentences = [part.strip() for part in re.split(r'(?<=[.!?])\s+', body)
+                     if part.strip()]
+        root = TreeNode('document', 'Paper A')
+        root.children = [TreeNode('sentence', sentence) for sentence in sentences]
+        return ParsedDocument(root)
+
+    def extract_bibitems(self, text, arxiv_id):
+        entries = []
+        for match in re.finditer(r'\\bibitem\{([^}]*)\}([^\n]*)', text):
+            key = match.group(1).strip()
+            body = match.group(2).strip()
+            parts = [part.strip() for part in body.rstrip('.').split('.') if part.strip()]
+            year = None
+            if parts and re.fullmatch(r'(?:19|20)\d{2}', parts[-1]):
+                year = int(parts.pop())
+            title = parts.pop() if parts else None
+            entries.append(BibEntry(arxiv_id, key, title=title, authors=parts, year=year))
+        return entries
+
+    def unify_bibentries(self, versioned):
+        groups = {}
+        order = []
+        for version, entry in versioned:
+            signature = (entry.title or entry.citation_key).lower()
+            if signature not in groups:
+                groups[signature] = []
+                order.append(signature)
+            groups[signature].append((version, entry))
+        chosen = []
+        mapping = {}
+        duplicates = 0
+        for signature in order:
+            items = sorted(groups[signature], key=lambda item: (item[0], item[1].citation_key))
+            merged = items[0][1]
+            for _, entry in items[1:]:
+                duplicates += 1
+                mapping[entry.citation_key] = merged.citation_key
+                merged = BibEntry(
+                    merged.arxiv_id,
+                    merged.citation_key,
+                    entry_type=entry.entry_type if merged.entry_type == 'misc' else merged.entry_type,
+                    title=merged.title or entry.title,
+                    authors=merged.authors + [author for author in entry.authors
+                                              if author not in merged.authors],
+                    year=merged.year if merged.year is not None else entry.year,
+                    doi=merged.doi or entry.doi,
+                    journal=merged.journal or entry.journal,
+                    url=merged.url or entry.url,
+                )
+            mapping.setdefault(merged.citation_key, merged.citation_key)
+            chosen.append(merged)
+        return chosen, mapping, dict(before=len(versioned), after=len(chosen),
+                                     duplicates=duplicates)
+
+    def remap_citations(self, text, mapping):
+        def replace(match):
+            keys = [key.strip() for key in match.group(2).split(',')]
+            return match.group(1) + ', '.join(mapping.get(key, key) for key in keys) + match.group(3)
+
+        return CITE_RE.sub(replace, text)
+
+
+class PartialServices(FakeServices):
+    def gather(self, arxiv_id, version, source_dir):
+        base = super().gather(arxiv_id, version, source_dir)
+        diagnostic = GatherDiagnostic(
+            'missing_include', 'Missing child.tex', 'warning', 'main.tex', 0, 1,
+        )
+        return GatheredSource(
+            text=base.text, status='partial', root_file=base.root_file,
+            files=base.files, bib_files=base.bib_files,
+            diagnostics=(diagnostic,),
+        )
+
+
+class UnparseableServices(FakeServices):
+    def gather(self, arxiv_id, version, source_dir):
+        return GatheredSource(
+            text='', status='unparseable',
+            diagnostics=(GatherDiagnostic('no_root', 'Root candidates: []', 'error'),),
+        )
+
+
+class PartialParseServices(FakeServices):
+    def parse_document(self, gathered, arxiv_id, version):
+        parsed = super().parse_document(gathered, arxiv_id, version)
+        diagnostic = ParseDiagnostic(
+            'uncertain_references', 'References heading kept in body',
+            'warning', 'main.tex', 2, 8,
+        )
+        return ParsedDocument(parsed.tree, 'partial', (diagnostic,))
+
+
+@pytest.fixture
+def services():
+    return FakeServices()
+
+
+def _snapshot(root):
+    return {path.relative_to(root).as_posix(): digest(path)
+            for path in sorted((root / 'data').rglob('*')) if path.is_file()}
+
+
+@pytest.fixture
+def runtime(tmp_path, make_source):
+    root = tmp_path / 'runtime'
+    make_source(root, '2410.23025', 1, {'main.tex': V1}, 'succeeded')
+    make_source(root, '2410.23025', 2, {'main.tex': V2}, 'succeeded')
+    make_source(root, '2410.23026', 1, {}, 'no_tex')
+    return root
+
+
+def test_pipeline_writes_typed_tables_and_manifest(runtime, services):
+    before = _snapshot(runtime)
+    manifest = run_parser(runtime, services=services)
+
+    assert manifest['papers_total'] == 2 and manifest['papers_processed'] == 2
+    assert manifest['versions'] == dict(versions_total=3, versions_parsed=2,
+                                        versions_empty=1, versions_failed=0,
+                                        missing=0, gather_failed=0)
+    assert manifest['elements']['before_dedup'] > manifest['elements']['after_dedup']
+    assert manifest['bibtex'] == dict(before_dedup=2, after_dedup=1, deduplicated=1)
+    assert manifest['read_only_m1'] is True
+    assert manifest['validation']['ok'] is True
+    assert manifest['validation']['warnings'] == []
+    assert manifest['fingerprints']['input'] and manifest['fingerprints']['schema']
+    assert all(key in manifest['outputs'] for key in
+               ('elements', 'hierarchy', 'bibtex', 'coverage.csv'))
+
+    output = runtime / 'parsed'
+    elements = pq.read_table(output / 'elements.parquet')
+    assert elements.column_names == ['element_id', 'arxiv_id', 'kind', 'content']
+    rows = elements.to_pylist()
+    shared = [row for row in rows if row['content'] == 'Shared sentence.']
+    assert len(shared) == 1
+    assert all(row['element_id'].startswith('2410-23025#') for row in rows)
+
+    hierarchy = pq.read_table(output / 'hierarchy.parquet').to_pylist()
+    shared_id = shared[0]['element_id']
+    assert {edge['version'] for edge in hierarchy if edge['element_id'] == shared_id} == {1, 2}
+
+    bibtex = pq.read_table(output / 'bibtex.parquet').to_pylist()
+    assert len(bibtex) == 1
+    assert bibtex[0]['citation_key'] == 'old'
+    assert bibtex[0]['year'] == 2020
+    assert bibtex[0]['title'] == 'Same Title'
+
+    assert manifest['outputs']['elements']['sha256'] == digest(output / 'elements.parquet')
+    assert json.loads((output / 'manifest.json').read_text(encoding='utf8')) == manifest
+    assert json.loads((output / 'errors.json').read_text(encoding='utf8')) == []
+    with (output / 'coverage.csv').open(encoding='utf8') as handle:
+        coverage = list(csv.DictReader(handle))
+    assert {row['arxiv_id'] for row in coverage} == {'2410.23025', '2410.23026'}
+
+    assert _snapshot(runtime) == before
+    assert not (runtime / 'progress').exists()
+    assert not (runtime / 'exports').exists()
+
+
+def test_pipeline_reports_partial_gather_diagnostics(runtime):
+    manifest = run_parser(runtime, services=PartialServices())
+    warnings = manifest['validation']['warnings']
+    gather_warnings = [item for item in warnings if item['status'] == 'gather_warning']
+    assert len(gather_warnings) == 2
+    assert {item['code'] for item in gather_warnings} == {'missing_include'}
+    assert manifest['versions']['versions_parsed'] == 2
+    assert manifest['versions']['versions_failed'] == 0
+
+
+def test_pipeline_fails_unparseable_gather(runtime):
+    manifest = run_parser(runtime, services=UnparseableServices())
+    assert manifest['versions']['versions_total'] == 3
+    assert manifest['versions']['gather_failed'] == 2
+    assert manifest['versions']['versions_failed'] == 2
+    assert manifest['versions']['versions_parsed'] == 0
+    errors = json.loads((runtime / 'parsed' / 'errors.json').read_text(encoding='utf8'))
+    assert len(errors) == 2
+    assert all('gather:unparseable' in item['error'] for item in errors)
+
+
+def test_pipeline_reports_partial_parse_diagnostics(runtime):
+    manifest = run_parser(runtime, services=PartialParseServices())
+    warnings = manifest['validation']['warnings']
+    parse_warnings = [item for item in warnings if item['status'] == 'parse_warning']
+    assert len(parse_warnings) == 2
+    assert {item['code'] for item in parse_warnings} == {'uncertain_references'}
+    assert manifest['versions']['versions_parsed'] == 2
+    assert manifest['versions']['versions_failed'] == 0
+
+
+def test_pipeline_dedups_elements_after_citation_remap(tmp_path, make_source, services):
+    root = tmp_path / 'runtime'
+    make_source(root, '2410.23027', 1, {'main.tex': r'''
+\documentclass{article}
+\begin{document}
+Shared claim \cite{old}. Unique v1.
+\begin{thebibliography}{1}
+\bibitem{old} A. Author. Same Title. 2020.
+\end{thebibliography}
+\end{document}
+'''}, 'succeeded')
+    make_source(root, '2410.23027', 2, {'main.tex': r'''
+\documentclass{article}
+\begin{document}
+Shared claim \cite{new}. Unique v2.
+\begin{thebibliography}{1}
+\bibitem{new} A. Author. Same Title. 2021.
+\end{thebibliography}
+\end{document}
+'''}, 'succeeded')
+    manifest = run_parser(root, services=services)
+    rows = pq.read_table(root / 'parsed' / 'elements.parquet').to_pylist()
+    sentence_rows = [row for row in rows if row['content'] == r'Shared claim \cite{old}.']
+    assert len(sentence_rows) == 1
+    shared_id = sentence_rows[0]['element_id']
+    hierarchy = pq.read_table(root / 'parsed' / 'hierarchy.parquet').to_pylist()
+    assert {edge['version'] for edge in hierarchy if edge['element_id'] == shared_id} == {1, 2}
+    assert manifest['bibtex']['deduplicated'] == 1
+
+
+def test_pipeline_resume_skips_checkpointed_publications(runtime, services):
+    run_parser(runtime, services=services)
+    log = []
+    manifest = run_parser(runtime, services=services, log=log.append)
+    assert sum('skip' in line for line in log) == 2
+    assert manifest['papers_processed'] == 2
+
+
+def test_pipeline_limit_counts_publications(runtime, services):
+    manifest = run_parser(runtime, output_root=runtime / 'parsed_limit', limit=1,
+                          services=services)
+    assert manifest['papers_total'] == 1
+    assert manifest['papers_processed'] == 1
+    assert manifest['versions']['versions_total'] == 2
+
+
+def test_pipeline_limit_restricts_existing_output(runtime, services):
+    run_parser(runtime, services=services)
+    manifest = run_parser(runtime, limit=1, services=services)
+    assert manifest['papers_total'] == 1 and manifest['papers_processed'] == 1
+    rows = pq.read_table(runtime / 'parsed' / 'elements.parquet').to_pylist()
+    assert rows and all(row['arxiv_id'] == '2410.23025' for row in rows)
+
+
+def test_pipeline_rerun_is_stable(runtime, services):
+    first = run_parser(runtime, output_root=runtime / 'parsed_a', services=services)
+    second = run_parser(runtime, output_root=runtime / 'parsed_b', services=services)
+    for name in ('elements', 'hierarchy', 'bibtex'):
+        assert first['outputs'][name] == second['outputs'][name]
+    assert first['validation'] == second['validation']
+
+
+def test_pipeline_empty_runtime_does_not_require_ab_services(tmp_path):
+    manifest = run_parser(tmp_path / 'runtime')
+    assert manifest['papers_total'] == 0
+    assert manifest['papers_processed'] == 0
+    assert manifest['validation']['ok'] is True
+    assert (tmp_path / 'runtime' / 'parsed' / 'elements.parquet').is_file()
+
+
+def test_pipeline_rejects_writes_into_milestone1(runtime, services):
+    with pytest.raises(ValueError, match='Milestone 1'):
+        run_parser(runtime, output_root=runtime / 'data' / 'parsed', services=services)
+    with pytest.raises(ValueError, match='Milestone 1'):
+        run_parser(runtime, output_root=runtime / 'progress' / 'parsed', services=services)
