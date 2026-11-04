@@ -1,6 +1,7 @@
 # Milestone 1 arXiv crawler
 
 M2 A1 standalone multi-file gathering: [interface, example, and current limits](docs/m2-a1-gather.md).
+M2 A2 version-local hierarchy: [interface and current limits](docs/m2-a2-hierarchy.md).
 
 Python >=3.11, Colab CPU; inclusive range `2504.02523`–`2504.07522`.
 Metadata và source arXiv dùng chung scheduler nối tiếp; S2 có limiter riêng.
