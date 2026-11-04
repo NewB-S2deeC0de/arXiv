@@ -1,0 +1,418 @@
+"""End-to-end Milestone 2 parsing pipeline (issue C3).
+
+Reads verified Milestone 1 sources read-only, parses every version, deduplicates
+across versions and writes three Parquet tables plus a manifest under
+``runtime/parsed``. Large datasets are processed publication by publication and
+merged by streaming the per-publication shards.
+"""
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+import os
+import platform
+import shutil
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import quote
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from crawler.storage import digest
+
+from .adapter import publications_with_records
+from .contract import (BIBTEX_SCHEMA, ELEMENTS_SCHEMA, HIERARCHY_SCHEMA,
+                       GatherError, ParserServices, SourceStatus, TreeNode,
+                       bibtex_rows, element_rows, hierarchy_rows)
+from .dedup import ElementStore
+from .integration import load_services
+from .validation import ValidationError, validate_or_raise, validate_output
+
+PARSER_VERSION = '1.0.0'
+CHECKPOINT_SCHEMA = 1
+MANIFEST_SCHEMA = 1
+TABLES = (('elements', ELEMENTS_SCHEMA), ('hierarchy', HIERARCHY_SCHEMA), ('bibtex', BIBTEX_SCHEMA))
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode('utf8')).hexdigest()
+
+
+def _atomic_json(path: Path, value) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    with temporary.open('w', encoding='utf8') as handle:
+        json.dump(value, handle, ensure_ascii=False, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
+
+
+def _read_json(path: Path, default):
+    try:
+        return json.loads(path.read_text(encoding='utf8'))
+    except (OSError, ValueError):
+        return default
+
+
+def _guard_output(persistent_root: Path, output_root: Path) -> None:
+    root = persistent_root.resolve()
+    output = output_root.resolve()
+    for name in ('data', 'progress', 'exports'):
+        forbidden = (root / name).resolve()
+        if output == forbidden or forbidden in output.parents:
+            raise ValueError(f'Parsed output must not write into Milestone 1 {name}/')
+    if output == root:
+        raise ValueError('Parsed output must be a dedicated subdirectory, not the runtime root')
+
+
+def resolve_output(persistent_root: str | Path, output_root: str | Path | None) -> Path:
+    if output_root is None:
+        return Path(persistent_root) / 'parsed'
+    return Path(output_root)
+
+
+def _version_stats() -> dict:
+    return dict(versions_total=0, versions_parsed=0, versions_empty=0,
+                versions_failed=0, missing=0, gather_failed=0,
+                elements_before=0, elements_after=0,
+                bibtex_before=0, bibtex_after=0, bibtex_duplicates=0,
+                seconds=0.0)
+
+
+def _remap_tree(node: TreeNode, mapping: dict[str, str], remap) -> None:
+    node.content = remap(node.content, mapping)
+    for child in node.children:
+        _remap_tree(child, mapping, remap)
+
+
+def _process_publication(arxiv_id: str, records, services: ParserServices
+                         ) -> tuple[dict, list[dict], list[dict], dict[str, list[dict]]]:
+    stats = _version_stats()
+    errors: list[dict] = []
+    warnings: list[dict] = []
+    store = ElementStore(arxiv_id)
+    versioned_bib = []
+    gathered_versions = []
+    rows: dict[str, list[dict]] = {'elements': [], 'hierarchy': [], 'bibtex': []}
+
+    # First pass: gather sources and unify references, so citation keys are
+    # already remapped before element content is deduplicated by the store.
+    for record in sorted(records, key=lambda item: item.version):
+        stats['versions_total'] += 1
+        if record.status is SourceStatus.MISSING:
+            stats['missing'] += 1
+            errors.append(dict(arxiv_id=arxiv_id, version=record.version,
+                               status='missing', error=record.error or 'missing'))
+            continue
+        if record.status is SourceStatus.FAILED:
+            stats['versions_failed'] += 1
+            errors.append(dict(arxiv_id=arxiv_id, version=record.version,
+                               status='failed', error=record.error or 'failed'))
+            continue
+        if record.status is SourceStatus.NO_TEX or not record.tex_files:
+            stats['versions_empty'] += 1
+            continue
+        try:
+            gathered = services.gather(arxiv_id, record.version, record.source_path / 'tex')
+        except GatherError as exc:
+            stats['gather_failed'] += 1
+            stats['versions_failed'] += 1
+            errors.append(dict(arxiv_id=arxiv_id, version=record.version,
+                               status='failed', error=f'gather:{exc}'))
+            continue
+        except Exception as exc:
+            stats['gather_failed'] += 1
+            stats['versions_failed'] += 1
+            errors.append(dict(arxiv_id=arxiv_id, version=record.version,
+                               status='failed',
+                               error=f'gather:{type(exc).__name__}:{exc}'))
+            continue
+        for diagnostic in gathered.diagnostics:
+            warnings.append(dict(
+                arxiv_id=arxiv_id, version=record.version, status='gather_warning',
+                code=diagnostic.code, message=diagnostic.message,
+                severity=diagnostic.severity, path=diagnostic.path,
+                start=diagnostic.start, end=diagnostic.end,
+            ))
+        if gathered.status == 'unparseable':
+            stats['gather_failed'] += 1
+            stats['versions_failed'] += 1
+            detail = '; '.join(
+                f'{diagnostic.code}: {diagnostic.message}'
+                for diagnostic in gathered.diagnostics
+            ) or 'unparseable source'
+            errors.append(dict(arxiv_id=arxiv_id, version=record.version,
+                               status='failed', error=f'gather:unparseable:{detail}'))
+            continue
+        if gathered.status not in ('ready', 'partial'):
+            stats['gather_failed'] += 1
+            stats['versions_failed'] += 1
+            errors.append(dict(arxiv_id=arxiv_id, version=record.version,
+                               status='failed', error=f'gather:invalid_status:{gathered.status}'))
+            continue
+        gathered_versions.append((record.version, gathered))
+        for entry in services.extract_bibitems(gathered.text, arxiv_id):
+            versioned_bib.append((record.version, entry))
+
+    unified, mapping, bib_stats = services.unify_bibentries(versioned_bib)
+
+    # Second pass: parse the hierarchy and store content after citation remapping.
+    for version, gathered in gathered_versions:
+        try:
+            parsed = services.parse_document(gathered, arxiv_id, version)
+        except Exception as exc:  # parser failures are reported, never silent success
+            stats['versions_failed'] += 1
+            errors.append(dict(arxiv_id=arxiv_id, version=version,
+                               status='failed', error=f'parse:{type(exc).__name__}:{exc}'))
+            continue
+        for diagnostic in parsed.diagnostics:
+            warnings.append(dict(
+                arxiv_id=arxiv_id, version=version, status='parse_warning',
+                code=diagnostic.code, message=diagnostic.message,
+                severity=diagnostic.severity, path=diagnostic.path,
+                start=diagnostic.start, end=diagnostic.end,
+            ))
+        if parsed.status == 'unparseable':
+            stats['versions_failed'] += 1
+            detail = '; '.join(
+                f'{diagnostic.code}: {diagnostic.message}'
+                for diagnostic in parsed.diagnostics
+            ) or 'unparseable source'
+            errors.append(dict(arxiv_id=arxiv_id, version=version,
+                               status='failed', error=f'parse:unparseable:{detail}'))
+            continue
+        if parsed.status not in ('ready', 'partial'):
+            stats['versions_failed'] += 1
+            errors.append(dict(arxiv_id=arxiv_id, version=version,
+                               status='failed', error=f'parse:invalid_status:{parsed.status}'))
+            continue
+        _remap_tree(parsed.tree, mapping, services.remap_citations)
+        store.add_tree(version, parsed.tree)
+        stats['versions_parsed'] += 1
+
+    errors.sort(key=lambda item: (item['version'], item['status']))
+    stats['elements_before'] = store.total_nodes
+    stats['elements_after'] = store.distinct_elements
+    stats['bibtex_before'] = bib_stats['before']
+    stats['bibtex_after'] = bib_stats['after']
+    stats['bibtex_duplicates'] = bib_stats['duplicates']
+
+    rows['elements'] = element_rows(store.sorted_elements())
+    rows['hierarchy'] = hierarchy_rows(store.sorted_edges())
+    rows['bibtex'] = bibtex_rows(sorted(unified, key=lambda entry: entry.citation_key))
+    validation = validate_or_raise(arxiv_id, rows)
+    warnings.extend(validation['warnings'])
+    return stats, errors, warnings, rows
+
+
+def _write_shards(parts_root: Path, arxiv_id: str, rows: dict[str, list[dict]]) -> None:
+    part_dir = parts_root / quote(arxiv_id, safe='')
+    if part_dir.exists():
+        shutil.rmtree(part_dir)
+    part_dir.mkdir(parents=True, exist_ok=True)
+    for name, schema in TABLES:
+        table = pa.Table.from_pylist(rows[name], schema=schema)
+        pq.write_table(table, part_dir / f'{name}.parquet')
+
+
+def _shards_exist(parts_root: Path, arxiv_id: str) -> bool:
+    part_dir = parts_root / quote(arxiv_id, safe='')
+    return all((part_dir / f'{name}.parquet').is_file() for name, _ in TABLES)
+
+
+def _merge_parts(parts_root: Path, output_root: Path, arxiv_ids) -> dict[str, int]:
+    part_dirs = [parts_root / quote(arxiv_id, safe='') for arxiv_id in sorted(arxiv_ids)]
+    counts = {}
+    for name, schema in TABLES:
+        final = output_root / f'{name}.parquet'
+        writer = pq.ParquetWriter(final, schema, compression='snappy')
+        total = 0
+        try:
+            for part_dir in part_dirs:
+                part = part_dir / f'{name}.parquet'
+                if not part.is_file():
+                    continue
+                table = pq.ParquetFile(part).read()
+                total += table.num_rows
+                writer.write_table(table)
+        finally:
+            writer.close()
+        counts[name] = total
+    return counts
+
+
+def _write_coverage(output_root: Path, processed: dict) -> None:
+    columns = ['arxiv_id', 'versions_total', 'versions_parsed', 'versions_empty',
+               'versions_failed', 'missing', 'gather_failed', 'elements_before',
+               'elements_after', 'bibtex_before', 'bibtex_after', 'bibtex_duplicates',
+               'seconds']
+    path = output_root / 'coverage.csv'
+    with path.open('w', newline='', encoding='utf8') as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        for arxiv_id in sorted(processed):
+            stats = processed[arxiv_id]['stats']
+            writer.writerow(dict(arxiv_id=arxiv_id, **{name: stats.get(name, 0) for name in columns[1:]}))
+
+
+def _software_versions() -> dict:
+    try:
+        import pyarrow
+        pyarrow_version = pyarrow.__version__
+    except Exception:
+        pyarrow_version = None
+    return dict(python=platform.python_version(), pyarrow=pyarrow_version,
+                parser=PARSER_VERSION, platform=platform.platform())
+
+
+def _max_rss_bytes() -> int | None:
+    """Best-effort process peak RSS; uses resource where available (Linux/Colab)."""
+    try:
+        import resource
+    except ImportError:
+        return None
+    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return usage if platform.system() == 'Darwin' else usage * 1024
+
+
+def _tree_bytes(path: Path) -> int:
+    return sum(item.stat().st_size for item in path.rglob('*') if item.is_file())
+
+
+def run_parser(persistent_root: str | Path = 'runtime', *,
+               output_root: str | Path | None = None,
+               limit: int | None = None,
+               resume: bool = True,
+               log=None,
+               services: ParserServices | None = None) -> dict:
+    """Parse all Milestone 1 publications and write the three M2 tables.
+
+    ``services`` injects the A1/A2/A3/B1/B2/B3 boundary. When omitted, the real
+    components are loaded from :mod:`parser.integration`.
+    """
+    root = Path(persistent_root)
+    output = resolve_output(root, output_root)
+    _guard_output(root, output)
+    output.mkdir(parents=True, exist_ok=True)
+    parts_root = output / '_parts'
+    checkpoint_path = output / 'checkpoint.json'
+
+    if not resume:
+        if parts_root.exists():
+            shutil.rmtree(parts_root)
+        checkpoint_path.unlink(missing_ok=True)
+    parts_root.mkdir(parents=True, exist_ok=True)
+
+    started_at = datetime.now(timezone.utc)
+    started = time.perf_counter()
+    publications = publications_with_records(root, limit=limit)
+    input_ids = [arxiv_id for arxiv_id, _ in publications]
+    if services is None and publications:
+        services = load_services()
+
+    checkpoint = _read_json(checkpoint_path, {'schema_version': CHECKPOINT_SCHEMA,
+                                              'processed': {}, 'errors': []})
+    if checkpoint.get('schema_version') != CHECKPOINT_SCHEMA:
+        checkpoint = {'schema_version': CHECKPOINT_SCHEMA, 'processed': {}, 'errors': []}
+    selected = set(input_ids)
+    processed: dict = {arxiv_id: item for arxiv_id, item in checkpoint.get('processed', {}).items()
+                       if arxiv_id in selected}
+
+    dirty = False
+    flush_every = 25
+    for index, (arxiv_id, records) in enumerate(publications, start=1):
+        if resume and arxiv_id in processed and _shards_exist(parts_root, arxiv_id):
+            if log:
+                log(f'[{index}/{len(publications)}] skip {arxiv_id} (checkpoint)')
+            continue
+        if log:
+            log(f'[{index}/{len(publications)}] parse {arxiv_id} ({len(records)} versions)')
+        publication_started = time.perf_counter()
+        stats, errors, warnings, rows = _process_publication(arxiv_id, records, services)
+        stats['seconds'] = round(time.perf_counter() - publication_started, 3)
+        _write_shards(parts_root, arxiv_id, rows)
+        processed[arxiv_id] = dict(stats=stats, errors=errors, warnings=warnings)
+        dirty = True
+        if index % flush_every == 0 or index == len(publications):
+            checkpoint['processed'] = processed
+            checkpoint['errors'] = [error for item in processed.values() for error in item.get('errors', [])]
+            _atomic_json(checkpoint_path, checkpoint)
+            dirty = False
+    if dirty:
+        checkpoint['processed'] = processed
+        checkpoint['errors'] = [error for item in processed.values() for error in item.get('errors', [])]
+        _atomic_json(checkpoint_path, checkpoint)
+
+    counts = _merge_parts(parts_root, output, input_ids)
+    _write_coverage(output, processed)
+    errors = [error for item in processed.values() for error in item.get('errors', [])]
+    warnings = [warning for item in processed.values() for warning in item.get('warnings', [])]
+    _atomic_json(output / 'errors.json', errors)
+    output_validation = validate_output(output)
+
+    elapsed = time.perf_counter() - started
+    aggregate = _version_stats()
+    for item in processed.values():
+        for name in aggregate:
+            aggregate[name] += item['stats'].get(name, 0)
+
+    config_payload = dict(persistent_root=str(root), output_root=str(output),
+                          limit=limit, resume=resume)
+    manifest = {
+        'schema_version': MANIFEST_SCHEMA,
+        'parser_version': PARSER_VERSION,
+        'generated_at': datetime.now(timezone.utc).isoformat(),
+        'started_at': started_at.isoformat(),
+        'read_only_m1': True,
+        'persistent_root': str(root),
+        'output_root': str(output),
+        'limit': limit,
+        'papers_total': len(publications),
+        'papers_processed': len(processed),
+        'versions': {key: aggregate[key] for key in (
+            'versions_total', 'versions_parsed', 'versions_empty',
+            'versions_failed', 'missing', 'gather_failed')},
+        'elements': dict(before_dedup=aggregate['elements_before'],
+                         after_dedup=aggregate['elements_after'],
+                         deduplicated=aggregate['elements_before'] - aggregate['elements_after']),
+        'bibtex': dict(before_dedup=aggregate['bibtex_before'],
+                       after_dedup=aggregate['bibtex_after'],
+                       deduplicated=aggregate['bibtex_duplicates']),
+        'empty_versions': aggregate['versions_empty'],
+        'timing': dict(elapsed_seconds=round(elapsed, 3),
+                       average_seconds_per_publication=round(elapsed / len(processed), 3)
+                       if processed else None),
+        'memory': dict(peak_rss_bytes=_max_rss_bytes()),
+        'storage': dict(output_bytes=None, parts_bytes=_tree_bytes(parts_root)),
+        'errors': errors,
+        'validation': dict(
+            ok=output_validation['ok'],
+            errors=output_validation['errors'],
+            warnings=warnings,
+            publications_checked=len(processed),
+            rows={name: counts[name] for name, _ in TABLES},
+        ),
+        'fingerprints': dict(
+            config=_sha256_text(json.dumps(config_payload, sort_keys=True)),
+            input=_sha256_text(json.dumps(sorted(input_ids), sort_keys=True)),
+            schema=_sha256_text(str(ELEMENTS_SCHEMA) + str(HIERARCHY_SCHEMA) + str(BIBTEX_SCHEMA)),
+        ),
+        'software': _software_versions(),
+        'outputs': {},
+    }
+    for name, _ in TABLES:
+        path = output / f'{name}.parquet'
+        manifest['outputs'][name] = dict(rows=counts[name], sha256=digest(path),
+                                         bytes=path.stat().st_size)
+    coverage_path = output / 'coverage.csv'
+    manifest['outputs']['coverage.csv'] = dict(rows=len(processed), sha256=digest(coverage_path),
+                                               bytes=coverage_path.stat().st_size)
+    manifest['storage']['output_bytes'] = sum(item['bytes'] for item in manifest['outputs'].values())
+    _atomic_json(output / 'manifest.json', manifest)
+    if not output_validation['ok']:
+        raise ValidationError(f'output validation failed: {output_validation["errors"][0]}')
+    return manifest
