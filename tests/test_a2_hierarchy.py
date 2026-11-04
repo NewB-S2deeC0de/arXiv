@@ -87,3 +87,75 @@ def test_heading_inside_second_command_argument_is_not_structural(tmp_path):
     result = _tree(tmp_path, r'''\documentclass{article}\begin{document}
 \href{https://example.org}{\section{Fake}}\section{Real}Text.\end{document}''')
     assert [n.attrs['title'] for n in result.root.children if n.kind == 'heading'] == ['Real']
+
+
+def test_opaque_blocks_with_blank_lines_reach_a3_as_one_paragraph(tmp_path):
+    result = _tree(tmp_path, r'''\documentclass{article}\begin{document}\section{Method}
+\begin{equation}a=b
+
+c=d\end{equation}
+\begin{figure}\caption{A}\begin{tabular}{c}x\end{tabular}
+
+\caption{B}\end{figure}
+\begin{verbatim}\section{Fake}
+
+literal\end{verbatim}\end{document}''')
+    children = result.root.children[0].children
+    assert result.status == 'ready'
+    assert len(children) == 1
+    assert all(marker in children[0].raw for marker in
+               (r'\end{equation}', r'\end{figure}', r'\end{verbatim}'))
+
+
+def test_unclosed_opaque_block_is_partial_with_raw_preserved(tmp_path):
+    result = _tree(tmp_path, r'''\documentclass{article}\begin{document}
+\begin{align}a&=b
+
+c&=d''')
+    assert result.status == 'partial'
+    assert 'unclosed_protected' in [d.code for d in result.diagnostics]
+    assert len(result.root.children) == 1
+    assert r'\begin{align}' in result.root.children[0].raw
+
+
+def test_bibliography_command_is_separated_only_with_clear_boundary(tmp_path):
+    result = _tree(tmp_path, r'''\documentclass{article}\begin{document}
+\section{Body}Body.\section{References}\bibliography{refs}
+\section{After}After.\end{document}''')
+    assert [n.attrs['title'] for n in result.root.children if n.kind == 'heading'] == ['Body', 'After']
+    assert len(result.bibliography) == 1
+    assert r'\section{References}' in result.bibliography[0].raw
+    assert r'\bibliography{refs}' in result.bibliography[0].raw
+    assert result.bibliography[0].source_spans[0].path == 'main.tex'
+
+
+def test_math_delimiters_with_blank_lines_remain_whole(tmp_path):
+    result = _tree(tmp_path, r'''\documentclass{article}\begin{document}
+Start $x+
+
+y$ and \[a
+
+b\] then $$c
+
+d$$ end.\end{document}''')
+    assert result.status == 'ready'
+    assert len(result.root.children) == 1
+    assert result.root.children[0].raw.endswith('end.')
+
+
+def test_protected_block_keeps_cross_file_provenance(tmp_path):
+    result = _tree(tmp_path,
+        r'\documentclass{article}\begin{document}\begin{equation}a\input{part}z\end{equation}\end{document}',
+        {'part.tex': 'b\n\nc'})
+    assert len(result.root.children) == 1
+    paragraph = result.root.children[0]
+    assert [span.path for span in paragraph.source_spans] == ['main.tex', 'part.tex', 'main.tex']
+    assert 'b\n\nc' in paragraph.raw
+
+
+def test_unclosed_bibliography_is_partial_and_keeps_raw(tmp_path):
+    result = _tree(tmp_path, r'\documentclass{article}\begin{document}\begin{thebibliography}{9}\bibitem{x} Text')
+    assert result.status == 'partial'
+    assert 'unclosed_protected' in [d.code for d in result.diagnostics]
+    assert len(result.bibliography) == 0
+    assert r'\bibitem{x}' in result.root.children[0].raw

@@ -58,6 +58,23 @@ def _tokens(text):
             end = text.find('\n', i)
             i = len(text) if end < 0 else end + 1
             continue
+        if text[i] == '$':
+            start = i
+            marker = '$$' if text.startswith('$$', i) else '$'
+            i += len(marker)
+            while i < len(text):
+                if text[i] == '\\':
+                    i += 2
+                elif text.startswith(marker, i):
+                    i += len(marker)
+                    break
+                else:
+                    i += 1
+            else:
+                yield 'unclosed_protected', start, len(text), marker, False
+                continue
+            yield 'protected', start, i, marker, False
+            continue
         if text[i] != '\\':
             i += 1
             continue
@@ -72,6 +89,13 @@ def _tokens(text):
             i += 1
         else:
             break
+        if name in ('[', '('):
+            closing = r'\]' if name == '[' else r'\)'
+            end = text.find(closing, i)
+            i = len(text) if end < 0 else end + len(closing)
+            yield ('protected' if end >= 0 else 'unclosed_protected',
+                   start, i, f'\\{name}', False)
+            continue
         if name == 'verb':
             if i < len(text) and text[i] == '*': i += 1
             if i < len(text):
@@ -126,12 +150,18 @@ def _tokens(text):
             closing = f'\\end{{{argument}}}'
             close = text.find(closing, i)
             i = len(text) if close < 0 else close + len(closing)
+            yield ('protected' if close >= 0 else 'unclosed_protected',
+                   start, i, argument, False)
             continue
         if name == 'begin' and argument == 'thebibliography':
             closing = r'\end{thebibliography}'
             close = text.find(closing, i)
             i = len(text) if close < 0 else close + len(closing)
-            yield 'bibliography', start, i, argument, False
+            yield ('bibliography' if close >= 0 else 'unclosed_protected',
+                   start, i, argument, False)
+            continue
+        if name in ('bibliography', 'addbibresource'):
+            yield 'bibliography', start, end, argument, False
             continue
         if name in _LEVELS or name in ('begin', 'end'):
             yield name, start, end, argument, starred
@@ -190,12 +220,19 @@ def build_hierarchy(gathered: GatheredVersion) -> HierarchyResult:
             return lists[-1][2] or lists[-1][0]
         return headings[-1]
 
+    tokens = list(_tokens(text))
+    protected = [(start, end) for name, start, end, _, _ in tokens
+                 if name in ('protected', 'unclosed_protected')]
+
     def paragraph(start, end):
         base = start
         for match in re.finditer(r'\n[ \t]*\n', text[base:end]):
             stop = base + match.start()
+            boundary_end = base + match.end()
+            if any(left < boundary_end and stop < right for left, right in protected):
+                continue
             add_paragraph(start, stop)
-            start = base + match.end()
+            start = boundary_end
         add_paragraph(start, end)
 
     def add_paragraph(start, end):
@@ -203,7 +240,12 @@ def build_hierarchy(gathered: GatheredVersion) -> HierarchyResult:
         while end > start and text[end - 1].isspace(): end -= 1
         if start < end: parent().children.append(node('paragraph', start, end))
 
-    for name, start, end, argument, starred in _tokens(text):
+    for name, start, end, argument, starred in tokens:
+        if name == 'unclosed_protected':
+            result.status = 'partial'
+            result.diagnostics.append(ParseDiagnostic(
+                'unclosed_protected', f'Unclosed {argument} environment', spans(start, end)))
+            continue
         structural = name in _LEVELS or name in ('begin', 'end', 'item', 'appendix', 'bibliography')
         if not structural: continue
         if name == 'begin' and argument == 'document':

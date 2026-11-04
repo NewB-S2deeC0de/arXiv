@@ -18,8 +18,18 @@ Only a recognized `thebibliography` environment is separated into
 `BibliographyBlock(raw, source_spans)`. An immediately preceding empty
 References/Bibliography heading is moved into the same block. An uncertain
 References heading stays in the body with `uncertain_references` diagnostic.
+An explicit `\bibliography{...}` or `\addbibresource{...}` command inside
+the document body is also separated. Preamble `\addbibresource` remains in
+A1 raw source for B2/C1. An unclosed `thebibliography` stays in the body with
+`partial` and an `unclosed_protected` diagnostic.
 Acknowledgements and appendices remain in the body. `.bib` files still belong
 to the A1 result; A2 does not parse them.
+
+Blank lines inside recognized math, figure/table, verbatim and code
+environments, and inside `$...$`, `$$...$$`, `\(...\)`, `\[...\]`, do not split
+paragraphs. Unclosed protected regions retain their raw text and set
+`partial` with a diagnostic. A3 receives these blocks in raw paragraph nodes
+and owns fine-grained leaf extraction.
 
 `unparseable` A1 input yields no root. `partial` A1 status propagates. A2 also
 sets `partial` for unbalanced lists, orphan items, or headings encountered in
