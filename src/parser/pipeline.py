@@ -260,9 +260,8 @@ def _process_publication(arxiv_id: str, records, services: ParserServices,
             stats['versions_partial'] += 1
             continue
         if parsed.tree is None:
-            stats['versions_failed'] += 1
-            errors.append(dict(arxiv_id=arxiv_id, version=version,
-                               status='failed', error='parse:no_finalized_tree'))
+            # Content chưa được finalize (B1 chưa hợp nhất). Chỉ bỏ qua lưu
+            # element; diagnostics và BibTeX đã được ghi ở trên.
             continue
         eligible_parsed.append((version, gathered, parsed))
         bib_texts = [block.raw for block in parsed.result.bibliography] or [gathered.text]
@@ -273,11 +272,11 @@ def _process_publication(arxiv_id: str, records, services: ParserServices,
     unified, mapping, bib_stats = services.unify_bibentries(versioned_bib)
 
     # Second pass: remap citations and store only finalized content.
+    # parsed.tree is None when A3/B1 has not finalized content yet (expected
+    # before B1 merges). Diagnostics and BibTeX are already recorded above;
+    # only element storage is skipped.
     for version, _, parsed in eligible_parsed:
         if parsed.tree is None:
-            stats['versions_failed'] += 1
-            errors.append(dict(arxiv_id=arxiv_id, version=version,
-                               status='failed', error='parse:no_finalized_tree'))
             continue
         _remap_tree(parsed.tree, mapping, services.remap_citations)
         store.add_tree(version, parsed.tree)

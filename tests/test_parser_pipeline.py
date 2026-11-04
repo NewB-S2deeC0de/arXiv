@@ -424,9 +424,8 @@ def test_ready_tree_none_bibtex_not_exported(tmp_path, make_source):
 
     class TreeNoneServices(FakeServices):
         def parse_document(self, gathered, arxiv_id, version):
-            base = super().parse_document(gathered, arxiv_id, version)
             block = BibliographyBlock(raw=gathered.text,
-                                      source_spans=tuple(SourceSpan('main.tex', 0, 5),))
+                                      source_spans=(SourceSpan('main.tex', 0, 5),))
             result = HierarchyResult(
                 arxiv_id=arxiv_id, version=version, status='ready', root=None,
                 bibliography=(block,), diagnostics=(),
@@ -434,7 +433,7 @@ def test_ready_tree_none_bibtex_not_exported(tmp_path, make_source):
             return ParsedDocument(result=result, tree=None)
 
     manifest = run_parser(root, services=TreeNoneServices(), include_partial=True)
-    assert manifest['versions']['versions_failed'] == 1
+    assert manifest['versions']['versions_failed'] == 0
     assert manifest['versions']['versions_parsed'] == 0
     output = root / 'parsed'
     assert pq.read_table(output / 'elements.parquet').num_rows == 0
@@ -448,9 +447,8 @@ def test_partial_tree_none_bibtex_not_exported(tmp_path, make_source):
 
     class PartialTreeNoneServices(FakeServices):
         def parse_document(self, gathered, arxiv_id, version):
-            base = super().parse_document(gathered, arxiv_id, version)
             block = BibliographyBlock(raw=gathered.text,
-                                      source_spans=tuple(SourceSpan('main.tex', 0, 5),))
+                                      source_spans=(SourceSpan('main.tex', 0, 5),))
             result = HierarchyResult(
                 arxiv_id=arxiv_id, version=version, status='partial', root=None,
                 bibliography=(block,), diagnostics=(),
@@ -458,7 +456,7 @@ def test_partial_tree_none_bibtex_not_exported(tmp_path, make_source):
             return ParsedDocument(result=result, tree=None)
 
     manifest = run_parser(root, services=PartialTreeNoneServices(), include_partial=True)
-    assert manifest['versions']['versions_failed'] == 1
+    assert manifest['versions']['versions_failed'] == 0
     assert manifest['versions']['versions_parsed'] == 0
     output = root / 'parsed'
     assert pq.read_table(output / 'elements.parquet').num_rows == 0

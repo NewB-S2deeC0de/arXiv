@@ -120,7 +120,10 @@ class DefaultParserServices:
                 'A2 build_hierarchy is not available yet. '
                 'Merge A2/A3/B1 or pass services=... to run_parser().'
             )
-        result = hierarchy.build_hierarchy(gathered.raw)
+        a2_result = hierarchy.build_hierarchy(gathered.raw)
+        result = a2_result
+        if hasattr(hierarchy, 'refine_hierarchy'):
+            result = hierarchy.refine_hierarchy(a2_result)
         return ParsedDocument(result=_to_result(result))
 
     def extract_bibitems(self, text: str, arxiv_id: str) -> list[BibEntry]:
