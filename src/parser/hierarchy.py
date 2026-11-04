@@ -52,6 +52,26 @@ _OPAQUE_ENVS = frozenset({'figure', 'figure*', 'table', 'table*', 'equation',
 _REFERENCES = frozenset({'references', 'bibliography'})
 
 
+def _skip_macro_definition(text, i):
+    """Skip a definition's name, optional arguments, and unevaluated body."""
+    if i < len(text) and text[i] == '*': i += 1
+    while i < len(text) and text[i].isspace(): i += 1
+    macro_end = _braced_end(text, i)
+    if macro_end is None and i < len(text) and text[i] == '\\':
+        control = _COMMAND_NAME.match(text, i + 1)
+        macro_end = control.end() if control else min(i + 2, len(text))
+    if macro_end is None: return i
+    i = macro_end
+    for _ in range(2):
+        while i < len(text) and text[i].isspace(): i += 1
+        if i < len(text) and text[i] == '[':
+            close = text.find(']', i + 1)
+            if close >= 0: i = close + 1
+    while i < len(text) and text[i].isspace(): i += 1
+    body_end = _braced_end(text, i)
+    return body_end if body_end is not None else i
+
+
 def _environment_end(text, start, environment):
     """Find the matching end command outside comments, verb and command arguments."""
     if environment in ('verbatim', 'verbatim*', 'comment', 'lstlisting', 'minted'):
@@ -84,6 +104,9 @@ def _environment_end(text, start, environment):
                 closing = text.find(text[i], i + 1)
                 i = len(text) if closing < 0 else closing + 1
             continue
+        if name in _MACRO_DEFINITIONS:
+            i = _skip_macro_definition(text, i)
+            continue
         arg_at = i
         while arg_at < len(text) and text[arg_at].isspace(): arg_at += 1
         end = _braced_end(text, arg_at)
@@ -99,6 +122,13 @@ def _environment_end(text, start, environment):
         elif argument == environment and name == 'end':
             depth -= 1
             if depth == 0: return i
+        elif name not in ('begin', 'end'):
+            while True:
+                next_arg = i
+                while next_arg < len(text) and text[next_arg].isspace(): next_arg += 1
+                next_end = _braced_end(text, next_arg)
+                if next_end is None: break
+                i = next_end
     return None
 
 
@@ -155,22 +185,7 @@ def _tokens(text):
                 i = len(text) if end < 0 else end + 1
             continue
         if name in _MACRO_DEFINITIONS:
-            if i < len(text) and text[i] == '*': i += 1
-            while i < len(text) and text[i].isspace(): i += 1
-            macro_end = _braced_end(text, i)
-            if macro_end is None and i < len(text) and text[i] == '\\':
-                control = _COMMAND_NAME.match(text, i + 1)
-                macro_end = control.end() if control else i + 2
-            if macro_end is None: continue
-            i = macro_end
-            for _ in range(2):
-                while i < len(text) and text[i].isspace(): i += 1
-                if i < len(text) and text[i] == '[':
-                    close = text.find(']', i + 1)
-                    if close >= 0: i = close + 1
-            while i < len(text) and text[i].isspace(): i += 1
-            body_end = _braced_end(text, i)
-            if body_end is not None: i = body_end
+            i = _skip_macro_definition(text, i)
             continue
         if name == 'appendix':
             yield name, start, i, None, False

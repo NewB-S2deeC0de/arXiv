@@ -40,6 +40,10 @@ The protected environment set includes `algorithm` and `algorithm*` in
 addition to figure/table/math/verbatim. Matching environment ends are found
 outside comments and `\verb` spans; a missing end does not silently truncate
 the block.
+Both structural scanning and end matching skip the unevaluated bodies of
+common `\newcommand` variants and braced arguments of ordinary commands, so
+an `\end{figure}` printed inside a definition or argument cannot close the
+figure early. This remains a static approximation of TeX macro expansion.
 
 `unparseable` A1 input yields no root. `partial` A1 status propagates. A2 also
 sets `partial` for unbalanced lists, orphan items, or headings encountered in

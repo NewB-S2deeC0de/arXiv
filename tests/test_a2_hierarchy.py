@@ -223,3 +223,42 @@ def test_literal_verbatim_does_not_nest_on_printed_begin_command(tmp_path):
 \begin{verbatim}\begin{verbatim} printed text\end{verbatim}\section{After}Done.\end{document}''')
     assert result.status == 'ready'
     assert [n.attrs['title'] for n in result.root.children if n.kind == 'heading'] == ['After']
+
+
+def test_protected_end_inside_macro_body_is_ignored(tmp_path):
+    result = _tree(tmp_path, r'''\documentclass{article}\begin{document}
+\begin{figure}\newcommand{\fake}{\end{figure}}
+
+\section{Fake}\caption{Actual result}\end{figure}
+\section{Real}Content.\end{document}''')
+    assert result.status == 'ready'
+    assert [node.attrs['title'] for node in result.root.children
+            if node.kind == 'heading'] == ['Real']
+    block = result.root.children[0]
+    assert block.kind == 'paragraph'
+    assert r'\newcommand{\fake}{\end{figure}}' in block.raw
+    assert r'\caption{Actual result}' in block.raw
+
+
+def test_protected_end_inside_ordinary_command_argument_is_ignored(tmp_path):
+    result = _tree(tmp_path, r'''\documentclass{article}\begin{document}
+\begin{figure}\href{url}{literal \end{figure} text}
+
+\caption{Actual}\end{figure}\section{Real}Content.\end{document}''')
+    assert result.status == 'ready'
+    assert [node.attrs['title'] for node in result.root.children
+            if node.kind == 'heading'] == ['Real']
+    assert len([node for node in result.root.children if node.kind == 'paragraph']) == 1
+    assert r'\caption{Actual}' in result.root.children[0].raw
+
+
+def test_protected_end_inside_unbraced_macro_definition_is_ignored(tmp_path):
+    result = _tree(tmp_path, r'''\documentclass{article}\begin{document}
+\begin{figure}\DeclareRobustCommand\fake[1]{\end{figure}}
+
+\caption{Actual}\end{figure}\section{Real}Text.\end{document}''')
+    assert result.status == 'ready'
+    assert [node.attrs['title'] for node in result.root.children
+            if node.kind == 'heading'] == ['Real']
+    assert len([node for node in result.root.children if node.kind == 'paragraph']) == 1
+    assert r'\caption{Actual}' in result.root.children[0].raw
