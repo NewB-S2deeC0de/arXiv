@@ -130,6 +130,9 @@ class FakeServices:
 
         return CITE_RE.sub(replace, text)
 
+    def cache_fingerprint(self):
+        return 'fake-services-v1'
+
 
 class PartialServices(FakeServices):
     def gather(self, arxiv_id, version, source_dir):
@@ -491,28 +494,56 @@ def test_resume_reprocesses_on_service_fingerprint_change(tmp_path, make_source)
     assert any('skip' not in line and 'parse' in line for line in log3), log3
 
 
-def test_resume_reprocesses_when_custom_service_without_fingerprint_changes(
-        tmp_path, make_source):
+def test_resume_reprocesses_when_service_config_changes(tmp_path, make_source):
     root = tmp_path / 'runtime'
     make_source(root, '2410.23025', 1, {'main.tex': V1}, 'succeeded')
 
-    class NoFingerprintServiceA(FakeServices):
-        pass
+    class ConfigurableServices(FakeServices):
+        def __init__(self, suffix):
+            self.suffix = suffix
 
-    class NoFingerprintServiceB(FakeServices):
-        pass
+        def cache_fingerprint(self):
+            return f'ConfigurableServices:v1:{self.suffix}'
+
+        def parse_document(self, gathered, arxiv_id, version):
+            parsed = super().parse_document(gathered, arxiv_id, version)
+            parsed.tree.children[0].content += self.suffix
+            return parsed
 
     log1 = []
-    run_parser(root, services=NoFingerprintServiceA(), log=log1.append)
+    run_parser(root, services=ConfigurableServices(' A'), log=log1.append)
     assert any('skip' not in line and 'parse' in line for line in log1), log1
 
     log2 = []
-    run_parser(root, services=NoFingerprintServiceA(), log=log2.append)
+    run_parser(root, services=ConfigurableServices(' A'), log=log2.append)
     assert any('skip' in line for line in log2), log2
 
     log3 = []
-    run_parser(root, services=NoFingerprintServiceB(), log=log3.append)
+    run_parser(root, services=ConfigurableServices(' B'), log=log3.append)
     assert any('skip' not in line and 'parse' in line for line in log3), log3
+    contents = [row['content'] for row in
+                pq.read_table(root / 'parsed' / 'elements.parquet').to_pylist()]
+    assert any(' B' in content for content in contents), contents
+
+
+def test_resume_disabled_for_service_without_fingerprint(tmp_path, make_source):
+    root = tmp_path / 'runtime'
+    make_source(root, '2410.23025', 1, {'main.tex': V1}, 'succeeded')
+
+    class NoFingerprintServices(FakeServices):
+        cache_fingerprint = None
+
+    log1 = []
+    run_parser(root, services=NoFingerprintServices(), log=log1.append)
+    assert any('skip' not in line and 'parse' in line for line in log1), log1
+
+    log2 = []
+    manifest = run_parser(root, services=NoFingerprintServices(), log=log2.append)
+    assert any('skip' not in line and 'parse' in line for line in log2), log2
+    assert manifest['resume'] == dict(
+        requested=True, effective=False,
+        disabled_reason='service_without_cache_fingerprint',
+    )
 
 
 def test_input_fingerprint_changes_when_content_changes(tmp_path, make_source):

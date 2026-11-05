@@ -171,6 +171,13 @@ element and BibTeX counts before/after deduplication, and parse time in seconds.
   shards exist. After an abrupt stop, at most the last checkpoint window (25
   publications) is reparsed; existing shards are overwritten safely.
 - `--no-resume` deletes the checkpoint and `_parts/`, then reparses from scratch.
+- A service injected via `services=...` must expose `cache_fingerprint()` to be
+  trusted for resume. If it does not, resume is disabled for that run (all
+  publications are reparsed) and `manifest.resume` records
+  `effective=false` with `disabled_reason=service_without_cache_fingerprint`.
+  The fallback fingerprint (class identity plus source-file hash) is never used
+  to reuse shards, because it cannot see runtime configuration. Declare a
+  fingerprint that includes any output-affecting settings.
 - `--limit N` limits both processing and the final merged tables to the first `N`
   publications; older shards may remain in `_parts/` but are not merged.
 - Failed/missing versions are recorded in coverage and `errors.json`; they do not

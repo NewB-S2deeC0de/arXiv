@@ -51,12 +51,13 @@ def _schema_fingerprint() -> str:
 
 
 def _service_fingerprint(services) -> str:
-    """Fingerprint a service, including custom ones without cache_fingerprint.
+    """Fingerprint a service for policy/checkpoint metadata.
 
-    A service that exposes ``cache_fingerprint()`` is trusted. Otherwise fall
-    back to the implementing class identity plus a hash of its source file, so
-    changing the service implementation still invalidates resume instead of
-    silently reusing shards from the previous implementation.
+    A service that exposes ``cache_fingerprint()`` is trusted for resume.
+    Otherwise fall back to class identity plus a hash of its source file so the
+    policy fingerprint still reflects code changes. This fallback cannot see
+    runtime configuration, so :func:`run_parser` disables resume for such
+    services instead of reusing shards.
     """
     method = getattr(services, 'cache_fingerprint', None)
     if callable(method):
@@ -441,6 +442,19 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
     if services is None and publications:
         services = load_services()
 
+    # A service without a reliable fingerprint cannot prove that cached shards
+    # match its implementation or runtime configuration. Never reuse them:
+    # reprocess instead of silently serving stale output.
+    resume_effective = resume
+    resume_disabled_reason = None
+    if (resume_effective and services is not None
+            and not callable(getattr(services, 'cache_fingerprint', None))):
+        resume_effective = False
+        resume_disabled_reason = 'service_without_cache_fingerprint'
+        if log:
+            log('resume disabled: injected service has no cache_fingerprint(); '
+                'reprocessing all publications')
+
     policy_fingerprint = _policy_fingerprint(include_partial, services)
     checkpoint = _read_json(checkpoint_path, {'schema_version': CHECKPOINT_SCHEMA,
                                               'policy_fingerprint': policy_fingerprint,
@@ -458,7 +472,8 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
     flush_every = 25
     for index, (arxiv_id, records) in enumerate(publications, start=1):
         input_fingerprint = _publication_input_fingerprint(arxiv_id, records)
-        if (resume and arxiv_id in processed and _shards_exist(parts_root, arxiv_id)
+        if (resume_effective and arxiv_id in processed
+                and _shards_exist(parts_root, arxiv_id)
                 and processed[arxiv_id].get('input_fingerprint') == input_fingerprint
                 and processed[arxiv_id].get('policy_fingerprint') == policy_fingerprint):
             if log:
@@ -512,6 +527,8 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
                               input_fingerprints=input_fingerprints),
         'generated_at': datetime.now(timezone.utc).isoformat(),
         'started_at': started_at.isoformat(),
+        'resume': dict(requested=resume, effective=resume_effective,
+                       disabled_reason=resume_disabled_reason),
         'read_only_m1': True,
         'persistent_root': str(root),
         'output_root': str(output),
