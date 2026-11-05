@@ -567,8 +567,134 @@ def test_input_fingerprint_changes_when_content_changes(tmp_path, make_source):
     assert fp_a != fp_b != fp_c
 
 
+def test_input_fingerprint_changes_with_selected_bib_and_approvals(tmp_path, make_source):
+    root = tmp_path / 'runtime'
+    make_source(root, '2410.23025', 1, {'main.tex': V1, 'refs.bib': '@misc{x}'}, 'succeeded')
+
+    from parser.pipeline import _publication_input_fingerprint
+    from parser.adapter import read_source_record
+    version_dir = root / 'data' / '2410.23025' / 'versions' / 'v1'
+    recs = [read_source_record('2410.23025', 1, version_dir)]
+
+    base = _publication_input_fingerprint('2410.23025', recs)
+    selected = _publication_input_fingerprint(
+        '2410.23025', recs,
+        selected_bib_files={('2410.23025', 1): ('refs.bib',)})
+    approved = _publication_input_fingerprint(
+        '2410.23025', recs,
+        approved_metadata_candidates={'2410.23025': ('candidate-1',)})
+
+    assert len({base, selected, approved}) == 3
+
+
+def test_pipeline_reprocesses_when_audit_sidecar_is_missing(runtime, services):
+    run_parser(runtime, services=services)
+    audit = runtime / 'parsed' / '_parts' / '2410.23025' / 'audit.json'
+    assert audit.is_file()
+    audit.unlink()
+
+    log = []
+    run_parser(runtime, services=services, log=log.append)
+
+    assert not any('skip 2410.23025' in line for line in log)
+    assert audit.is_file()
+
+
 def test_pipeline_rejects_writes_into_milestone1(runtime, services):
     with pytest.raises(ValueError, match='Milestone 1'):
         run_parser(runtime, output_root=runtime / 'data' / 'parsed', services=services)
     with pytest.raises(ValueError, match='Milestone 1'):
         run_parser(runtime, output_root=runtime / 'progress' / 'parsed', services=services)
+
+REAL_TEX = r"""
+\documentclass{article}
+\begin{document}
+\section{Introduction}
+We use \cite{alpha} and \cite{beta}.
+\bibliography{refs}
+\end{document}
+"""
+
+
+def test_default_services_run_real_a_to_b_to_c_integration(tmp_path, make_source):
+    root = tmp_path / 'runtime'
+    make_source(root, '2411.18799', 1, {
+        'main.tex': REAL_TEX,
+        'refs.bib': ('@article{alpha, title={Alpha}, year={2020}}\n'
+                     '@article{beta, title={Beta}, year={2021}}'),
+    }, 'succeeded')
+
+    manifest = run_parser(root)
+
+    assert manifest['versions']['versions_parsed'] == 1
+    assert manifest['versions']['versions_failed'] == 0
+    assert manifest['bibtex'] == dict(before_dedup=2, after_dedup=2, deduplicated=0)
+    assert manifest['quality']['citations_unresolved'] == 0
+    assert manifest['audit']['publications'] == 1
+    bibtex = pq.read_table(root / 'parsed' / 'bibtex.parquet').to_pylist()
+    assert len(bibtex) == 2
+    assert {row['title'] for row in bibtex} == {'Alpha', 'Beta'}
+    elements = pq.read_table(root / 'parsed' / 'elements.parquet').to_pylist()
+    assert any('\\cite{' in row['content'] for row in elements)
+    audit = json.loads((root / 'parsed' / 'bibtex_audit.json').read_text(encoding='utf8'))
+    publication = audit['publications']['2411.18799']
+    assert publication['mode'] == 'b_standardization'
+    assert publication['versions'][0]['status'] == 'ready'
+    assert publication['references']['result']['merge']['records']
+    assert (root / 'parsed' / '_parts' / '2411.18799' / 'audit.json').is_file()
+
+
+def test_default_services_missing_bib_is_partial_not_pending(tmp_path, make_source):
+    root = tmp_path / 'runtime'
+    make_source(root, '2411.18799', 1, {
+        'main.tex': r"""\documentclass{article}\begin{document}
+We use \cite{alpha}. \bibliography{missing}
+\end{document}""",
+    }, 'succeeded')
+
+    manifest = run_parser(root)
+
+    assert manifest['versions']['versions_partial'] == 1
+    assert manifest['versions']['versions_pending'] == 0
+    assert manifest['versions']['versions_parsed'] == 0
+    assert any(w['code'] == 'bibliography_dependency_not_in_listed_bib_files'
+               for w in manifest['validation']['warnings'])
+
+
+TWO_VERSION_TEX = r"""
+\documentclass{article}
+\begin{document}
+\section{Introduction}
+The shared claim is stable. Version-specific result \cite{same}.
+\bibliography{refs}
+\end{document}
+"""
+
+
+def test_default_services_remap_same_key_per_version_not_globally(tmp_path, make_source):
+    root = tmp_path / 'runtime'
+    for version in (1, 2):
+        make_source(root, '2411.18799', version, {
+            'main.tex': TWO_VERSION_TEX,
+            'refs.bib': (f'@article{{same, title={{Version {version}}}, '
+                         f'doi={{10.1234/ref{version}}}}}'),
+        }, 'succeeded')
+
+    manifest = run_parser(root)
+
+    assert manifest['versions']['versions_parsed'] == 2
+    bibtex = pq.read_table(root / 'parsed' / 'bibtex.parquet').to_pylist()
+    assert len(bibtex) == 2
+    assert {row['doi'] for row in bibtex} == {'10.1234/ref1', '10.1234/ref2'}
+    audit = json.loads((root / 'parsed' / 'bibtex_audit.json').read_text(encoding='utf8'))
+    mapping = audit['publications']['2411.18799']['references']['result']['merge']['mapping']
+    same = [item for item in mapping if item['old_key'] == 'same']
+    assert len(same) == 2
+    assert len({item['canonical_key'] for item in same}) == 2
+    assert all(item['canonical_key'] not in (None, 'same') for item in same)
+    elements = pq.read_table(root / 'parsed' / 'elements.parquet').to_pylist()
+    shared = [row for row in elements if row['content'] == 'The shared claim is stable.']
+    assert len(shared) == 1
+    hierarchy = pq.read_table(root / 'parsed' / 'hierarchy.parquet').to_pylist()
+    assert {edge['version'] for edge in hierarchy
+            if edge['element_id'] == shared[0]['element_id']} == {1, 2}
