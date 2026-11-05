@@ -1,5 +1,13 @@
 # Milestone 1 arXiv crawler
 
+## Milestone 2 — testing và benchmark
+
+Luồng D đang triển khai: [acceptance matrix](docs/m2-d1-acceptance-matrix.md),
+[quyết định contract của D](docs/m2-d-contract-decisions.md) và
+[cách chạy test/benchmark, báo cáo và Git](docs/m2-d-reproducibility.md).
+Benchmark CLI: `PYTHONPATH=src python -m parser.benchmark --help`.
+Chưa có kết quả Colab thật hoặc book M2 đã build; xem các blocker trong tài liệu.
+
 M2 A1 standalone multi-file gathering: [interface, example, and current limits](docs/m2-a1-gather.md).
 M2 A2 version-local hierarchy: [interface and current limits](docs/m2-a2-hierarchy.md).
 M2 A3 sentence, formula and figure leaves: [interface and current limits](docs/m2-a3-leaves.md).
