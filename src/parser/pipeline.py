@@ -14,7 +14,9 @@ import os
 import platform
 import shutil
 import time
+from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from urllib.parse import quote
 
@@ -26,7 +28,7 @@ from crawler.storage import digest
 from .adapter import publications_with_records
 from .contract import (BIBTEX_SCHEMA, ELEMENTS_SCHEMA, HIERARCHY_SCHEMA,
                        GatheredSource, GatherError, ParsedDocument,
-                       ParserServices, SourceStatus, TreeNode,
+                       ParserServices, SourceStatus, TreeNode, VersionInput,
                        bibtex_rows, element_rows, hierarchy_rows)
 from .dedup import ElementStore
 from .integration import load_services
@@ -102,7 +104,9 @@ def _file_content_fingerprint(path: Path) -> str:
         return 'missing'
 
 
-def _publication_input_fingerprint(arxiv_id: str, records) -> str:
+def _publication_input_fingerprint(arxiv_id: str, records, *,
+                                   selected_bib_files=None,
+                                   approved_metadata_candidates=None) -> str:
     parts = [arxiv_id]
     for record in sorted(records, key=lambda item: item.version):
         parts.append(f"v{record.version}:{_status_text(record.status)}:{record.error or ''}")
@@ -113,6 +117,18 @@ def _publication_input_fingerprint(arxiv_id: str, records) -> str:
             except ValueError:
                 rel = path.name
             parts.append(f"{rel.as_posix()}:{_file_content_fingerprint(path)}")
+    decisions = {}
+    if selected_bib_files:
+        decisions['selected_bib_files'] = {
+            str(version): list(files)
+            for (publication, version), files in selected_bib_files.items()
+            if publication == arxiv_id
+        }
+    if approved_metadata_candidates:
+        decisions['approved_metadata_candidates'] = list(
+            approved_metadata_candidates.get(arxiv_id, ()))
+    if decisions:
+        parts.append(json.dumps(decisions, sort_keys=True, default=list))
     return _sha256_text('|'.join(parts))
 
 
@@ -165,7 +181,8 @@ def _version_stats() -> dict:
                 missing=0, gather_failed=0,
                 elements_before=0, elements_after=0,
                 bibtex_before=0, bibtex_after=0, bibtex_duplicates=0,
-                seconds=0.0)
+                citations_unresolved=0, bibtex_conflicts=0,
+                bibtex_conflict_fields=0, seconds=0.0)
 
 
 def _remap_tree(node: TreeNode, mapping: dict[str, str], remap) -> None:
@@ -174,7 +191,99 @@ def _remap_tree(node: TreeNode, mapping: dict[str, str], remap) -> None:
         _remap_tree(child, mapping, remap)
 
 
-def _process_publication(arxiv_id: str, records, services: ParserServices,
+def _span_dict(span) -> dict:
+    if isinstance(span, dict):
+        return dict(path=span.get('path'), start=span.get('start'), end=span.get('end'))
+    return dict(path=getattr(span, 'path', None), start=getattr(span, 'start', None),
+                end=getattr(span, 'end', None))
+
+
+def _diagnostic_warning(arxiv_id, version, stage, item, *, path=None) -> dict:
+    spans = [_span_dict(span) for span in (getattr(item, 'source_spans', None) or ())]
+    start = getattr(item, 'start', None)
+    end = getattr(item, 'end', None)
+    if not spans and start is not None:
+        spans = [dict(path=path, start=start, end=end)]
+    first = spans[0] if spans else {}
+    return dict(
+        arxiv_id=arxiv_id, version=version, status='parse_warning', stage=stage,
+        code=str(getattr(item, 'code', 'diagnostic')),
+        message=str(getattr(item, 'message', '')),
+        severity=str(getattr(item, 'severity', 'warning')),
+        path=first.get('path'), start=first.get('start'), end=first.get('end'),
+        spans=spans,
+    )
+
+
+def _source_texts(gathered, source_dir: Path) -> dict[str, str] | None:
+    """Decode exactly A1's files; return None rather than a partial guess."""
+    raw = getattr(gathered, 'raw', None)
+    names = getattr(raw, 'used_tex_files', None)
+    if not names:
+        return None
+    texts = {}
+    for name in names:
+        try:
+            texts[name] = (Path(source_dir) / name).read_text(encoding='utf8')
+        except (OSError, UnicodeError):
+            return None
+    return texts or None
+
+
+def _jsonable(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Enum):
+        return value.value
+    if is_dataclass(value) and not isinstance(value, type):
+        return {field.name: _jsonable(getattr(value, field.name))
+                for field in fields(value)}
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_jsonable(item) for item in value]
+    return str(value)
+
+
+def _standardization_audit(arxiv_id: str, standardized, services,
+                           warnings, errors) -> dict:
+    audit = dict(
+        schema_version=1,
+        arxiv_id=arxiv_id,
+        mode='b_standardization',
+        versions=[],
+        references=None,
+        warnings=warnings,
+        errors=errors,
+    )
+    method = getattr(services, 'audit_payload', None)
+    if callable(method) and getattr(standardized, 'references', None) is not None:
+        audit['references'] = method(standardized)
+    for version in getattr(standardized, 'versions', ()) or ():
+        finalized = getattr(version, 'finalized', None)
+        audit['versions'].append(dict(
+            version=getattr(version, 'version', None),
+            status=getattr(version, 'status', None),
+            normalized=_jsonable(getattr(version, 'normalized', None)),
+            bibliography=_jsonable(getattr(version, 'bibliography', None)),
+            finalized=None if finalized is None else dict(
+                tree=_jsonable(getattr(finalized, 'tree', None)),
+                nodes=_jsonable(getattr(finalized, 'nodes', ())),
+            ),
+        ))
+    return _jsonable(audit)
+
+
+def _legacy_audit(arxiv_id: str, warnings, errors) -> dict:
+    return _jsonable(dict(
+        schema_version=1, arxiv_id=arxiv_id, mode='legacy_service',
+        versions=[], references=None, warnings=warnings, errors=errors,
+    ))
+
+
+def _process_publication_legacy(arxiv_id: str, records, services: ParserServices,
                          include_partial: bool = False
                          ) -> tuple[dict, list[dict], list[dict], dict[str, list[dict]]]:
     stats = _version_stats()
@@ -333,22 +442,286 @@ def _process_publication(arxiv_id: str, records, services: ParserServices,
     rows['bibtex'] = bibtex_rows(sorted(unified, key=lambda entry: entry.citation_key))
     validation = validate_or_raise(arxiv_id, rows)
     warnings.extend(validation['warnings'])
+    stats['citations_unresolved'] = len({item['citation_key'] for item in validation['warnings']
+                                         if item.get('code') == 'unresolved_citation'})
     return stats, errors, warnings, rows
 
 
-def _write_shards(parts_root: Path, arxiv_id: str, rows: dict[str, list[dict]]) -> None:
-    part_dir = parts_root / quote(arxiv_id, safe='')
-    if part_dir.exists():
-        shutil.rmtree(part_dir)
-    part_dir.mkdir(parents=True, exist_ok=True)
+def _process_publication_b(arxiv_id: str, records, services: ParserServices, *,
+                           include_partial: bool = False,
+                           selected_bib_files=None,
+                           approved_metadata_candidates=None):
+    stats = _version_stats()
+    errors: list[dict] = []
+    warnings: list[dict] = []
+    store = ElementStore(arxiv_id)
+    rows: dict[str, list[dict]] = {'elements': [], 'hierarchy': [], 'bibtex': []}
+    gathered_versions = []
+
+    for record in sorted(records, key=lambda item: item.version):
+        stats['versions_total'] += 1
+        if record.status is SourceStatus.MISSING:
+            stats['missing'] += 1
+            errors.append(dict(arxiv_id=arxiv_id, version=record.version,
+                               status='missing', error=record.error or 'missing'))
+            continue
+        if record.status is SourceStatus.FAILED:
+            stats['versions_failed'] += 1
+            errors.append(dict(arxiv_id=arxiv_id, version=record.version,
+                               status='failed', error=record.error or 'failed'))
+            continue
+        if record.status is SourceStatus.NO_TEX or not record.tex_files:
+            stats['versions_empty'] += 1
+            continue
+        source_dir = record.source_path / 'tex'
+        try:
+            gathered = services.gather(arxiv_id, record.version, source_dir)
+        except GatherError as exc:
+            stats['gather_failed'] += 1
+            stats['versions_failed'] += 1
+            errors.append(dict(arxiv_id=arxiv_id, version=record.version,
+                               status='failed', error=f'gather:{exc}'))
+            continue
+        except Exception as exc:
+            stats['gather_failed'] += 1
+            stats['versions_failed'] += 1
+            errors.append(dict(arxiv_id=arxiv_id, version=record.version,
+                               status='failed',
+                               error=f'gather:{type(exc).__name__}:{exc}'))
+            continue
+        for diagnostic in gathered.diagnostics:
+            spans = _spans_of(diagnostic)
+            first = spans[0] if spans else {}
+            warnings.append(dict(
+                arxiv_id=arxiv_id, version=record.version, status='gather_warning',
+                stage='gather',
+                code=diagnostic.code, message=diagnostic.message,
+                severity=diagnostic.severity,
+                path=first.get('path'), start=first.get('start'), end=first.get('end'),
+                spans=spans,
+            ))
+        if gathered.status == 'unparseable':
+            stats['gather_failed'] += 1
+            stats['versions_failed'] += 1
+            detail = '; '.join(
+                f'{diagnostic.code}: {diagnostic.message}'
+                for diagnostic in gathered.diagnostics
+            ) or 'unparseable source'
+            errors.append(dict(arxiv_id=arxiv_id, version=record.version,
+                               status='failed', error=f'gather:unparseable:{detail}'))
+            continue
+        if gathered.status not in ('ready', 'partial'):
+            stats['gather_failed'] += 1
+            stats['versions_failed'] += 1
+            errors.append(dict(arxiv_id=arxiv_id, version=record.version,
+                               status='failed', error=f'gather:invalid_status:{gathered.status}'))
+            continue
+        gathered_versions.append((record.version, gathered, source_dir))
+
+    parsed_versions = []
+    for version, gathered, source_dir in gathered_versions:
+        try:
+            parsed = services.parse_document(gathered, arxiv_id, version)
+        except Exception as exc:
+            stats['versions_failed'] += 1
+            errors.append(dict(arxiv_id=arxiv_id, version=version,
+                               status='failed', error=f'parse:{type(exc).__name__}:{exc}'))
+            continue
+        for diagnostic in parsed.result.diagnostics:
+            spans = _spans_of(diagnostic)
+            first = spans[0] if spans else {}
+            warnings.append(dict(
+                arxiv_id=arxiv_id, version=version, status='parse_warning',
+                stage='parse',
+                code=diagnostic.code, message=diagnostic.message,
+                severity=diagnostic.severity,
+                path=first.get('path'), start=first.get('start'), end=first.get('end'),
+                spans=spans,
+            ))
+        if parsed.result.status == 'unparseable':
+            stats['versions_failed'] += 1
+            detail = '; '.join(
+                f'{diagnostic.code}: {diagnostic.message}'
+                for diagnostic in parsed.result.diagnostics
+            ) or 'unparseable source'
+            errors.append(dict(arxiv_id=arxiv_id, version=version,
+                               status='failed', error=f'parse:unparseable:{detail}'))
+            continue
+        if parsed.result.status not in ('ready', 'partial'):
+            stats['versions_failed'] += 1
+            errors.append(dict(arxiv_id=arxiv_id, version=version,
+                               status='failed', error=f'parse:invalid_status:{parsed.result.status}'))
+            continue
+        parsed_versions.append((version, gathered, parsed, source_dir))
+
+    overrides = selected_bib_files or {}
+    items = []
+    for version, gathered, parsed, source_dir in parsed_versions:
+        chosen = overrides.get((arxiv_id, version))
+        if chosen is not None:
+            chosen = tuple(chosen)
+        items.append(VersionInput(
+            hierarchy=parsed.result,
+            gathered=gathered.raw,
+            source_dir=source_dir,
+            source_texts=_source_texts(gathered, source_dir),
+            selected_bib_files=chosen,
+        ))
+    approved = ()
+    if approved_metadata_candidates:
+        approved = tuple(approved_metadata_candidates.get(arxiv_id, ()))
+
+    try:
+        standardized = services.standardize_publication(
+            arxiv_id, items, node_factory=TreeNode,
+            include_partial=include_partial,
+            approved_metadata_candidates=approved,
+        )
+    except Exception as exc:
+        for version, _, _, _ in parsed_versions:
+            stats['versions_failed'] += 1
+            errors.append(dict(arxiv_id=arxiv_id, version=version,
+                               status='failed',
+                               error=f'standardize:{type(exc).__name__}:{exc}'))
+        audit = _standardization_audit(arxiv_id, None, services, warnings, errors)
+        return stats, errors, warnings, rows, audit
+
+    seen_versions = set()
+    for version in getattr(standardized, 'versions', ()) or ():
+        seen_versions.add(version.version)
+        status = str(version.status)
+        for diagnostic in getattr(getattr(version, 'normalized', None), 'diagnostics', ()) or ():
+            warnings.append(_diagnostic_warning(arxiv_id, version.version, 'normalize', diagnostic))
+        bibliography = getattr(version, 'bibliography', None)
+        for diagnostic in getattr(bibliography, 'selection_diagnostics', ()) or ():
+            warnings.append(_diagnostic_warning(arxiv_id, version.version,
+                                                'bibliography', diagnostic))
+        for resource in getattr(bibliography, 'resources', ()) or ():
+            if getattr(resource, 'diagnostic', None) is not None:
+                warnings.append(_diagnostic_warning(
+                    arxiv_id, version.version, 'bibliography_read',
+                    resource.diagnostic, path=getattr(resource, 'path', None)))
+            parsed_resource = getattr(resource, 'parsed', None)
+            for diagnostic in getattr(parsed_resource, 'warnings', ()) or ():
+                warnings.append(_diagnostic_warning(
+                    arxiv_id, version.version, 'bibliography_parse',
+                    diagnostic, path=getattr(resource, 'path', None)))
+        finalized = getattr(version, 'finalized', None)
+        tree = getattr(finalized, 'tree', None) if finalized is not None else None
+        if tree is not None:
+            store.add_tree(version.version, tree)
+            stats['versions_parsed'] += 1
+        elif status == 'partial' and not include_partial:
+            stats['versions_partial'] += 1
+        else:
+            stats['versions_pending'] += 1
+            warnings.append(dict(
+                arxiv_id=arxiv_id, version=version.version, status='parse_warning',
+                stage='standardize', code='no_finalized_tree',
+                message='Version has no finalized tree; element rows are skipped.',
+                path=None, start=None, end=None, spans=[],
+            ))
+
+    for version, _, _, _ in parsed_versions:
+        if version not in seen_versions:
+            stats['versions_pending'] += 1
+            warnings.append(dict(
+                arxiv_id=arxiv_id, version=version, status='parse_warning',
+                stage='standardize', code='version_not_returned',
+                message='Standardization did not return this version.',
+                path=None, start=None, end=None, spans=[],
+            ))
+
+    references = getattr(standardized, 'references', None)
+    for finding in getattr(references, 'findings', ()) or ():
+        code = str(getattr(finding, 'code', 'reference_finding'))
+        if code in ('ambiguous_old_key', 'ambiguous_citation_mapping'):
+            code = 'ambiguous_reference_key'
+        warnings.append(dict(
+            arxiv_id=arxiv_id, version=None, status='parse_warning',
+            stage='references', code=code,
+            message=str(getattr(finding, 'message', '')),
+            severity='warning', path=None, start=None, end=None, spans=[],
+        ))
+
+    merge = getattr(references, 'merge', None)
+    records_found = getattr(merge, 'records', ()) if merge is not None else ()
+    occurrences = getattr(merge, 'occurrences', ()) if merge is not None else ()
+    for record in records_found:
+        payload = record.payload.as_kwargs()
+        rows['bibtex'].append({name: payload.get(name) for name in BIBTEX_SCHEMA.names})
+    rows['bibtex'].sort(key=lambda row: row['citation_key'])
+    stats['bibtex_before'] = len(occurrences)
+    stats['bibtex_after'] = len(records_found)
+    stats['bibtex_duplicates'] = max(0, stats['bibtex_before'] - stats['bibtex_after'])
+    stats['bibtex_conflicts'] = sum(1 for record in records_found
+                                    if getattr(record, 'conflicts', ()))
+    stats['bibtex_conflict_fields'] = sum(len(getattr(record, 'conflicts', ()))
+                                          for record in records_found)
+
+    rows['elements'] = element_rows(store.sorted_elements())
+    rows['hierarchy'] = hierarchy_rows(store.sorted_edges())
+    validation = validate_or_raise(arxiv_id, rows)
+    warnings.extend(validation['warnings'])
+    stats['citations_unresolved'] = len({item['citation_key'] for item in validation['warnings']
+                                         if item.get('code') == 'unresolved_citation'})
+    stats['elements_before'] = store.total_nodes
+    stats['elements_after'] = store.distinct_elements
+    audit = _standardization_audit(arxiv_id, standardized, services, warnings, errors)
+    return stats, errors, warnings, rows, audit
+
+
+def _process_publication(arxiv_id: str, records, services: ParserServices, *,
+                         include_partial: bool = False,
+                         selected_bib_files=None,
+                         approved_metadata_candidates=None):
+    if callable(getattr(services, 'standardize_publication', None)):
+        return _process_publication_b(
+            arxiv_id, records, services, include_partial=include_partial,
+            selected_bib_files=selected_bib_files,
+            approved_metadata_candidates=approved_metadata_candidates)
+    stats, errors, warnings, rows = _process_publication_legacy(
+        arxiv_id, records, services, include_partial=include_partial)
+    return stats, errors, warnings, rows, _legacy_audit(arxiv_id, warnings, errors)
+
+
+def _write_shards(parts_root: Path, arxiv_id: str, rows: dict[str, list[dict]],
+                  audit: dict) -> None:
+    encoded = quote(arxiv_id, safe='')
+    part_dir = parts_root / encoded
+    temporary = parts_root / f'{encoded}.tmp'
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    temporary.mkdir(parents=True, exist_ok=True)
     for name, schema in TABLES:
         table = pa.Table.from_pylist(rows[name], schema=schema)
-        pq.write_table(table, part_dir / f'{name}.parquet')
+        pq.write_table(table, temporary / f'{name}.parquet')
+    _atomic_json(temporary / 'audit.json', audit)
+    if part_dir.exists():
+        shutil.rmtree(part_dir)
+    temporary.replace(part_dir)
+
+
+def _audit_is_valid(path: Path, arxiv_id: str) -> bool:
+    payload = _read_json(path, None)
+    return (isinstance(payload, dict) and payload.get('schema_version') == 1
+            and payload.get('arxiv_id') == arxiv_id)
 
 
 def _shards_exist(parts_root: Path, arxiv_id: str) -> bool:
     part_dir = parts_root / quote(arxiv_id, safe='')
-    return all((part_dir / f'{name}.parquet').is_file() for name, _ in TABLES)
+    return (all((part_dir / f'{name}.parquet').is_file() for name, _ in TABLES)
+            and _audit_is_valid(part_dir / 'audit.json', arxiv_id))
+
+
+def _publication_audits(parts_root: Path, arxiv_ids) -> dict:
+    audits = {}
+    for arxiv_id in sorted(arxiv_ids):
+        path = parts_root / quote(arxiv_id, safe='') / 'audit.json'
+        payload = _read_json(path, None)
+        if isinstance(payload, dict):
+            audits[arxiv_id] = payload
+    return audits
 
 
 def _merge_parts(parts_root: Path, output_root: Path, arxiv_ids) -> dict[str, int]:
@@ -374,9 +747,10 @@ def _merge_parts(parts_root: Path, output_root: Path, arxiv_ids) -> dict[str, in
 
 def _write_coverage(output_root: Path, processed: dict) -> None:
     columns = ['arxiv_id', 'versions_total', 'versions_parsed', 'versions_empty',
-               'versions_failed', 'missing', 'gather_failed', 'elements_before',
-               'elements_after', 'bibtex_before', 'bibtex_after', 'bibtex_duplicates',
-               'seconds']
+               'versions_partial', 'versions_pending', 'versions_failed', 'missing',
+               'gather_failed', 'elements_before', 'elements_after', 'bibtex_before',
+               'bibtex_after', 'bibtex_duplicates', 'citations_unresolved',
+               'bibtex_conflicts', 'bibtex_conflict_fields', 'seconds']
     path = output_root / 'coverage.csv'
     with path.open('w', newline='', encoding='utf8') as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
@@ -416,7 +790,9 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
                resume: bool = True,
                log=None,
                services: ParserServices | None = None,
-               include_partial: bool = False) -> dict:
+               include_partial: bool = False,
+               selected_bib_files: dict | None = None,
+               approved_metadata_candidates: dict | None = None) -> dict:
     """Parse all Milestone 1 publications and write the three M2 tables.
 
     ``services`` injects the A1/A2/A3/B1/B2/B3 boundary. When omitted, the real
@@ -471,7 +847,9 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
     dirty = False
     flush_every = 25
     for index, (arxiv_id, records) in enumerate(publications, start=1):
-        input_fingerprint = _publication_input_fingerprint(arxiv_id, records)
+        input_fingerprint = _publication_input_fingerprint(
+            arxiv_id, records, selected_bib_files=selected_bib_files,
+            approved_metadata_candidates=approved_metadata_candidates)
         if (resume_effective and arxiv_id in processed
                 and _shards_exist(parts_root, arxiv_id)
                 and processed[arxiv_id].get('input_fingerprint') == input_fingerprint
@@ -482,11 +860,13 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
         if log:
             log(f'[{index}/{len(publications)}] parse {arxiv_id} ({len(records)} versions)')
         publication_started = time.perf_counter()
-        stats, errors, warnings, rows = _process_publication(
-            arxiv_id, records, services, include_partial=include_partial
+        stats, errors, warnings, rows, audit = _process_publication(
+            arxiv_id, records, services, include_partial=include_partial,
+            selected_bib_files=selected_bib_files,
+            approved_metadata_candidates=approved_metadata_candidates,
         )
         stats['seconds'] = round(time.perf_counter() - publication_started, 3)
-        _write_shards(parts_root, arxiv_id, rows)
+        _write_shards(parts_root, arxiv_id, rows, audit)
         processed[arxiv_id] = dict(stats=stats, errors=errors, warnings=warnings,
                                    input_fingerprint=input_fingerprint,
                                    policy_fingerprint=policy_fingerprint)
@@ -503,6 +883,9 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
 
     counts = _merge_parts(parts_root, output, input_ids)
     _write_coverage(output, processed)
+    audits = _publication_audits(parts_root, input_ids)
+    _atomic_json(output / 'bibtex_audit.json',
+                 dict(schema_version=1, publications=audits))
     errors = [error for item in processed.values() for error in item.get('errors', [])]
     warnings = [warning for item in processed.values() for warning in item.get('warnings', [])]
     _atomic_json(output / 'errors.json', errors)
@@ -516,8 +899,12 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
 
     input_fingerprints = {arxiv_id: item.get('input_fingerprint')
                           for arxiv_id, item in processed.items()}
-    config_payload = dict(persistent_root=str(root), output_root=str(output),
-                          limit=limit, resume=resume, include_partial=include_partial)
+    config_payload = dict(
+        persistent_root=str(root), output_root=str(output), limit=limit,
+        resume=resume, include_partial=include_partial,
+        selected_bib_overrides=len(selected_bib_files or {}),
+        approved_metadata_publications=len(approved_metadata_candidates or {}),
+    )
     manifest = {
         'schema_version': MANIFEST_SCHEMA,
         'parser_version': PARSER_VERSION,
@@ -545,6 +932,11 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
         'bibtex': dict(before_dedup=aggregate['bibtex_before'],
                        after_dedup=aggregate['bibtex_after'],
                        deduplicated=aggregate['bibtex_duplicates']),
+        'quality': dict(citations_unresolved=aggregate['citations_unresolved'],
+                        bibtex_conflicts=aggregate['bibtex_conflicts'],
+                        bibtex_conflict_fields=aggregate['bibtex_conflict_fields']),
+        'audit': dict(schema_version=1, publications=len(audits),
+                      path='bibtex_audit.json'),
         'empty_versions': aggregate['versions_empty'],
         'timing': dict(elapsed_seconds=round(elapsed, 3),
                        average_seconds_per_publication=round(elapsed / len(processed), 3)
@@ -574,6 +966,9 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
     coverage_path = output / 'coverage.csv'
     manifest['outputs']['coverage.csv'] = dict(rows=len(processed), sha256=digest(coverage_path),
                                                bytes=coverage_path.stat().st_size)
+    audit_path = output / 'bibtex_audit.json'
+    manifest['outputs']['bibtex_audit.json'] = dict(
+        rows=len(audits), sha256=digest(audit_path), bytes=audit_path.stat().st_size)
     manifest['storage']['output_bytes'] = sum(item['bytes'] for item in manifest['outputs'].values())
     _atomic_json(output / 'manifest.json', manifest)
     if not output_validation['ok']:
