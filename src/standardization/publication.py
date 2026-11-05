@@ -54,10 +54,13 @@ def standardize_publication(arxiv_id, versions, *, node_factory, include_partial
             selected_bib_files=() if hierarchy.status == 'unparseable' else item.selected_bib_files)
         normalized = normalize_a3_hierarchy(hierarchy, source_texts=item.source_texts)
         status = hierarchy.status
-        if status == 'ready' and (bibliography.selection_diagnostics or any(
+        if status == 'ready' and (
+            normalized.source_mapping_failures or bibliography.selection_diagnostics or any(
                 resource.diagnostic is not None or any(
                     warning.code in _INCOMPLETE_BIBTEX for warning in resource.parsed.warnings)
-                for resource in bibliography.resources)):
+                for resource in bibliography.resources
+            )
+        ):
             status = 'partial'
         eligible = status == 'ready' or (include_partial and status == 'partial')
         if eligible:
