@@ -212,21 +212,20 @@ output guard.
 - Missing citation keys are warnings, not hard failures, because sources may
   contain intentionally undefined references.
 - `versions_pending` counts versions that are `ready` from A1 but have no
-  finalized `tree` yet (A3/B1 not merged). These versions produce diagnostics
-  and BibTeX are skipped, but no element/hierarchy rows are written. They are
+  finalized `tree` yet (A3/B1 not merged). These versions keep diagnostics but
+  their BibTeX is skipped and no element/hierarchy rows are written. They are
   not counted as failed or parsed.
 - `manifest.parser_policy.policy_fingerprint` hashes parser version, schemas,
-  `include_partial` policy, the A/B service `cache_fingerprint` (when the
-  injected service exposes one), and the input fingerprints of processed
-  publications. `manifest.input_fingerprints` records per-publication input
+  `include_partial` policy, the service `cache_fingerprint`, and the input
+  fingerprints of processed publications. The default service fingerprints every
+  parser source file, so any A/B/C code change invalidates resume. A custom
+  service without `cache_fingerprint()` falls back to its class identity and
+  source-file hash. `manifest.input_fingerprints` records per-publication input
   fingerprints (version, status, source file content hash). The checkpoint
   stores the same fingerprints and refuses to reuse a shard when policy or
   input changed; resume is reset automatically when the checkpoint schema or
   policy fingerprint differs.
 - `peak_rss_bytes` is process peak RSS, not a per-publication measurement.
-- BibTeX extraction handles `\bibitem`-style bibliographies. `\bibitem`-free
-  setups that rely on external `.bib` files still produce hierarchy content but
-  no `bibtex` rows; `.bib` parsing is not part of this milestone.
 - BibTeX extraction handles `\bibitem`-style bibliographies. `\bibitem`-free
   setups that rely on external `.bib` files still produce hierarchy content but
   no `bibtex` rows; `.bib` parsing is not part of this milestone.

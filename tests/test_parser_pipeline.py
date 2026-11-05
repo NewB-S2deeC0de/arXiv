@@ -491,6 +491,30 @@ def test_resume_reprocesses_on_service_fingerprint_change(tmp_path, make_source)
     assert any('skip' not in line and 'parse' in line for line in log3), log3
 
 
+def test_resume_reprocesses_when_custom_service_without_fingerprint_changes(
+        tmp_path, make_source):
+    root = tmp_path / 'runtime'
+    make_source(root, '2410.23025', 1, {'main.tex': V1}, 'succeeded')
+
+    class NoFingerprintServiceA(FakeServices):
+        pass
+
+    class NoFingerprintServiceB(FakeServices):
+        pass
+
+    log1 = []
+    run_parser(root, services=NoFingerprintServiceA(), log=log1.append)
+    assert any('skip' not in line and 'parse' in line for line in log1), log1
+
+    log2 = []
+    run_parser(root, services=NoFingerprintServiceA(), log=log2.append)
+    assert any('skip' in line for line in log2), log2
+
+    log3 = []
+    run_parser(root, services=NoFingerprintServiceB(), log=log3.append)
+    assert any('skip' not in line and 'parse' in line for line in log3), log3
+
+
 def test_input_fingerprint_changes_when_content_changes(tmp_path, make_source):
     root = tmp_path / 'runtime'
     make_source(root, '2410.23025', 1, {'main.tex': V1, 'refs.bib': '@misc{x}'}, 'succeeded')

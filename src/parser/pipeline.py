@@ -42,8 +42,39 @@ def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode('utf8')).hexdigest()
 
 
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
 def _schema_fingerprint() -> str:
     return _sha256_text(str(ELEMENTS_SCHEMA) + str(HIERARCHY_SCHEMA) + str(BIBTEX_SCHEMA))
+
+
+def _service_fingerprint(services) -> str:
+    """Fingerprint a service, including custom ones without cache_fingerprint.
+
+    A service that exposes ``cache_fingerprint()`` is trusted. Otherwise fall
+    back to the implementing class identity plus a hash of its source file, so
+    changing the service implementation still invalidates resume instead of
+    silently reusing shards from the previous implementation.
+    """
+    method = getattr(services, 'cache_fingerprint', None)
+    if callable(method):
+        return str(method())
+    cls = type(services)
+    source_hash = ''
+    try:
+        import inspect
+        source = inspect.getsourcefile(cls) or inspect.getfile(cls)
+    except (TypeError, OSError):
+        source = None
+    if source:
+        try:
+            source_hash = _sha256_bytes(Path(source).read_bytes())
+        except OSError:
+            source_hash = ''
+    identity = f'{cls.__module__}.{cls.__qualname__}'
+    return _sha256_text(json.dumps([identity, source_hash], sort_keys=True))
 
 
 def _policy_fingerprint(include_partial: bool,
@@ -53,8 +84,8 @@ def _policy_fingerprint(include_partial: bool,
         include_partial=include_partial,
         schema=_schema_fingerprint(),
     )
-    if services is not None and hasattr(services, 'cache_fingerprint'):
-        payload['services'] = services.cache_fingerprint()
+    if services is not None:
+        payload['services'] = _service_fingerprint(services)
     return _sha256_text(json.dumps(payload, sort_keys=True))
 
 

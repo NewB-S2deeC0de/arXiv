@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import hashlib
+import json
 
 from .contract import (BibEntry, BibliographyBlock, GatherDiagnostic,
                        GatheredSource, HierarchyResult, ParseDiagnostic,
@@ -22,6 +23,22 @@ class ParserDependencyError(RuntimeError):
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode('utf8')).hexdigest()
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _parser_module_fingerprint() -> dict[str, str]:
+    """Hash every parser source file so A/B/C code changes invalidate resume."""
+    base = Path(__file__).resolve().parent
+    fingerprints = {}
+    for path in sorted(base.glob('*.py')):
+        try:
+            fingerprints[path.name] = _sha256_bytes(path.read_bytes())
+        except OSError:
+            fingerprints[path.name] = 'unreadable'
+    return fingerprints
 
 
 def _to_span(span) -> SourceSpan:
@@ -133,8 +150,14 @@ class DefaultParserServices:
         return ParsedDocument(result=_to_result(a3_result))
 
     def cache_fingerprint(self) -> str:
-        """Fingerprint of the A/B service implementation for cache invalidation."""
-        return _sha256_text('A1+A2+A3+B1+B2+B3 provisional'.encode('utf8'))
+        """Fingerprint of the A/B service implementation for cache invalidation.
+
+        Hashes the source of every parser module so any code change that can
+        affect output invalidates cached shards, instead of relying on a
+        manually bumped constant.
+        """
+        return _sha256_text(json.dumps(_parser_module_fingerprint(),
+                                       sort_keys=True))
 
     def extract_bibitems(self, text: str, arxiv_id: str) -> list[BibEntry]:
         from .bibtex import extract_bibitems
@@ -156,7 +179,8 @@ class DefaultParserServices:
 def load_services() -> ParserServices:
     """Load the real A/B implementations, with a clear error while unmerged."""
     try:
-        from . import bibtex, gather, hierarchy  # noqa: F401
+        from . import bibtex, gather, hierarchy, leaves  # noqa: F401
+        from .leaves import refine_hierarchy  # noqa: F401
     except ImportError as exc:
         raise ParserDependencyError(
             'A1/A2/A3/B1/B2/B3 parser modules are not available. '

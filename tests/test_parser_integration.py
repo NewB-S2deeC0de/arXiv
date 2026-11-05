@@ -1,4 +1,7 @@
+import re
+
 from parser.integration import DefaultParserServices
+from parser.pipeline import _policy_fingerprint
 
 
 def test_default_services_convert_a1_ready_gather(tmp_path):
@@ -42,3 +45,21 @@ def test_default_services_convert_a1_unparseable_source(tmp_path):
     assert gathered.text == ''
     assert gathered.root_file is None
     assert [item.code for item in gathered.diagnostics] == ['no_root']
+
+
+def test_default_services_cache_fingerprint_is_hex_and_stable():
+    service = DefaultParserServices()
+
+    first = service.cache_fingerprint()
+    second = service.cache_fingerprint()
+
+    assert isinstance(first, str)
+    assert first == second
+    assert re.fullmatch(r'[0-9a-f]{64}', first)
+
+
+def test_default_services_policy_fingerprint_uses_service():
+    fingerprint = _policy_fingerprint(True, DefaultParserServices())
+
+    assert isinstance(fingerprint, str)
+    assert re.fullmatch(r'[0-9a-f]{64}', fingerprint)
