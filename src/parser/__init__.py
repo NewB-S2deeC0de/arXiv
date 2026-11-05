@@ -3,7 +3,8 @@
 from .gather import GatherDiagnostic, GatheredSegment, GatheredVersion, SourceSpan, gather_version
 from .hierarchy import HierarchyResult, ParseDiagnostic, ParseNode, build_hierarchy
 from .leaves import refine_hierarchy
+from .pipeline import run_parser
 
 __all__ = ['GatherDiagnostic', 'GatheredSegment', 'GatheredVersion', 'SourceSpan',
            'gather_version', 'HierarchyResult', 'ParseDiagnostic', 'ParseNode',
-           'build_hierarchy', 'refine_hierarchy']
+           'build_hierarchy', 'refine_hierarchy', 'run_parser']
