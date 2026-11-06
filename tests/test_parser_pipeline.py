@@ -757,9 +757,14 @@ def test_source_texts_read_error_downgrades_to_partial(tmp_path, make_source, mo
 
     assert manifest['versions']['versions_parsed'] == 0
     assert manifest['versions']['versions_partial'] == 1
+    assert manifest['versions']['versions_pending'] == 0
     assert manifest['versions']['versions_failed'] == 0
     assert any(w['code'] == 'source_texts_unavailable'
                for w in manifest['validation']['warnings'])
+    assert not any(
+        warning['code'] == 'version_not_returned'
+        for warning in manifest['validation']['warnings']
+    )
 
     # The failed-to-read version must still be recorded in the audit sidecar.
     audit = json.loads((root / 'parsed' / 'bibtex_audit.json').read_text(encoding='utf8'))

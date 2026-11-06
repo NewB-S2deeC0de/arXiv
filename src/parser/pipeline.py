@@ -611,6 +611,7 @@ def _process_publication_b(arxiv_id: str, records, services: ParserServices, *,
     if approved_metadata_candidates:
         approved = tuple(approved_metadata_candidates.get(arxiv_id, ()))
 
+    read_failed_versions = {item['version'] for item in read_failed}
     try:
         standardized = services.standardize_publication(
             arxiv_id, items, node_factory=TreeNode,
@@ -618,7 +619,6 @@ def _process_publication_b(arxiv_id: str, records, services: ParserServices, *,
             approved_metadata_candidates=approved,
         )
     except Exception as exc:
-        read_failed_versions = {item['version'] for item in read_failed}
         for version, _, _, _ in parsed_versions:
             if version in read_failed_versions:
                 continue
@@ -667,7 +667,7 @@ def _process_publication_b(arxiv_id: str, records, services: ParserServices, *,
             ))
 
     for version, _, _, _ in parsed_versions:
-        if version in read_failed:
+        if version in read_failed_versions:
             continue
         if version not in seen_versions:
             stats['versions_pending'] += 1
