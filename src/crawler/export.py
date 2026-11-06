@@ -119,10 +119,10 @@ def _export_snapshot(config,run_id):
         elif key[2]=='source':
             inventory={}
             inventory=read_result(key,'inventory.json') or {}
-            version_metrics.append(dict(arxiv_id=key[0],version=key[1],references_status=store.rows.get((key[0],key[1],'references',0),{}).get('status','not_scheduled'),source_status=row['status'],source_attempts=row['total'],error_code=row['error'],compressed_bytes=inventory.get('compressed_bytes'),unpacked_bytes=inventory.get('unpacked_bytes'),kept_bytes=inventory.get('kept_bytes'),tex_count=inventory.get('tex_count'),bib_count=inventory.get('bib_count')))
+            version_metrics.append(dict(arxiv_id=key[0],version=key[1],metadata_status=store.rows.get((key[0],key[1],'metadata',0),{}).get('status','not_scheduled'),references_status=store.rows.get((key[0],key[1],'references',0),{}).get('status','not_scheduled'),source_status=row['status'],source_attempts=row['total'],error_code=row['error'],compressed_bytes=inventory.get('compressed_bytes'),unpacked_bytes=inventory.get('unpacked_bytes'),kept_bytes=inventory.get('kept_bytes'),tex_count=inventory.get('tex_count'),bib_count=inventory.get('bib_count')))
     for name,rows,columns in [
         ('paper_metrics',paper_metrics,['arxiv_id','discovery_status','metadata_exported','references_status','reference_count','discovery_attempts','references_attempts','reference_count_scope','references_status_scope','reference_versions_total','reference_versions_succeeded']),
-        ('version_metrics',version_metrics,['arxiv_id','version','references_status','source_status','source_attempts','error_code','compressed_bytes','unpacked_bytes','kept_bytes','tex_count','bib_count'])]:
+        ('version_metrics',version_metrics,['arxiv_id','version','metadata_status','references_status','source_status','source_attempts','error_code','compressed_bytes','unpacked_bytes','kept_bytes','tex_count','bib_count'])]:
         with (target/f'{name}.csv').open('w',newline='',encoding='utf8') as f:
             writer=csv.DictWriter(f,fieldnames=columns); writer.writeheader(); writer.writerows(rows)
     run_summaries=[]
