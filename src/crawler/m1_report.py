@@ -226,16 +226,190 @@ def prepare_report(export_dir, runtime_roots, output_dir, *, scan_storage=False)
     return output
 
 
+def prepare_combined_report(parts, output_dir, *, scan_storage=False):
+    """Combine disjoint, independently exported ranges without merging ledgers."""
+    from tempfile import TemporaryDirectory
+
+    if len(parts) < 2:
+        raise ValueError('At least two export/runtime pairs are required')
+    summaries = []
+    distributions = []
+    all_ids = set()
+    run_ids = set()
+    starts, ends = [], []
+    for export_dir, runtime_root in parts:
+        export_dir, runtime_root = Path(export_dir), Path(runtime_root)
+        # Validate before publishing any combined report file.
+        with TemporaryDirectory() as temporary:
+            summary = prepare_report(export_dir, [runtime_root], temporary,
+                                     scan_storage=scan_storage)
+            distribution = json.loads((Path(temporary) / 'distributions.json').read_text())
+        rows = _rows(export_dir / 'paper_metrics.csv')
+        paper_ids = [row['arxiv_id'] for row in rows]
+        if len(set(paper_ids)) != summary['coverage']['assigned_papers']:
+            raise ValueError(f'Export does not enumerate its full assigned range: {export_dir}')
+        overlap = all_ids.intersection(paper_ids)
+        if overlap:
+            raise ValueError(f'Overlapping arXiv IDs across exports: {sorted(overlap)[:5]}')
+        all_ids.update(paper_ids)
+        runs = set(summary['provenance']['run_ids'])
+        if run_ids.intersection(runs):
+            raise ValueError(f'Duplicate crawler run IDs across exports: {sorted(run_ids & runs)}')
+        run_ids.update(runs)
+        for row in json.loads((export_dir / 'run_metrics.json').read_text()):
+            if row.get('run_id') not in runs:
+                continue
+            start = _iso(row.get('started_at'))
+            end = _iso(row.get('finished_at') or row.get('last_sample_at'))
+            if start is not None:
+                starts.append(start)
+            if end is not None:
+                ends.append(end)
+        summaries.append(summary)
+        distributions.append(distribution)
+
+    def total_at(*keys):
+        values = [item for summary in summaries
+                  if (item := _get(summary, keys)) is not None]
+        return sum(values) if values else None
+
+    def weighted_mean(mean_key, count_key, section):
+        count = total_at(section, count_key)
+        if not count:
+            return None
+        return sum(summary[section][mean_key] * summary[section][count_key]
+                   for summary in summaries if summary[section][count_key]) / count
+
+    def combined_status(key):
+        result = Counter()
+        for summary in summaries:
+            result.update(summary['coverage'][key])
+        return dict(result)
+
+    def ratio(numerator, denominator):
+        return numerator / denominator if denominator else None
+
+    coverage = {
+        key: total_at('coverage', key) for key in (
+            'assigned_papers', 'exported_papers', 'metadata_versions_total',
+            'metadata_versions_succeeded', 'source_versions_total',
+            'reference_versions_total', 'reference_versions_succeeded')
+    }
+    for key in ('discovery_status', 'metadata_status', 'source_status', 'reference_status'):
+        coverage[key] = combined_status(key)
+    coverage['paper_export_rate'] = ratio(coverage['exported_papers'], coverage['assigned_papers'])
+    coverage['metadata_version_success_rate'] = ratio(
+        coverage['metadata_versions_succeeded'], coverage['metadata_versions_total'])
+    coverage['source_coverage_rate'] = ratio(
+        coverage['source_status'].get('succeeded', 0) + coverage['source_status'].get('no_tex', 0),
+        coverage['source_versions_total'])
+    coverage['tex_availability_rate'] = ratio(
+        coverage['source_status'].get('succeeded', 0), coverage['source_versions_total'])
+    coverage['reference_version_success_rate'] = ratio(
+        coverage['reference_versions_succeeded'], coverage['reference_versions_total'])
+
+    source = {}
+    for field in ('compressed_bytes', 'unpacked_bytes', 'kept_bytes'):
+        source[f'{field}_sample_count'] = total_at('source', f'{field}_sample_count')
+        source[f'mean_{field}'] = weighted_mean(
+            f'mean_{field}', f'{field}_sample_count', 'source')
+    references = {
+        key: total_at('references', key) for key in (
+            'successful_version_sample_count', 'paper_union_sample_count',
+            'legacy_snapshots_excluded', 'paper_union_rows_with_arxiv_id')
+    }
+    for mean_key, count_key in (
+        ('mean_per_successful_version', 'successful_version_sample_count'),
+        ('mean_paper_union_with_snapshot', 'paper_union_sample_count'),
+    ):
+        references[mean_key] = weighted_mean(mean_key, count_key, 'references')
+
+    performance = {
+        key: total_at('performance', key) for key in (
+            'sessions', 'active_wall_seconds', 'rss_sampled_seconds',
+            'final_data_logical_bytes', 'export_snapshot_logical_bytes',
+            'paper_observed_span_sample_count', 'discovery_observed_span_seconds')
+    }
+    performance['mean_active_seconds_per_assigned_paper'] = ratio(
+        performance['active_wall_seconds'], coverage['assigned_papers'])
+    performance['calendar_elapsed_seconds'] = (
+        (max(ends) - min(starts)).total_seconds() if starts and ends else None)
+    for key in ('rss_peak_bytes',):
+        values = [s['performance'][key] for s in summaries if s['performance'][key] is not None]
+        performance[key] = max(values) if values else None
+    rss_seconds = performance['rss_sampled_seconds']
+    performance['rss_time_weighted_mean_bytes'] = (
+        sum(s['performance']['rss_time_weighted_mean_bytes'] * s['performance']['rss_sampled_seconds']
+            for s in summaries if s['performance']['rss_time_weighted_mean_bytes'] is not None)
+        / rss_seconds if rss_seconds else None)
+    performance['paper_observed_span_mean_seconds'] = weighted_mean(
+        'paper_observed_span_mean_seconds', 'paper_observed_span_sample_count', 'performance')
+    scopes = {s['performance']['disk_peak_scope'] for s in summaries
+              if s['performance']['disk_observed_peak_bytes'] is not None}
+    peaks = [s['performance']['disk_observed_peak_bytes'] for s in summaries
+             if s['performance']['disk_observed_peak_bytes'] is not None]
+    performance['disk_peak_scope'] = next(iter(scopes)) if len(scopes) == 1 else None
+    performance['disk_observed_peak_bytes'] = max(peaks) if len(scopes) == 1 and peaks else None
+
+    combined_distributions = {
+        key: [value for distribution in distributions for value in distribution[key]]
+        for key in ('references_per_successful_version', 'paper_observed_spans_seconds')
+    }
+    combined_distributions['source_sizes'] = {
+        field: [value for distribution in distributions for value in distribution['source_sizes'][field]]
+        for field in ('compressed_bytes', 'unpacked_bytes', 'kept_bytes')
+    }
+    output = {
+        'provenance': {
+            'parts': [dict(export_run_id=s['provenance']['export_run_id'],
+                           export_manifest_sha256=s['provenance']['export_manifest_sha256'],
+                           assigned_papers=s['coverage']['assigned_papers'],
+                           run_ids=s['provenance']['run_ids']) for s in summaries],
+            'run_ids': sorted(run_ids),
+            'run_ids_without_local_resources': sorted({run_id for s in summaries
+                for run_id in s['provenance']['run_ids_without_local_resources']}),
+        },
+        'coverage': coverage, 'source': source, 'references': references,
+        'performance': performance,
+        'limitations': summaries[0]['limitations'] + [
+            'Independent runtime ledgers were not merged; aggregate counts use non-overlapping assigned ID sets.',
+            'Summed active wall time is total session time across runtimes and may include concurrent sessions.',
+            'Observed disk peaks are per-runtime maxima, not a combined historical peak.',
+        ],
+    }
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    atomic_json(output_dir / 'summary.json', output)
+    atomic_json(output_dir / 'distributions.json', combined_distributions)
+    return output
+
+
+def _get(mapping, keys):
+    for key in keys:
+        mapping = mapping[key]
+    return mapping
+
+
 def main():
     parser = argparse.ArgumentParser(description='Prepare small, reproducible M1 report inputs')
-    parser.add_argument('--export', type=Path, required=True)
+    parser.add_argument('--export', type=Path)
     parser.add_argument('--runtime', type=Path, action='append', default=[])
+    parser.add_argument('--part', nargs=2, action='append', metavar=('EXPORT', 'RUNTIME'),
+                        help='One independent export and its runtime; repeat for disjoint ranges')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--scan-storage', action='store_true',
                         help='Scan logical bytes under the first runtime/data directory')
     args = parser.parse_args()
-    result = prepare_report(args.export, args.runtime, args.output,
-                            scan_storage=args.scan_storage)
+    if args.part:
+        if args.export or args.runtime:
+            parser.error('--part cannot be combined with --export/--runtime')
+        result = prepare_combined_report(args.part, args.output,
+                                         scan_storage=args.scan_storage)
+    else:
+        if not args.export:
+            parser.error('--export is required unless --part is used')
+        result = prepare_report(args.export, args.runtime, args.output,
+                                scan_storage=args.scan_storage)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

@@ -124,13 +124,27 @@ redirect sang host khác ghi `redirect_disallowed`, không âm thầm dùng main
 - https://www.python-httpx.org/quickstart/
 
 Code repo và Drive runtime độc lập. Sau khi export snapshot M1, chuẩn bị số liệu
-báo cáo bằng lệnh sau từ repo code:
+báo cáo bằng lệnh sau từ repo code cho một range:
 
 ```bash
 PYTHONPATH=src python -m crawler.m1_report \
   --export runtime/exports/<export_id> --runtime runtime \
   --output ../m1-report/book/data
 ```
+
+Nếu hai thành viên cào hai range riêng, giữ nguyên hai runtime và export từng
+runtime bằng config tương ứng. Ghép hai export bằng:
+
+```bash
+PYTHONPATH=src python -m crawler.m1_report \
+  --part runtime/exports/m1-own runtime \
+  --part runtime_Hiếu/exports/m1-hieu runtime_Hiếu \
+  --output ../m1-report/book/data
+```
+
+Lệnh kiểm tra checksum, ID được giao không giao nhau và run ID không trùng;
+không ghép trực tiếp progress hoặc data. Xem hướng dẫn đầy đủ trong README của
+repo báo cáo.
 
 Jupyter Book nằm trong repo báo cáo riêng. Parsing và matching thuộc các
 milestone sau.
