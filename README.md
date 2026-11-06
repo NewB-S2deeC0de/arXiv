@@ -364,3 +364,24 @@ This patch has no live Colab throughput benchmark.
 
 Details of the reference-page recovery and S2 dispatch-pacing update:
 [change report](docs/reference-resume-and-s2-pacing.md).
+
+## Milestone 2 · Standardization
+
+Phần B nằm trong `src/standardization`. Dùng Python 3.11 trở lên và cài
+`src/requirements.txt`. Chạy bộ test B từ thư mục gốc bằng lệnh sau.
+
+```bash
+python -m pytest tests/test_b[123]_*.py tests/test_b_publication.py
+```
+
+Trên Windows, truyền danh sách file B trực tiếp để pytest không thu thập
+test crawler M1 dùng `fcntl`.
+
+```powershell
+$bTests = @(Get-ChildItem tests -File | Where-Object {$_.Name -match '^test_b([123]_|_publication\.py$)'} | ForEach-Object {$_.FullName})
+python -m pytest @bTests
+```
+
+C3 có thể gọi `standardize_publication` sau A1/A2/A3 để chuẩn hóa cây, đọc
+bibliography theo version, hợp nhất reference và remap citation trước C2.
+Xem [API và quy tắc tích hợp](docs/b-local-workflow-api.md).

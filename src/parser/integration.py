@@ -11,14 +11,17 @@ from pathlib import Path
 import hashlib
 import json
 
-from .contract import (BibEntry, BibliographyBlock, GatherDiagnostic,
-                       GatheredSource, HierarchyResult, ParseDiagnostic,
-                       ParseNode, ParsedDocument, ParserServices, SourceSpan,
-                       TreeNode)
+from .contract import (BibliographyBlock, GatherDiagnostic, GatheredSource,
+                       HierarchyResult, ParseDiagnostic, ParseNode,
+                       ParsedDocument, ParserServices, SourceSpan, VersionInput)
 
 
 class ParserDependencyError(RuntimeError):
     """Raised when the A/B parsing components are not available yet."""
+
+    def __init__(self, message: str, *, code: str = 'missing_module'):
+        super().__init__(message)
+        self.code = code
 
 
 def _sha256_text(value: str) -> str:
@@ -83,20 +86,8 @@ def _parse_diagnostic(item) -> ParseDiagnostic:
                            source_spans=spans)
 
 
-def _as_tree(node, diagnostics: list[ParseDiagnostic]) -> TreeNode:
-    """Convert a rich node to C2 TreeNode only after content is finalized."""
-    for warning in getattr(node, 'warnings', ()):
-        diagnostics.append(ParseDiagnostic('node_warning', str(warning),
-                                           source_spans=tuple(
-                                               _to_span(s) for s in getattr(node, 'source_spans', ()))))
-    content = getattr(node, 'content', None)
-    if content is None:
-        content = getattr(node, 'raw', '')
-    return TreeNode(
-        kind=str(node.kind),
-        content=content,
-        children=[_as_tree(child, diagnostics) for child in getattr(node, 'children', ())],
-    )
+def _parser_fingerprint() -> str:
+    return _sha256_text(json.dumps(_parser_module_fingerprint(), sort_keys=True))
 
 
 @dataclass(frozen=True)
@@ -149,41 +140,96 @@ class DefaultParserServices:
         a3_result = refine_hierarchy(a2_result)
         return ParsedDocument(result=_to_result(a3_result))
 
+    def standardize_publication(self, arxiv_id: str, versions: list[VersionInput],
+                                *, node_factory, include_partial: bool = False,
+                                approved_metadata_candidates=()):
+        try:
+            from standardization import (PublicationVersionInput,
+                                          standardize_publication as run)
+        except ImportError as exc:
+            raise ParserDependencyError(
+                'B standardization API is not available. '
+                'Merge B1/B2/B3 or pass services=... to run_parser().',
+                code='missing_module',
+            ) from exc
+        items = [
+            PublicationVersionInput(
+                hierarchy=item.hierarchy,
+                gathered=item.gathered,
+                source_dir=Path(item.source_dir),
+                source_texts=item.source_texts,
+                selected_bib_files=item.selected_bib_files,
+            )
+            for item in versions
+        ]
+        return run(arxiv_id, items, node_factory=node_factory,
+                   include_partial=include_partial,
+                   approved_metadata_candidates=approved_metadata_candidates)
+
+    def audit_payload(self, standardized) -> dict:
+        from standardization import b3_audit_payload
+
+        return b3_audit_payload(standardized.references)
+
     def cache_fingerprint(self) -> str:
-        """Fingerprint of the A/B service implementation for cache invalidation.
+        """Fingerprint A/B/C code and policy so cached shards never go stale.
 
-        Hashes the source of every parser module so any code change that can
-        affect output invalidates cached shards, instead of relying on a
-        manually bumped constant.
+        The parser hash covers A1/A2/A3 and the C adapters; B composes its own
+        source and policy hash through ``b3_cache_fingerprint``.
         """
-        return _sha256_text(json.dumps(_parser_module_fingerprint(),
-                                       sort_keys=True))
-
-    def extract_bibitems(self, text: str, arxiv_id: str) -> list[BibEntry]:
-        from .bibtex import extract_bibitems
-
-        return extract_bibitems(text, arxiv_id)
-
-    def unify_bibentries(self, versioned: list[tuple[int, BibEntry]]
-                         ) -> tuple[list[BibEntry], dict[str, str], dict]:
-        from .bibtex import unify_bibentries
-
-        return unify_bibentries(versioned)
-
-    def remap_citations(self, text: str, mapping: dict[str, str]) -> str:
-        from .bibtex import remap_citations
-
-        return remap_citations(text, mapping)
+        parser_fingerprint = _parser_fingerprint()
+        try:
+            from standardization import b3_cache_fingerprint
+        except ImportError:
+            return parser_fingerprint
+        return b3_cache_fingerprint(parser_fingerprint=parser_fingerprint)
 
 
 def load_services() -> ParserServices:
     """Load the real A/B implementations, with a clear error while unmerged."""
     try:
-        from . import bibtex, gather, hierarchy, leaves  # noqa: F401
+        from . import gather, hierarchy, leaves  # noqa: F401
         from .leaves import refine_hierarchy  # noqa: F401
     except ImportError as exc:
         raise ParserDependencyError(
-            'A1/A2/A3/B1/B2/B3 parser modules are not available. '
-            'Merge those components or pass services=... to run_parser().'
+            'A1/A2/A3 parser modules are not available. '
+            'Merge those components or pass services=... to run_parser().',
+            code='missing_module',
         ) from exc
+    try:
+        from standardization import (PublicationVersionInput, b3_audit_payload,
+                                      b3_cache_fingerprint,
+                                      standardize_publication)
+    except ImportError as exc:
+        raise ParserDependencyError(
+            'B1/B2/B3 standardization modules are not available. '
+            'Merge group B or pass services=... to run_parser().',
+            code='missing_module',
+        ) from exc
+    if not all(callable(item) for item in (
+            refine_hierarchy, standardize_publication, b3_audit_payload,
+            b3_cache_fingerprint)):
+        raise ParserDependencyError(
+            'B standardization API is incomplete or not wired.',
+            code='not_wired',
+        )
     return DefaultParserServices()
+
+
+def capabilities() -> dict:
+    """Report which integration components are importable and wired."""
+    result = dict(gather=False, build_hierarchy=False, refine_hierarchy=False,
+                  standardize=False, missing=[])
+    try:
+        from . import gather, hierarchy, leaves  # noqa: F401
+        result['gather'] = callable(getattr(gather, 'gather_version', None))
+        result['build_hierarchy'] = callable(getattr(hierarchy, 'build_hierarchy', None))
+        result['refine_hierarchy'] = callable(getattr(leaves, 'refine_hierarchy', None))
+    except ImportError as exc:
+        result['missing'].append(f'parser:{exc.name}')
+    try:
+        from standardization import standardize_publication
+        result['standardize'] = callable(standardize_publication)
+    except ImportError as exc:
+        result['missing'].append(f'standardization:{exc.name}')
+    return result
