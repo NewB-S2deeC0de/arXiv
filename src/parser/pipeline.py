@@ -258,7 +258,7 @@ def _jsonable(value):
 
 
 def _standardization_audit(arxiv_id: str, standardized, services,
-                           warnings, errors) -> dict:
+                           warnings, errors, read_failed=None) -> dict:
     audit = dict(
         schema_version=1,
         arxiv_id=arxiv_id,
@@ -283,6 +283,17 @@ def _standardization_audit(arxiv_id: str, standardized, services,
                 nodes=_jsonable(getattr(finalized, 'nodes', ())),
             ),
         ))
+    for item in read_failed or ():
+        audit['versions'].append(dict(
+            version=item['version'],
+            status=item.get('status', 'partial'),
+            normalized=None,
+            bibliography=None,
+            finalized=None,
+            reason=item.get('reason', 'source_texts_unavailable'),
+            message=item.get('message'),
+        ))
+    audit['versions'].sort(key=lambda item: str(item.get('version')))
     return _jsonable(audit)
 
 
@@ -566,7 +577,7 @@ def _process_publication_b(arxiv_id: str, records, services: ParserServices, *,
 
     overrides = selected_bib_files or {}
     items = []
-    read_failed: set[int] = set()
+    read_failed: list[dict] = []
     for version, gathered, parsed, source_dir in parsed_versions:
         chosen = overrides.get((arxiv_id, version))
         if chosen is not None:
@@ -576,7 +587,11 @@ def _process_publication_b(arxiv_id: str, records, services: ParserServices, *,
         except SourceTextUnavailable as exc:
             # Cannot verify source spans without the decoded A1 text: downgrade
             # instead of silently bypassing provenance verification.
-            read_failed.add(version)
+            read_failed.append(dict(
+                version=version, status='partial',
+                reason='source_texts_unavailable',
+                message=f'Cannot decode source text for provenance verification: {exc}',
+            ))
             stats['versions_partial'] += 1
             warnings.append(dict(
                 arxiv_id=arxiv_id, version=version, status='parse_warning',
@@ -603,12 +618,16 @@ def _process_publication_b(arxiv_id: str, records, services: ParserServices, *,
             approved_metadata_candidates=approved,
         )
     except Exception as exc:
+        read_failed_versions = {item['version'] for item in read_failed}
         for version, _, _, _ in parsed_versions:
+            if version in read_failed_versions:
+                continue
             stats['versions_failed'] += 1
             errors.append(dict(arxiv_id=arxiv_id, version=version,
                                status='failed',
                                error=f'standardize:{type(exc).__name__}:{exc}'))
-        audit = _standardization_audit(arxiv_id, None, services, warnings, errors)
+        audit = _standardization_audit(
+            arxiv_id, None, services, warnings, errors, read_failed=read_failed)
         return stats, errors, warnings, rows, audit
 
     seen_versions = set()
@@ -703,7 +722,8 @@ def _process_publication_b(arxiv_id: str, records, services: ParserServices, *,
                                          if item.get('code') == 'unresolved_citation'})
     stats['elements_before'] = store.total_nodes
     stats['elements_after'] = store.distinct_elements
-    audit = _standardization_audit(arxiv_id, standardized, services, warnings, errors)
+    audit = _standardization_audit(
+        arxiv_id, standardized, services, warnings, errors, read_failed=read_failed)
     return stats, errors, warnings, rows, audit
 
 

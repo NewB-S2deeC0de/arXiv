@@ -761,6 +761,18 @@ def test_source_texts_read_error_downgrades_to_partial(tmp_path, make_source, mo
     assert any(w['code'] == 'source_texts_unavailable'
                for w in manifest['validation']['warnings'])
 
+    # The failed-to-read version must still be recorded in the audit sidecar.
+    audit = json.loads((root / 'parsed' / 'bibtex_audit.json').read_text(encoding='utf8'))
+    pub = audit['publications']['2410.23025']
+    versions = pub['versions']
+    assert len(versions) == 1
+    assert versions[0]['version'] == 1
+    assert versions[0]['status'] == 'partial'
+    assert versions[0]['finalized'] is None
+    assert versions[0]['normalized'] is None
+    assert versions[0]['bibliography'] is None
+    assert versions[0]['reason'] == 'source_texts_unavailable'
+
 
 def test_selected_bib_override_invalidates_resume(tmp_path, make_source):
     root = tmp_path / 'runtime'
