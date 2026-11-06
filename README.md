@@ -268,10 +268,14 @@ trạng thái và được audit riêng. Kết quả mới có `verification.jso
 publish và đối chiếu nội dung thành công. Receipt gắn với SHA-256 của manifest;
 receipt không bảo đảm phát hiện sửa đổi âm thầm của nội dung sau lần xác minh.
 
-Notebook có cell `RUN_AUDIT`: mặc định bỏ qua receipt hợp lệ, kiểm tra phần còn
-lại và lưu sau từng kết quả. `FULL_AUDIT=True` bắt đầu/tiếp tục một lượt kiểm tra
-lại toàn phạm vi, checkpoint tại `progress/audit.json`; sau khi hoàn tất, gọi
-full lần nữa tạo lượt mới. Giữ nguyên phạm vi khi tiếp tục lượt bị ngắt. Audit
+Notebook có cell `RUN_AUDIT`: mặc định chọn `AUDIT_STAGES` gồm `metadata`,
+`source`, `references` (cả legacy v0 và vN), bỏ qua receipt hợp lệ, kiểm tra phần
+còn lại và lưu sau từng kết quả. Discovery không nằm trong audit riêng mặc định;
+export vẫn đối chiếu checksum của `discovery/normalized.json` trước khi dùng.
+Audit source vẫn hash các file đã publish, không chỉ `inventory.json`.
+`FULL_AUDIT=True` bắt đầu/tiếp tục một lượt kiểm tra lại phạm vi đã chọn,
+checkpoint tại `progress/audit.json`; sau khi hoàn tất, gọi full lần nữa tạo
+lượt mới. Đổi `AUDIT_STAGES` khi lượt full đang dở sẽ bắt đầu lượt mới. Audit
 không gọi API, không reset trạng thái crawl, và dùng cùng DatasetLock nên phải
 chạy khi crawler dừng. Invalid cần được xem xét riêng (kể cả not_found không
 có payload/marker). File hỏng không được cấp dấu xác minh mới.
