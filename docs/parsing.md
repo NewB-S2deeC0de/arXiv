@@ -31,10 +31,10 @@ The A/B boundary is the `ParserServices` protocol:
 | Method | Owner | Contract |
 |:--|:--|:--|
 | `gather(arxiv_id, version, source_dir)` | A1 | wraps `gather_version()`; returns `GatheredSource(text, status, root_file, files, bib_files, diagnostics, raw)` |
-| `parse_document(gathered, arxiv_id, version)` | A2/A3 + B1 | returns `ParsedDocument(result=HierarchyResult, tree=None)`; `tree` is filled only after content is finalized by B1/remap |
-| `extract_bibitems(text, arxiv_id)` | B2 | returns `list[BibEntry]` |
-| `unify_bibentries(versioned)` | B3 | returns `(entries, citation_key_map, stats)` |
-| `remap_citations(text, mapping)` | B3 | rewrites `\cite...` keys |
+| `parse_document(gathered, arxiv_id, version)` | A2/A3 | returns `ParsedDocument(result=HierarchyResult, tree=None)`; B1 finalizes content separately |
+| `standardize_publication(arxiv_id, versions, *, node_factory, include_partial=False, approved_metadata_candidates=())` | B1/B2/B3 | publication-level normalize/bibitem-select/DOI-merge/finalize; returns per-version status + `references` merge result |
+| `audit_payload(standardized)` | B3 | returns `b3_audit_payload(references)` with mapping, findings, unresolved, occurrences |
+| `cache_fingerprint()` | A/B/C | composes parser source hash with `b3_cache_fingerprint(parser_fingerprint=...)` |
 
 `DefaultParserServices.gather()` wraps the merged A1
 `gather_version(arxiv_id, version, source_dir)` result and preserves the raw
@@ -110,12 +110,18 @@ manifest = run_parser('runtime', limit=10)
    not collapsed. Document roots are always unique per version. Hierarchy edges
    are stored per version, so a shared element can hang under different parents
    in different versions.
-6. **BibTeX unification (B2/B3 dependency).** `\bibitem` entries are extracted
-   from the full gathered text, including the bibliography. Entries with the same
-   normalized title (or, when the title is missing, the same key) are merged;
-   fields are unioned. Dropped citation keys are remapped and every
-   `\cite`/`\citep`/`\citet` argument is rewritten to the chosen key before
-   elements are deduplicated.
+6. **Standardization (B1/B2/B3 per publication).** C3 gathers all usable versions
+   of one publication into `VersionInput`s (rich A3 `HierarchyResult`, raw A1
+   `GatheredVersion`, `source_dir = source/tex`, decoded `source_texts`, optional
+   `selected_bib_files` override) and calls
+   `standardize_publication(arxiv_id, versions, ...)` **once per publication**.
+   B1 normalizes leaves, B2 selects bibitems/`.bib` entries, B3 merges by DOI and
+   assigns version-scoped canonical keys (`old_key -> canonical_key` is never a
+   global map). Each version's `finalized.tree` (remapped keys) is added to the
+   C2 element store; there is no second remap pass. BibTeX rows are projected
+   from `record.payload.as_kwargs()` filtered to `BIBTEX_SCHEMA.names`.
+   `partial` versions (missing `.bib`, source-map failure, invalid key) keep
+   diagnostics and coverage but are not exported by default.
 7. **Output (`pipeline.py`, C3).** Each publication is parsed and written to a
    shard under `_parts/<encoded-id>/`. A checkpoint is flushed every 25
    publications and at the end. At the end the shards are streamed into the final
@@ -140,17 +146,19 @@ runtime/parsed/
 |-- elements.parquet
 |-- hierarchy.parquet
 |-- bibtex.parquet
+|-- bibtex_audit.json
 |-- coverage.csv
 |-- errors.json
 |-- checkpoint.json
 |-- manifest.json
-`-- _parts/<encoded-arxiv-id>/{elements,hierarchy,bibtex}.parquet
+`-- _parts/<encoded-arxiv-id>/{audit.json,elements,hierarchy,bibtex}.parquet
 ```
 
 `elements`, `hierarchy`, and `bibtex` use the schemas from `contract.py` and
 match the Milestone 2 specification. `coverage.csv` has one row per publication
-with versions total/parsed/empty/pending/failed/missing, gather failures,
-element and BibTeX counts before/after deduplication, and parse time in seconds.
+with versions total/parsed/empty/partial/pending/failed/missing, gather failures,
+element and BibTeX counts before/after deduplication, unexportable/unresolved
+BibTeX occurrences, conflicts, and parse time in seconds.
 
 `manifest.json` contains:
 
@@ -160,17 +168,31 @@ element and BibTeX counts before/after deduplication, and parse time in seconds.
 - `timing.elapsed_seconds` and `timing.average_seconds_per_publication`;
 - `memory.peak_rss_bytes` (when `resource` is available, e.g. Colab Linux);
 - `storage.output_bytes` and `_parts` bytes;
-- `outputs.<table>.{rows,sha256,bytes}` checksums;
+- `outputs.<table>.{rows,sha256,bytes}` checksums, plus `outputs.bibtex_audit.json`;
+- `audit.schema_version` and number of audited publications;
 - `fingerprints.{config,input,schema}` so a run can be reproduced and compared;
 - `validation.{ok,errors,warnings,publications_checked,rows}`;
 - `software` versions and `errors` (also in `errors.json`).
 
 ## Resume semantics
 
-- A publication is skipped only when it is in `checkpoint.json` *and* all three
-  shards exist. After an abrupt stop, at most the last checkpoint window (25
-  publications) is reparsed; existing shards are overwritten safely.
+- A publication is skipped only when it is in `checkpoint.json` *and* its shards
+  plus `_parts/<id>/audit.json` exist and are valid. If the audit sidecar is
+  missing or invalid, the publication is reparsed rather than served stale.
+- A publication's input fingerprint includes `selected_bib_files` and
+  `approved_metadata_candidates` overrides, so changing those invalidates the
+  shard and forces reprocessing.
+- `cache_fingerprint()` composes parser source hash with B's
+  `b3_cache_fingerprint(parser_fingerprint=...)`, so a B code/policy change
+  invalidates resume for every publication.
 - `--no-resume` deletes the checkpoint and `_parts/`, then reparses from scratch.
+- A service injected via `services=...` must expose `cache_fingerprint()` to be
+  trusted for resume. If it does not, resume is disabled for that run (all
+  publications are reparsed) and `manifest.resume` records
+  `effective=false` with `disabled_reason=service_without_cache_fingerprint`.
+  The fallback fingerprint (class identity plus source-file hash) is never used
+  to reuse shards, because it cannot see runtime configuration. Declare a
+  fingerprint that includes any output-affecting settings.
 - `--limit N` limits both processing and the final merged tables to the first `N`
   publications; older shards may remain in `_parts/` but are not merged.
 - Failed/missing versions are recorded in coverage and `errors.json`; they do not
@@ -199,33 +221,27 @@ output guard.
 
 ## Limitations
 
-- A1 is merged. A2 is implemented on `feat/m2-a2`; A3/B1/B2/B3 are still
-  separate. Until they merge into this branch, `load_services()` raises
-  `ParserDependencyError`; C3 orchestration can still be exercised by injecting
-  `services=...`.
-- The default A2 adapter forwards the raw A1 `GatheredVersion` and maps A2
-  `ParseNode.raw` to C3 content. A3/B1 will replace that provisional mapping with
-  the final normalized content and warning dispatch.
+- A1/A2/A3 and B1/B2/B3 are merged into this branch; `load_services()` raises
+  `ParserDependencyError` only if `standardization` or the parser modules are
+  absent. C3 orchestration can still be exercised by injecting `services=...`.
+- B1/B2/B3 run per publication through `standardize_publication`; C3 never
+  re-implements normalization, bibitem selection, or DOI merge.
 - Parsing is heuristic: custom macros, exotic environments, and malformed TeX can
   produce imperfect hierarchy or cleanup results. Parser failures are reported per
   version instead of being silently ignored.
 - Missing citation keys are warnings, not hard failures, because sources may
   contain intentionally undefined references.
-- `versions_pending` counts versions that are `ready` from A1 but have no
-  finalized `tree` yet (A3/B1 not merged). These versions keep diagnostics but
-  their BibTeX is skipped and no element/hierarchy rows are written. They are
-  not counted as failed or parsed.
+- `versions_partial` counts versions that A1/A2/A3 processed but B1 could not
+  finalize (missing `.bib`, source-map failure, invalid key). They keep
+  diagnostics and coverage but are not exported by default; `versions_pending`
+  counts versions with no finalized tree after standardization.
 - `manifest.parser_policy.policy_fingerprint` hashes parser version, schemas,
-  `include_partial` policy, the service `cache_fingerprint`, and the input
-  fingerprints of processed publications. The default service fingerprints every
-  parser source file, so any A/B/C code change invalidates resume. A custom
-  service without `cache_fingerprint()` falls back to its class identity and
-  source-file hash. `manifest.input_fingerprints` records per-publication input
-  fingerprints (version, status, source file content hash). The checkpoint
-  stores the same fingerprints and refuses to reuse a shard when policy or
-  input changed; resume is reset automatically when the checkpoint schema or
-  policy fingerprint differs.
+  `include_partial` policy, the composed `cache_fingerprint` (A/B/C), and the
+  input fingerprints (including `selected_bib_files`/`approved_metadata_candidates`)
+  of processed publications. The default service fingerprints every parser source
+  file plus B source/policy, so any A/B/C code change invalidates resume.
 - `peak_rss_bytes` is process peak RSS, not a per-publication measurement.
-- BibTeX extraction handles `\bibitem`-style bibliographies. `\bibitem`-free
-  setups that rely on external `.bib` files still produce hierarchy content but
-  no `bibtex` rows; `.bib` parsing is not part of this milestone.
+- BibTeX rows come from B2-selected `.bib` entries. Setups without usable
+  `.bib` entries produce hierarchy content but no `bibtex` rows; invalid original
+  keys are reported as `unexportable`/`invalid_key_unresolved` in the audit,
+  not as duplicates.

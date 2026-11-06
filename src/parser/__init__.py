@@ -10,3 +10,4 @@ __all__ = [
     'gather_version', 'HierarchyResult', 'ParseDiagnostic', 'ParseNode',
     'build_hierarchy', 'refine_hierarchy', 'run_parser',
 ]
+

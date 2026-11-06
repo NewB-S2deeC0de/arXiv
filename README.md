@@ -276,10 +276,14 @@ trạng thái và được audit riêng. Kết quả mới có `verification.jso
 publish và đối chiếu nội dung thành công. Receipt gắn với SHA-256 của manifest;
 receipt không bảo đảm phát hiện sửa đổi âm thầm của nội dung sau lần xác minh.
 
-Notebook có cell `RUN_AUDIT`: mặc định bỏ qua receipt hợp lệ, kiểm tra phần còn
-lại và lưu sau từng kết quả. `FULL_AUDIT=True` bắt đầu/tiếp tục một lượt kiểm tra
-lại toàn phạm vi, checkpoint tại `progress/audit.json`; sau khi hoàn tất, gọi
-full lần nữa tạo lượt mới. Giữ nguyên phạm vi khi tiếp tục lượt bị ngắt. Audit
+Notebook có cell `RUN_AUDIT`: mặc định chọn `AUDIT_STAGES` gồm `metadata`,
+`source`, `references` (cả legacy v0 và vN), bỏ qua receipt hợp lệ, kiểm tra phần
+còn lại và lưu sau từng kết quả. Discovery không nằm trong audit riêng mặc định;
+export vẫn đối chiếu checksum của `discovery/normalized.json` trước khi dùng.
+Audit source vẫn hash các file đã publish, không chỉ `inventory.json`.
+`FULL_AUDIT=True` bắt đầu/tiếp tục một lượt kiểm tra lại phạm vi đã chọn,
+checkpoint tại `progress/audit.json`; sau khi hoàn tất, gọi full lần nữa tạo
+lượt mới. Đổi `AUDIT_STAGES` khi lượt full đang dở sẽ bắt đầu lượt mới. Audit
 không gọi API, không reset trạng thái crawl, và dùng cùng DatasetLock nên phải
 chạy khi crawler dừng. Invalid cần được xem xét riêng (kể cả not_found không
 có payload/marker). File hỏng không được cấp dấu xác minh mới.
@@ -368,3 +372,24 @@ This patch has no live Colab throughput benchmark.
 
 Details of the reference-page recovery and S2 dispatch-pacing update:
 [change report](docs/reference-resume-and-s2-pacing.md).
+
+## Milestone 2 · Standardization
+
+Phần B nằm trong `src/standardization`. Dùng Python 3.11 trở lên và cài
+`src/requirements.txt`. Chạy bộ test B từ thư mục gốc bằng lệnh sau.
+
+```bash
+python -m pytest tests/test_b[123]_*.py tests/test_b_publication.py
+```
+
+Trên Windows, truyền danh sách file B trực tiếp để pytest không thu thập
+test crawler M1 dùng `fcntl`.
+
+```powershell
+$bTests = @(Get-ChildItem tests -File | Where-Object {$_.Name -match '^test_b([123]_|_publication\.py$)'} | ForEach-Object {$_.FullName})
+python -m pytest @bTests
+```
+
+C3 có thể gọi `standardize_publication` sau A1/A2/A3 để chuẩn hóa cây, đọc
+bibliography theo version, hợp nhất reference và remap citation trước C2.
+Xem [API và quy tắc tích hợp](docs/b-local-workflow-api.md).

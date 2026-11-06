@@ -63,3 +63,20 @@ def test_default_services_policy_fingerprint_uses_service():
 
     assert isinstance(fingerprint, str)
     assert re.fullmatch(r'[0-9a-f]{64}', fingerprint)
+
+def test_default_services_fingerprint_composes_b_policy():
+    from parser.integration import _parser_fingerprint
+
+    service = DefaultParserServices()
+
+    assert service.cache_fingerprint() != _parser_fingerprint()
+
+
+def test_capabilities_reports_merged_abc_modules():
+    from parser.integration import capabilities
+
+    report = capabilities()
+
+    assert report['gather'] and report['build_hierarchy']
+    assert report['refine_hierarchy'] and report['standardize']
+    assert report['missing'] == []

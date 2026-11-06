@@ -177,6 +177,17 @@ class ParsedDocument:
 
 
 @dataclass(frozen=True)
+class VersionInput:
+    """One version handed to publication-level standardization (B1/B2/B3)."""
+
+    hierarchy: HierarchyResult
+    gathered: object
+    source_dir: Path
+    source_texts: dict[str, str] | None = None
+    selected_bib_files: tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True)
 class Element:
     element_id: str
     arxiv_id: str
@@ -206,7 +217,13 @@ class BibEntry:
 
 
 class ParserServices(Protocol):
-    """A1/A2/A3/B1/B2/B3 boundary consumed by the C3 pipeline."""
+    """A1/A2/A3/B1/B2/B3 boundary consumed by the C3 pipeline.
+
+    The default service implements publication-level standardization. An
+    injected test service may instead expose the legacy per-version BibTeX
+    methods; the pipeline keeps that path only for such fakes and never treats
+    it as evidence that the real A/B/C integration passed.
+    """
 
     def gather(self, arxiv_id: str, version: int, source_dir: Path) -> GatheredSource:
         ...
@@ -215,14 +232,15 @@ class ParserServices(Protocol):
                        version: int) -> ParsedDocument:
         ...
 
-    def extract_bibitems(self, text: str, arxiv_id: str) -> list[BibEntry]:
+    def standardize_publication(self, arxiv_id: str, versions: list[VersionInput],
+                                *, node_factory, include_partial: bool = False,
+                                approved_metadata_candidates=()) -> object:
         ...
 
-    def unify_bibentries(self, versioned: list[tuple[int, BibEntry]]
-                         ) -> tuple[list[BibEntry], dict[str, str], dict]:
+    def audit_payload(self, standardized) -> dict:
         ...
 
-    def remap_citations(self, text: str, mapping: dict[str, str]) -> str:
+    def cache_fingerprint(self) -> str:
         ...
 
 
