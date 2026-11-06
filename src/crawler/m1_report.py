@@ -398,7 +398,7 @@ def main():
                         help='One independent export and its runtime; repeat for disjoint ranges')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--scan-storage', action='store_true',
-                        help='Scan logical bytes under the first runtime/data directory')
+                        help='Scan logical bytes under each selected runtime/data directory')
     args = parser.parse_args()
     if args.part:
         if args.export or args.runtime:
