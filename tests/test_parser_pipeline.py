@@ -200,7 +200,9 @@ def test_pipeline_writes_typed_tables_and_manifest(runtime, services):
                                         versions_pending=0, versions_failed=0,
                                         missing=0, gather_failed=0)
     assert manifest['elements']['before_dedup'] > manifest['elements']['after_dedup']
-    assert manifest['bibtex'] == dict(before_dedup=2, after_dedup=1, deduplicated=1)
+    assert manifest['bibtex']['before_dedup'] == 2
+    assert manifest['bibtex']['after_dedup'] == 1
+    assert manifest['bibtex']['deduplicated'] == 1
     assert manifest['read_only_m1'] is True
     assert manifest['validation']['ok'] is True
     assert manifest['validation']['warnings'] == []
@@ -628,7 +630,9 @@ def test_default_services_run_real_a_to_b_to_c_integration(tmp_path, make_source
 
     assert manifest['versions']['versions_parsed'] == 1
     assert manifest['versions']['versions_failed'] == 0
-    assert manifest['bibtex'] == dict(before_dedup=2, after_dedup=2, deduplicated=0)
+    assert manifest['bibtex']['before_dedup'] == 2
+    assert manifest['bibtex']['after_dedup'] == 2
+    assert manifest['bibtex']['deduplicated'] == 0
     assert manifest['quality']['citations_unresolved'] == 0
     assert manifest['audit']['publications'] == 1
     bibtex = pq.read_table(root / 'parsed' / 'bibtex.parquet').to_pylist()
@@ -698,3 +702,103 @@ def test_default_services_remap_same_key_per_version_not_globally(tmp_path, make
     hierarchy = pq.read_table(root / 'parsed' / 'hierarchy.parquet').to_pylist()
     assert {edge['version'] for edge in hierarchy
             if edge['element_id'] == shared[0]['element_id']} == {1, 2}
+
+
+INVALID_BIB_TEX = r"""
+\documentclass{article}
+\begin{document}
+\section{Introduction}
+We use \cite{valid} and \cite{empty}.
+\begin{thebibliography}{1}
+\bibitem{valid} A. Author. Valid Title. 2020.
+\bibitem{} Empty key entry. 2021.
+\end{thebibliography}
+\end{document}
+"""
+
+
+def test_default_services_invalid_key_is_unexportable_not_duplicate(tmp_path, make_source):
+    root = tmp_path / 'runtime'
+    make_source(root, '2411.18799', 1, {
+        'main.tex': INVALID_BIB_TEX,
+    }, 'succeeded')
+
+    manifest = run_parser(root)
+
+    assert manifest['versions']['versions_parsed'] == 1
+    bibtex = pq.read_table(root / 'parsed' / 'bibtex.parquet').to_pylist()
+    assert len(bibtex) == 1
+    assert bibtex[0]['citation_key'].startswith('ref_')
+    assert manifest['bibtex']['before_dedup'] == 2
+    assert manifest['bibtex']['after_dedup'] == 1
+    assert manifest['bibtex']['deduplicated'] == 0
+    assert manifest['quality']['bibtex_unexportable'] == 1
+    audit = json.loads((root / 'parsed' / 'bibtex_audit.json').read_text(encoding='utf8'))
+    pub = audit['publications']['2411.18799']
+    mapping = pub['references']['result']['merge']['mapping']
+    valid_rows = [item for item in mapping if item.get('old_key') == 'valid']
+    assert len(valid_rows) == 1
+    assert valid_rows[0]['canonical_key'].startswith('ref_')
+    codes = {f['code'] for f in pub['references']['result']['findings']}
+    assert 'invalid_key_unresolved' in codes
+
+
+def test_source_texts_read_error_downgrades_to_partial(tmp_path, make_source, monkeypatch):
+    from parser.pipeline import SourceTextUnavailable
+
+    root = tmp_path / 'runtime'
+    make_source(root, '2410.23025', 1, {'main.tex': V1}, 'succeeded')
+
+    def boom(*args, **kwargs):
+        raise SourceTextUnavailable('main.tex: [Errno 2] No such file')
+    monkeypatch.setattr('parser.pipeline._source_texts', boom)
+
+    manifest = run_parser(root)
+
+    assert manifest['versions']['versions_parsed'] == 0
+    assert manifest['versions']['versions_partial'] == 1
+    assert manifest['versions']['versions_failed'] == 0
+    assert any(w['code'] == 'source_texts_unavailable'
+               for w in manifest['validation']['warnings'])
+
+
+def test_selected_bib_override_invalidates_resume(tmp_path, make_source):
+    root = tmp_path / 'runtime'
+    make_source(root, '2410.23025', 1, {
+        'main.tex': V1, 'refs.bib': '@misc{x, title={X}}',
+    }, 'succeeded')
+
+    run_parser(root)
+
+    log = []
+    run_parser(root, log=log.append)
+    assert log and all('skip' in line for line in log), log
+
+    log = []
+    run_parser(root, selected_bib_files={('2410.23025', 1): ('refs.bib',)},
+               log=log.append)
+    assert any('parse 2410.23025' in line for line in log), log
+
+
+def test_two_version_same_key_different_doi_remaps_content(tmp_path, make_source):
+    root = tmp_path / 'runtime'
+    for version in (1, 2):
+        make_source(root, '2411.18799', version, {
+            'main.tex': TWO_VERSION_TEX,
+            'refs.bib': (f'@article{{same, title={{Version {version}}}, '
+                         f'doi={{10.1234/ref{version}}}}}'),
+        }, 'succeeded')
+
+    manifest = run_parser(root)
+
+    assert manifest['versions']['versions_parsed'] == 2
+    elements = pq.read_table(root / 'parsed' / 'elements.parquet').to_pylist()
+    cite_sentences = [row for row in elements if '\\cite{' in row['content']]
+    assert len(cite_sentences) == 2
+    keys = {row['content'] for row in cite_sentences}
+    assert len(keys) == 2
+    audit = json.loads((root / 'parsed' / 'bibtex_audit.json').read_text(encoding='utf8'))
+    mapping = audit['publications']['2411.18799']['references']['result']['merge']['mapping']
+    canonical = {item['canonical_key'] for item in mapping if item['old_key'] == 'same'}
+    assert keys == {f'Version-specific result \\cite{{{key}}}.'
+                    for key in canonical}
