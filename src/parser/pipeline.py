@@ -175,12 +175,17 @@ def resolve_output(persistent_root: str | Path, output_root: str | Path | None) 
     return Path(output_root)
 
 
+class SourceTextUnavailable(RuntimeError):
+    """Raised when C cannot decode an A1 source file needed for provenance verification."""
+
+
 def _version_stats() -> dict:
     return dict(versions_total=0, versions_parsed=0, versions_empty=0,
                 versions_partial=0, versions_pending=0, versions_failed=0,
                 missing=0, gather_failed=0,
                 elements_before=0, elements_after=0,
                 bibtex_before=0, bibtex_after=0, bibtex_duplicates=0,
+                bibtex_unexportable=0, bibtex_unresolved=0,
                 citations_unresolved=0, bibtex_conflicts=0,
                 bibtex_conflict_fields=0, seconds=0.0)
 
@@ -215,19 +220,24 @@ def _diagnostic_warning(arxiv_id, version, stage, item, *, path=None) -> dict:
     )
 
 
-def _source_texts(gathered, source_dir: Path) -> dict[str, str] | None:
-    """Decode exactly A1's files; return None rather than a partial guess."""
+def _source_texts(gathered, source_dir: Path) -> dict[str, str]:
+    """Decode exactly A1's files; raise if any needed file cannot be read.
+
+    Returning ``None`` silently bypasses provenance verification, so a read
+    error is surfaced instead and the caller downgrades the version rather
+    than marking it ``ready`` without evidence.
+    """
     raw = getattr(gathered, 'raw', None)
     names = getattr(raw, 'used_tex_files', None)
     if not names:
-        return None
+        return {}
     texts = {}
     for name in names:
         try:
             texts[name] = (Path(source_dir) / name).read_text(encoding='utf8')
-        except (OSError, UnicodeError):
-            return None
-    return texts or None
+        except (OSError, UnicodeError) as exc:
+            raise SourceTextUnavailable(f'{name}: {exc}') from exc
+    return texts
 
 
 def _jsonable(value):
@@ -556,15 +566,30 @@ def _process_publication_b(arxiv_id: str, records, services: ParserServices, *,
 
     overrides = selected_bib_files or {}
     items = []
+    read_failed: set[int] = set()
     for version, gathered, parsed, source_dir in parsed_versions:
         chosen = overrides.get((arxiv_id, version))
         if chosen is not None:
             chosen = tuple(chosen)
+        try:
+            texts = _source_texts(gathered, source_dir)
+        except SourceTextUnavailable as exc:
+            # Cannot verify source spans without the decoded A1 text: downgrade
+            # instead of silently bypassing provenance verification.
+            read_failed.add(version)
+            stats['versions_partial'] += 1
+            warnings.append(dict(
+                arxiv_id=arxiv_id, version=version, status='parse_warning',
+                stage='source_verify', code='source_texts_unavailable',
+                message=f'Cannot decode source text for provenance verification: {exc}',
+                path=None, start=None, end=None, spans=[],
+            ))
+            continue
         items.append(VersionInput(
             hierarchy=parsed.result,
             gathered=gathered.raw,
             source_dir=source_dir,
-            source_texts=_source_texts(gathered, source_dir),
+            source_texts=texts,
             selected_bib_files=chosen,
         ))
     approved = ()
@@ -623,6 +648,8 @@ def _process_publication_b(arxiv_id: str, records, services: ParserServices, *,
             ))
 
     for version, _, _, _ in parsed_versions:
+        if version in read_failed:
+            continue
         if version not in seen_versions:
             stats['versions_pending'] += 1
             warnings.append(dict(
@@ -647,13 +674,22 @@ def _process_publication_b(arxiv_id: str, records, services: ParserServices, *,
     merge = getattr(references, 'merge', None)
     records_found = getattr(merge, 'records', ()) if merge is not None else ()
     occurrences = getattr(merge, 'occurrences', ()) if merge is not None else ()
+    unresolved = getattr(merge, 'unresolved', ()) if merge is not None else ()
     for record in records_found:
         payload = record.payload.as_kwargs()
         rows['bibtex'].append({name: payload.get(name) for name in BIBTEX_SCHEMA.names})
     rows['bibtex'].sort(key=lambda row: row['citation_key'])
     stats['bibtex_before'] = len(occurrences)
     stats['bibtex_after'] = len(records_found)
-    stats['bibtex_duplicates'] = max(0, stats['bibtex_before'] - stats['bibtex_after'])
+    # Dedup only counts merged groups with more than one member. Occurrences
+    # with no exportable payload (invalid original key) are tracked separately
+    # as unexportable, never as duplicates.
+    stats['bibtex_duplicates'] = sum(max(0, len(getattr(record, 'members', ())) - 1)
+                                     for record in records_found)
+    stats['bibtex_unexportable'] = sum(1 for item in occurrences
+                                       if getattr(getattr(item, 'prepared', None),
+                                                  'payload', None) is None)
+    stats['bibtex_unresolved'] = len(unresolved)
     stats['bibtex_conflicts'] = sum(1 for record in records_found
                                     if getattr(record, 'conflicts', ()))
     stats['bibtex_conflict_fields'] = sum(len(getattr(record, 'conflicts', ()))
@@ -749,7 +785,8 @@ def _write_coverage(output_root: Path, processed: dict) -> None:
     columns = ['arxiv_id', 'versions_total', 'versions_parsed', 'versions_empty',
                'versions_partial', 'versions_pending', 'versions_failed', 'missing',
                'gather_failed', 'elements_before', 'elements_after', 'bibtex_before',
-               'bibtex_after', 'bibtex_duplicates', 'citations_unresolved',
+               'bibtex_after', 'bibtex_duplicates', 'bibtex_unexportable',
+               'bibtex_unresolved', 'citations_unresolved',
                'bibtex_conflicts', 'bibtex_conflict_fields', 'seconds']
     path = output_root / 'coverage.csv'
     with path.open('w', newline='', encoding='utf8') as handle:
@@ -931,10 +968,14 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
                          deduplicated=aggregate['elements_before'] - aggregate['elements_after']),
         'bibtex': dict(before_dedup=aggregate['bibtex_before'],
                        after_dedup=aggregate['bibtex_after'],
-                       deduplicated=aggregate['bibtex_duplicates']),
+                       deduplicated=aggregate['bibtex_duplicates'],
+                       unexportable=aggregate['bibtex_unexportable'],
+                       unresolved=aggregate['bibtex_unresolved']),
         'quality': dict(citations_unresolved=aggregate['citations_unresolved'],
                         bibtex_conflicts=aggregate['bibtex_conflicts'],
-                        bibtex_conflict_fields=aggregate['bibtex_conflict_fields']),
+                        bibtex_conflict_fields=aggregate['bibtex_conflict_fields'],
+                        bibtex_unexportable=aggregate['bibtex_unexportable'],
+                        bibtex_unresolved=aggregate['bibtex_unresolved']),
         'audit': dict(schema_version=1, publications=len(audits),
                       path='bibtex_audit.json'),
         'empty_versions': aggregate['versions_empty'],
