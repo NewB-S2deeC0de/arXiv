@@ -4,5 +4,8 @@ __pycache__/
 .pytest_cache/
 .ipynb_checkpoints/
 .venv/
+# Keep working notes local; force-add a Markdown file only when explicitly requested.
+docs/*
+!docs/runtime-files.md
 
 scratch
