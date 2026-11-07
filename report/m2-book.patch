@@ -1,0 +1,160 @@
+diff --git a/m2/methods.md b/m2/methods.md
+new file mode 100644
+index 0000000..fce0ebf
+--- /dev/null
++++ b/m2/methods.md
+@@ -0,0 +1,56 @@
++# Phương pháp và khả năng tái lập M2
++
++## Dữ liệu và phạm vi thực nghiệm
++
++Đầu vào là source LaTeX/BibTeX do crawler M1 lưu theo publication và version, có `complete.json`, `inventory.json` và thư mục `source/tex`. Không lấy PDF hoặc dữ liệu references Semantic Scholar làm nội dung parsing.
++
++Nguồn dữ liệu nhóm: [thư mục Google Drive](https://drive.google.com/drive/folders/1mNYmJH0l19l5bFYddKB-S82CLgtOxe5t). Kiểm tra danh sách công khai ngày 2026-11-07 thấy ba runtime: `runtime`, `runtime-hieu`, `runtime-kien`. Mỗi thư mục data có 5.000 thư mục tên publication và một thư mục reference-batches. Đây là số thư mục quan sát được, không chứng minh source của từng publication đã đầy đủ hoặc parse thành công. Người dùng xác nhận runtime của thành viên thứ tư chưa được bổ sung.
++
++Không công bố kết quả ba runtime là benchmark toàn nhóm. Khi có đủ dữ liệu, dừng crawler, chờ Drive đồng bộ và tạo snapshot riêng trước khi đo. `parser.dataset_snapshot` sao chép source records, kiểm tra checksum trước/sau và kiểm tra lại nguồn. Version trùng byte tính một lần; khác byte thì lỗi để nhóm giải quyết. Không ghi đè dữ liệu gốc. Manifest snapshot lưu nguồn, version, checksum và fingerprint.
++
++## Pipeline A → B → C
++
++A1 chọn root TeX và mở rộng include theo thứ tự nguồn; lưu source spans và diagnostics cho include thiếu, vòng lặp, đường dẫn không an toàn. A2 tạo hierarchy heading, paragraph, list/item và tách bibliography khi có bằng chứng rõ. A3 chia sentence, bảo vệ inline math và các vùng đặc biệt, nhận diện block formula và figure/table. Đây là phân tích tĩnh, không thực thi TeX hay macro tùy ý.
++
++B1 chuẩn hóa content, giữ raw, attrs, spans và cảnh báo trên cây giàu thông tin. B2 thu bibliography inline và `.bib` được chọn; `.bib` ngoài selection không đóng góp entry. C3 gọi `standardize_publication` theo publication, nhận `version.finalized.tree`. B3 canonicalize reference và remap citation theo `(arxiv_id, version, old_key)` trước C2 dedup. Key mơ hồ giữ citation gốc và diagnostic. Không tự áp dụng precedence `.bib` hơn bibitem.
++
++C2 chia sẻ unique elements giữa version khi phù hợp, nhưng giữ các lần lặp trong cùng version bằng element/edge riêng theo policy hiện tại. C3 xuất `elements.parquet`, `hierarchy.parquet`, `bibtex.parquet`, manifest, coverage và bibliography audit.
++
++## Thứ tự hierarchy và resume
++
++Hierarchy có `position:int64` không null, bắt đầu từ 0 trong từng nhóm `(arxiv_id, version, parent_id)`. Vị trí được ghi ngay khi duyệt children, kể cả children của root, không suy từ element ID hoặc thứ tự hàng Parquet. Consumer nhóm theo version/parent rồi sort position để dựng lại children.
++
++Validator từ chối vị trí thiếu, âm, sai kiểu, trùng hoặc không liên tục. Source-order acceptance đảo thứ tự root/nested siblings giữa hai version, giữ sentence lặp, trộn thứ tự hàng đã đọc và đối chiếu với cây finalized trong audit.
++
++Parser version `1.1.0`, checkpoint schema `3`, manifest schema `2`; schema fingerprint cũng đổi khi thêm position. Checkpoint cũ bị invalidated và publication được parse lại; không coi shard thiếu position là output hợp lệ của schema mới.
++
++## Benchmark Colab CPU
++
++Dùng notebook `notebooks/benchmark_colab.ipynb` trong repo code, đặt đúng repo D, shortcut Drive và các runtime. Mặc định hiện tại là bộ dữ liệu chưa đủ nhóm: `GROUP_DATA_COMPLETE=False`; run có nhãn `blocked_incomplete_group_dataset`. Chỉ bật official run khi đủ bốn thành viên. Không limit và không resume cho run chính thức; mỗi run có output mới.
++
++Snapshot đặt trên SSD Colab, output đặt trên Drive. Wall time gồm đọc snapshot, parse/standardize/dedup, export/validation và thu thập counts; không gồm cài dependency hoặc copy/checksum snapshot. I/O Drive ảnh hưởng timing. Không so trực tiếp các run có vị trí I/O khác mà bỏ qua điều kiện này.
++
++RSS là process hiện tại, lấy mẫu mặc định 0,25 giây; không gồm child processes và có thể bỏ lỡ spike. Storage là logical bytes trong parsed, gồm shards, checkpoint và audit, không phải filesystem allocation.
++
++```bash
++PYTHONPATH=src python -m parser.dataset_snapshot --root /path/runtime --root /path/runtime-hieu --root /path/runtime-kien --out /content/m2-snapshot-new
++PYTHONPATH=src python -m parser.benchmark --persistent-root /content/m2-snapshot-new --out /path/new-partial-run --incomplete-group-data
++```
++
++Lệnh trên chỉ đo ba runtime đã có. Khi đủ dữ liệu, tạo snapshot mới bao gồm runtime thứ tư; notebook ghi xác nhận completeness vào environment/summary. Không đổi nhãn run cũ thành run chính thức.
++
++## Đơn vị báo cáo
++
++`papers_processed` là publication đã xét, không phải số parse thành công. `versions_parsed` là version có cây xuất. Empty, partial bị loại, pending, failed và missing là các nhóm riêng:
++
++```text
++versions_total = versions_parsed + versions_empty + versions_partial
++               + versions_pending + versions_failed + missing
++gather_failed <= versions_failed
++```
++
++Partial opt-in có cây thuộc parsed, không cộng lại partial. Benchmark kiểm tra partition trước khi báo completed. Pending/failed/validation lỗi chặn acceptance; completed chỉ nói thực thi phép đo, requires_D1_review chưa phải acceptance pass.
++
++Unresolved citations từ C3 là distinct keys trong từng publication, cộng qua publication; không phải citation occurrences trước dedup của B. Conflicts đếm canonical records có ít nhất một field conflict; conflict_fields đếm cặp record/field. Thiếu nguồn thì null. Counts theo kind là unique elements sau dedup.
++
++Lưu cùng run: `summary.json`, `environment.json`, `resources.csv`, snapshot manifest, log tests và toàn bộ parsed artifacts. Sinh bảng từ run thực bằng `parser.benchmark_report --run <run> --out <book>/m2/results.md`; không dùng số test tổng hợp làm số thực nghiệm.
+diff --git a/m2/overview.md b/m2/overview.md
+index c6587f8..9035b15 100644
+--- a/m2/overview.md
++++ b/m2/overview.md
+@@ -40,10 +40,10 @@ Phát hiện và hợp nhất những thành phần nội dung hoặc tài liệ
+
+ Phần này sẽ trình bày các thống kê về tỷ lệ phân tích thành công, số lượng thành phần được trích xuất, hiệu quả loại bỏ trùng lặp, thời gian xử lý và tài nguyên sử dụng.
+
+-Các kết quả sẽ được bổ sung sau khi quá trình tích hợp và kiểm thử hoàn tất.
++Xem [kết quả và phạm vi dữ liệu hiện có](results.md). Chưa có benchmark chính thức toàn nhóm vì còn thiếu runtime của một thành viên; không dùng số test tổng hợp thay số corpus thật.
+
+ ## 4. Trạng thái thực hiện
+
+-**Nội dung Milestone 2 đang được phát triển và hoàn thiện.**
++Phần phương pháp và acceptance đã được bổ sung tại [phương pháp/tái lập](methods.md) và [kiểm chứng/giới hạn](validation.md). Hierarchy lưu thứ tự sibling bằng position; có test round-trip sau export và invalidation checkpoint cũ.
+
+-Báo cáo chi tiết về phương pháp triển khai, dữ liệu đầu ra, kết quả thực nghiệm và các hạn chế sẽ được cập nhật tại đây.
+\ No newline at end of file
++Kết quả benchmark toàn nhóm sẽ cập nhật sau khi runtime cuối được bổ sung và chạy Colab CPU trên snapshot đầy đủ.
+diff --git a/m2/results.md b/m2/results.md
+new file mode 100644
+index 0000000..cc1ce34
+--- /dev/null
++++ b/m2/results.md
+@@ -0,0 +1,22 @@
++# Kết quả thực nghiệm M2
++
++## Trạng thái ngày 2026-11-07
++
++**Chưa có benchmark Colab CPU trên toàn bộ dữ liệu bốn thành viên.** Người dùng xác nhận runtime của mình chưa có trong Drive. Ba runtime đã quan sát được không thay thế phạm vi toàn nhóm.
++
++| Phạm vi | Đã quan sát | Chưa xác minh |
++|---|---|---|
++| `runtime` | 5.000 thư mục tên publication | Marker/checksum, version coverage, số source parse được |
++| `runtime-hieu` | 5.000 thư mục tên publication | Marker/checksum, version coverage, số source parse được |
++| `runtime-kien` | 5.000 thư mục tên publication | Marker/checksum, version coverage, số source parse được |
++| Runtime người dùng | Chưa được bổ sung theo xác nhận người dùng | Toàn bộ coverage và dữ liệu source |
++
++Các số trên là **kiểm kê tên thư mục**, không phải benchmark hoặc số crawl thành công. Không có số wall time, peak RSS, storage hoặc chất lượng corpus để điền vào bảng kết quả chính thức.
++
++## Cách cập nhật sau khi đủ dữ liệu
++
++1. Bổ sung runtime còn thiếu, chốt snapshot ổn định và xác nhận Colab CPU.
++2. Chạy notebook benchmark cùng commit đã test, toàn bộ input, output mới, không resume/limit.
++3. Lưu artifact và review coverage/validation/failures.
++4. Sinh lại trang này từ `summary.json`/`environment.json` bằng `parser.benchmark_report`; bổ sung phân tích lỗi thực và link artifact có quyền đọc phù hợp.
++5. Build book lại. Không thay trang này bằng số từ fixture pytest hoặc microbenchmark.
+diff --git a/m2/validation.md b/m2/validation.md
+new file mode 100644
+index 0000000..e536fb9
+--- /dev/null
++++ b/m2/validation.md
+@@ -0,0 +1,31 @@
++# Kiểm chứng và giới hạn M2
++
++## Acceptance có bằng chứng thực thi
++
++D1 chạy default services thật qua A→B→C trên fixture offline, không dùng fake services làm bằng chứng tích hợp. Bộ kiểm tra bao gồm:
++
++| Nội dung | Bằng chứng |
++|---|---|
++| Gather/hierarchy/leaves | Chạy deterministic, source spans đối chiếu được, input giữ nguyên |
++| Finalize và bibliography | Hai version, cùng citation key nhưng DOI khác, canonical remap đúng version; `.bib` ngoài selection không xuất |
++| Source order | Đảo root/nested siblings, sentence lặp; đọc Parquet, trộn thứ tự hàng, dựng lại bằng position và đối chiếu finalized tree trong audit |
++| Schema/resume | Checkpoint schema cũ và shard thiếu position được parse lại |
++| Chất lượng | Key missing lặp nhiều lần đếm một distinct key/publication; DOI chung nhưng title khác tạo một conflict record/field |
++| Snapshot | Gom nhiều runtime, checksum/source không đổi, duplicate giống nhau gộp; xung đột khác byte bị từ chối |
++| Reporting | Đọc lại artifact thật, failed run lưu telemetry và ném lỗi; thiếu dữ liệu thành viên không được coi là kết quả toàn nhóm |
++
++B1 phản hồi ngày 2026-11-07 xác nhận commit `2e26c19` giữ thứ tự children/root và câu lặp trong `version.finalized.tree`, child_path khớp vị trí. Việc lưu position được bổ sung ở C2/export; không cần sửa B1.
++
++Lệnh regression Linux:
++
++```bash
++python -m pytest -q
++```
++
++Full suite ngày 2026-11-07 trên WSL Ubuntu 24.04/Python 3.12.3 đạt **676 passed, 608 subtests passed**, không còn XFAIL BC-04. Main đã nhận là `dbfe53f`, merge local D tại `c370c20`; các thay đổi D mới đang ở working tree để review. Các test dùng dữ liệu tổng hợp; chúng không phải kết quả benchmark 15.000 publication trên Drive. Windows có giới hạn crawler `fcntl`/directory fsync và quyền tạo symlink, vì vậy nghiệm thu full suite trên Linux.
++
++## Giới hạn chưa thể kết luận từ test
++
++Parser tĩnh không diễn giải đầy đủ TeX/macro động; missing include, nguồn không đối chiếu được hoặc bibliography không rõ ràng có thể tạo partial/diagnostic. Không tự điền nội dung hoặc reference để tăng coverage. Cần review failures trên corpus thực và nêu mẫu số khi báo tỷ lệ.
++
++Benchmark toàn nhóm vẫn thiếu runtime thành viên thứ tư theo xác nhận người dùng. Không có số timing/RAM/storage chính thức cho toàn nhóm tại thời điểm cập nhật. Không chuyển counts thư mục Drive thành counts source thành công.
+diff --git a/myst.yml b/myst.yml
+index 0645a2f..64633aa 100644
+--- a/myst.yml
++++ b/myst.yml
+@@ -16,6 +16,9 @@ project:
+     - title: Milestone 2 — Parsing
+       children:
+         - file: m2/overview.md
++        - file: m2/methods.md
++        - file: m2/validation.md
++        - file: m2/results.md
+ site:
+   template: book-theme
+   title: arXiv Project Report

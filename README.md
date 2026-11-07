@@ -2,6 +2,11 @@
 
 M2 A1–A3 implementation: `src/parser/gather.py`, `hierarchy.py`, `leaves.py`.
 
+Xem [tồn đọng D và trách nhiệm xử lý của các bên](docs/m2-d-remaining-work.md).
+Benchmark CLI: `PYTHONPATH=src python -m parser.benchmark --help`.
+Chưa có kết quả Colab thật hoặc book M2 đã build; xem các blocker trong tài liệu.
+
+
 
 Python >=3.11, Colab CPU; inclusive range `2504.02523`–`2504.07522`.
 Metadata và source arXiv dùng chung scheduler nối tiếp; S2 có limiter riêng.
@@ -410,3 +415,20 @@ python -m pytest @bTests
 C3 có thể gọi `standardize_publication` sau A1/A2/A3 để chuẩn hóa cây, đọc
 bibliography theo version, hợp nhất reference và remap citation trước C2.
 Xem [API và quy tắc tích hợp](docs/b-local-workflow-api.md).
+
+## Milestone 2 · Kiểm thử, benchmark toàn nhóm và báo cáo
+
+Nhánh D đã nhận `main@dbfe53f`. Test D1 dùng default services thật;
+hierarchy đã có position và kiểm chứng round-trip/resume, không còn XFAIL BC-04.
+Full suite Linux: **676 passed, 608 subtests passed** (`python -m pytest -q`).
+
+Dùng [notebook benchmark Colab CPU](notebooks/benchmark_colab.ipynb) với runtime
+chung hoặc các runtime riêng. Notebook tạo snapshot nguồn
+riêng, kiểm tra checksum và duplicate version, chạy toàn bộ dữ liệu không limit,
+lưu telemetry và sinh bảng Markdown từ artifact thực. Không sửa dữ liệu crawl.
+
+Xem [tồn đọng, điều kiện nghiệm thu và cách bàn giao của các bên](docs/m2-d-remaining-work.md).
+Drive hiện có ba runtime, còn thiếu runtime người dùng nên chưa có benchmark
+toàn nhóm. Notebook ghi rõ run bộ phận. Book đã có tại
+[arXiv-report](https://newb-s2deec0de.github.io/arXiv-report/); chương M2 bổ sung
+đã build local. Xem [patch bàn giao book](report/README.md) để apply vào repo report.

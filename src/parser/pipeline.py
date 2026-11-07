@@ -34,9 +34,9 @@ from .dedup import ElementStore
 from .integration import load_services
 from .validation import ValidationError, validate_or_raise, validate_output
 
-PARSER_VERSION = '1.0.0'
-CHECKPOINT_SCHEMA = 2
-MANIFEST_SCHEMA = 1
+PARSER_VERSION = '1.1.0'
+CHECKPOINT_SCHEMA = 3
+MANIFEST_SCHEMA = 2
 TABLES = (('elements', ELEMENTS_SCHEMA), ('hierarchy', HIERARCHY_SCHEMA), ('bibtex', BIBTEX_SCHEMA))
 
 

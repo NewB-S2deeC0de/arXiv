@@ -160,6 +160,13 @@ with versions total/parsed/empty/partial/pending/failed/missing, gather failures
 element and BibTeX counts before/after deduplication, unexportable/unresolved
 BibTeX occurrences, conflicts, and parse time in seconds.
 
+Hierarchy additionally stores non-null `position:int64`, the zero-based sibling
+index within `(arxiv_id, version, parent_id)`, including root children. Rebuild
+children by sorting this field, never by element ID or physical Parquet row order.
+Validators reject invalid, duplicate or gapped positions. Parser 1.1.0 uses
+checkpoint schema 3 and manifest schema 2; old checkpoints are reprocessed after
+the schema/policy fingerprint changes.
+
 `manifest.json` contains:
 
 - `papers_total` / `papers_processed`, version counts including

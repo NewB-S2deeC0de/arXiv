@@ -1,0 +1,33 @@
+{
+  "checked_on": "2026-11-07",
+  "source_url": "https://drive.google.com/drive/folders/1mNYmJH0l19l5bFYddKB-S82CLgtOxe5t",
+  "group_data_complete": false,
+  "missing": "user runtime (confirmed by user)",
+  "scope": "public directory listing only; not crawl success or benchmark counts",
+  "runtimes": [
+    {
+      "runtime": "runtime",
+      "drive_folder_id": "1HRVV7nlURDy9f-CIKNtb6O0evllqQzT9",
+      "publication_directories": 5000,
+      "first_id": "2504.02523",
+      "last_id": "2504.07522",
+      "source_markers_verified": false
+    },
+    {
+      "runtime": "runtime-hieu",
+      "drive_folder_id": "1WzSidrw9mJ_j9zoTlemXYzAV1C8lkyI-",
+      "publication_directories": 5000,
+      "first_id": "2411.18799",
+      "last_id": "2412.03847",
+      "source_markers_verified": false
+    },
+    {
+      "runtime": "runtime-kien",
+      "drive_folder_id": "146xCIcSRJtDwPtLfhFp8ck64BxOkI4nn",
+      "publication_directories": 5000,
+      "first_id": "2410.23025",
+      "last_id": "2411.03798",
+      "source_markers_verified": false
+    }
+  ]
+}

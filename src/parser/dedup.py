@@ -59,17 +59,17 @@ class ElementStore:
         return root_id
 
     def _add_children(self, version: int, node: TreeNode, parent_id: str) -> None:
-        for child in node.children:
+        for position, child in enumerate(node.children):
             kind = ElementKind(child.kind)
             element_id = self.intern(version, kind, child.content)
-            self.edges.append(HierarchyEdge(self.arxiv_id, version, element_id, parent_id))
+            self.edges.append(HierarchyEdge(self.arxiv_id, version, element_id, parent_id, position))
             self._add_children(version, child, element_id)
 
     def sorted_elements(self) -> list[Element]:
         return [self.elements[key] for key in sorted(self.elements)]
 
     def sorted_edges(self) -> list[HierarchyEdge]:
-        return sorted(self.edges, key=lambda edge: (edge.version, edge.element_id, edge.parent_id))
+        return sorted(self.edges, key=lambda edge: (edge.version, edge.parent_id, edge.position))
 
     @property
     def distinct_elements(self) -> int:

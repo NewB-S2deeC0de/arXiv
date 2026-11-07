@@ -8,3 +8,6 @@ __pycache__/
 docs/*
 
 scratch
+
+# Local report checkout, downloaded data and build tools
+.work/

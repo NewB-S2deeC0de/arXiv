@@ -39,7 +39,7 @@ def test_element_kind_prefixes_match_specification():
 
 def test_table_schemas_match_contract_columns():
     assert ELEMENTS_SCHEMA.names == ['element_id', 'arxiv_id', 'kind', 'content']
-    assert HIERARCHY_SCHEMA.names == ['arxiv_id', 'version', 'element_id', 'parent_id']
+    assert HIERARCHY_SCHEMA.names == ['arxiv_id', 'version', 'element_id', 'parent_id', 'position']
     assert BIBTEX_SCHEMA.names == [
         'arxiv_id', 'citation_key', 'entry_type', 'title', 'authors',
         'year', 'doi', 'journal', 'url',
@@ -61,7 +61,7 @@ def test_row_converters_preserve_nulls_and_author_lists():
     )]
     assert hierarchy_rows([edge]) == [dict(
         arxiv_id='2410.23025', version=2,
-        element_id='2410-23025#p1', parent_id='2410-23025#root1',
+        element_id='2410-23025#p1', parent_id='2410-23025#root1', position=0,
     )]
     row = bibtex_rows([entry])[0]
     assert row['title'] is None and row['year'] is None

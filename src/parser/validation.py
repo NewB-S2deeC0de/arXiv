@@ -78,10 +78,16 @@ def validate_rows(arxiv_id: str, rows: dict[str, list[dict]]) -> dict:
                    content_type=type(content).__name__)
 
     edge_keys: set[tuple] = set()
+    sibling_positions: dict[tuple, list[int]] = {}
     for index, row in enumerate(hierarchy):
         element_id = row.get('element_id')
         parent_id = row.get('parent_id')
         version = row.get('version')
+        position = row.get('position')
+        if type(position) is not int or position < 0:
+            _error(errors, 'invalid_sibling_position', row=index, position=position)
+        else:
+            sibling_positions.setdefault((version, parent_id), []).append(position)
         if row.get('arxiv_id') != arxiv_id:
             _error(errors, 'edge_publication_mismatch', row=index,
                    arxiv_id=row.get('arxiv_id'))
@@ -98,6 +104,12 @@ def validate_rows(arxiv_id: str, rows: dict[str, list[dict]]) -> dict:
             _error(errors, 'duplicate_edge', version=version,
                    element_id=element_id, parent_id=parent_id)
         edge_keys.add(key)
+
+    for (version, parent_id), positions in sibling_positions.items():
+        if len(set(positions)) != len(positions):
+            _error(errors, 'duplicate_sibling_position', version=version, parent_id=parent_id)
+        if sorted(positions) != list(range(len(positions))):
+            _error(errors, 'noncontiguous_sibling_positions', version=version, parent_id=parent_id)
 
     bibtex_keys: set[str] = set()
     for index, row in enumerate(bibtex):

@@ -1,5 +1,6 @@
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 from parser.contract import BIBTEX_SCHEMA, ELEMENTS_SCHEMA, HIERARCHY_SCHEMA
 from parser.validation import validate_output, validate_rows
@@ -17,7 +18,7 @@ def _rows():
         ],
         'hierarchy': [
             dict(arxiv_id=ARXIV, version=1,
-                 element_id='2410-23025#s1', parent_id='2410-23025#root1'),
+                 element_id='2410-23025#s1', parent_id='2410-23025#root1', position=0),
         ],
         'bibtex': [
             dict(arxiv_id=ARXIV, citation_key='key', entry_type='misc',
@@ -84,3 +85,22 @@ def test_validate_output_checks_all_tables_and_schemas(tmp_path):
     result = validate_output(tmp_path)
     assert result['ok'] is False
     assert any(error['code'] == 'schema_mismatch' for error in result['errors'])
+
+
+@pytest.mark.parametrize('position', [None, -1, True, '0'])
+def test_validate_rows_rejects_invalid_sibling_position(position):
+    rows = _rows()
+    rows['hierarchy'][0]['position'] = position
+    result = validate_rows(ARXIV, rows)
+    assert any(e['code'] == 'invalid_sibling_position' for e in result['errors'])
+
+
+def test_validate_rows_rejects_duplicate_and_gapped_positions():
+    rows = _rows()
+    rows['elements'].append(dict(rows['elements'][1], element_id='2410-23025#s2'))
+    rows['hierarchy'].append(dict(rows['hierarchy'][0], element_id='2410-23025#s2'))
+    assert any(e['code'] == 'duplicate_sibling_position'
+               for e in validate_rows(ARXIV, rows)['errors'])
+    rows['hierarchy'][1]['position'] = 2
+    assert any(e['code'] == 'noncontiguous_sibling_positions'
+               for e in validate_rows(ARXIV, rows)['errors'])

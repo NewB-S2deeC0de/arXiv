@@ -201,6 +201,7 @@ class HierarchyEdge:
     version: int
     element_id: str
     parent_id: str
+    position: int = 0
 
 
 @dataclass(frozen=True)
@@ -256,6 +257,7 @@ HIERARCHY_SCHEMA = pa.schema([
     pa.field('version', pa.int64()),
     pa.field('element_id', pa.string(), nullable=False),
     pa.field('parent_id', pa.string(), nullable=False),
+    pa.field('position', pa.int64(), nullable=False),
 ])
 
 BIBTEX_SCHEMA = pa.schema([
@@ -284,7 +286,8 @@ def element_rows(elements: list[Element]) -> list[dict]:
 
 def hierarchy_rows(edges: list[HierarchyEdge]) -> list[dict]:
     return [dict(arxiv_id=e.arxiv_id, version=e.version,
-                 element_id=e.element_id, parent_id=e.parent_id) for e in edges]
+                 element_id=e.element_id, parent_id=e.parent_id,
+                 position=e.position) for e in edges]
 
 
 def bibtex_rows(entries: list[BibEntry]) -> list[dict]:
