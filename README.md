@@ -1,16 +1,7 @@
 # Milestone 1 arXiv crawler
 
-## Milestone 2 — testing và benchmark
+M2 A1–A3 implementation: `src/parser/gather.py`, `hierarchy.py`, `leaves.py`.
 
-Luồng D đang triển khai: [acceptance matrix](docs/m2-d1-acceptance-matrix.md),
-[quyết định contract của D](docs/m2-d-contract-decisions.md) và
-[cách chạy test/benchmark, báo cáo và Git](docs/m2-d-reproducibility.md).
-Benchmark CLI: `PYTHONPATH=src python -m parser.benchmark --help`.
-Chưa có kết quả Colab thật hoặc book M2 đã build; xem các blocker trong tài liệu.
-
-M2 A1 standalone multi-file gathering: [interface, example, and current limits](docs/m2-a1-gather.md).
-M2 A2 version-local hierarchy: [interface and current limits](docs/m2-a2-hierarchy.md).
-M2 A3 sentence, formula and figure leaves: [interface and current limits](docs/m2-a3-leaves.md).
 
 Python >=3.11, Colab CPU; inclusive range `2504.02523`–`2504.07522`.
 Metadata và source arXiv dùng chung scheduler nối tiếp; S2 có limiter riêng.
@@ -19,7 +10,6 @@ Cooldown và attempts được lưu trước khi tiếp tục. Không tự retry
 
 ## Kiến trúc references theo version
 
-Xem [luồng worker, giới hạn queue, chuyển dữ liệu cũ và cách smoke](docs/versioned-reference-workers.md).
 References mới truy vấn URL arXiv vN, lưu riêng từng version; snapshot v0 giữ nguyên.
 Chưa kiểm chứng rằng S2 trả bibliography lịch sử tương ứng từng version.
 S2 chạy bốn lượt `POST /paper/batch`, tối đa 100 version mỗi request. Chỉ
@@ -134,8 +124,31 @@ redirect sang host khác ghi `redirect_disallowed`, không âm thầm dùng main
 - https://api.semanticscholar.org/api-docs/graphs
 - https://www.python-httpx.org/quickstart/
 
-Code repo và Drive runtime độc lập; parsing, matching, Jupyter Book, GitHub Pages,
-upload dataset và report repo thuộc milestone sau. Chưa chạy toàn bộ 5.000 ID.
+Code repo và Drive runtime độc lập. Sau khi export snapshot M1, chuẩn bị số liệu
+báo cáo bằng lệnh sau từ repo code cho một range:
+
+```bash
+PYTHONPATH=src python -m crawler.m1_report \
+  --export runtime/exports/<export_id> --runtime runtime \
+  --output ../m1-report/book/data
+```
+
+Nếu hai thành viên cào hai range riêng, giữ nguyên hai runtime và export từng
+runtime bằng config tương ứng. Ghép hai export bằng:
+
+```bash
+PYTHONPATH=src python -m crawler.m1_report \
+  --part runtime/exports/m1-own runtime \
+  --part runtime_Hiếu/exports/m1-hieu runtime_Hiếu \
+  --output ../m1-report/book/data
+```
+
+Lệnh kiểm tra checksum, ID được giao không giao nhau và run ID không trùng;
+không ghép trực tiếp progress hoặc data. Xem hướng dẫn đầy đủ trong README của
+repo báo cáo.
+
+Jupyter Book nằm trong repo báo cáo riêng. Parsing và matching thuộc các
+milestone sau.
 
 ## Discovery batching
 
@@ -266,7 +279,8 @@ với YAML sửa riêng trong bản clone trên Drive.
 `notebooks/5000_crawl.ipynb` đã được thay bằng cell toàn range trong
 `notebooks/crawl_colab.ipynb`; chỉ cần duy trì một notebook.
 
-Hướng dẫn dừng, sao lưu và nâng cấp khi Drive chưa đồng bộ: [docs/safe-stop-and-upgrade.md](docs/safe-stop-and-upgrade.md).
+Dừng crawler và đợi worker ghi xong trước khi cập nhật code; giữ backup runtime
+và không xóa journal hoặc services.json khi resume.
 
 ### Resume và xác minh riêng
 
@@ -297,13 +311,13 @@ Khởi động đọc snapshot/journal nhưng không quét baseline dung lượn
 tác đọc/ghi Drive khác vẫn có thể chậm. Các summary cũ có baseline toàn dataset
 không được so sánh trực tiếp với disk peak mới có phạm vi session_touched_paths.
 
-### Export M1 schema v2 và định dạng source
+### Export M1 schema v3 và định dạng source
 
 `papers.parquet` chỉ chứa publication trong range có discovery succeeded và
 normalized metadata kiểm tra được checksum. ID pending/failed/not_found vẫn
 có trong `paper_metrics.csv`, cùng cột `metadata_exported`; không đếm số ID
 được giao như số publication thành công. Manifest có `assigned_ids`,
-`missing_metadata`, `schema_version=2` và phạm vi kiểm tra toàn vẹn. Export cũ
+`missing_metadata`, `schema_version=3` và phạm vi kiểm tra toàn vẹn. Export cũ
 không bị sửa; tạo run-id mới để xuất lại.
 
 Venue được bổ sung từ `citedPaper.venue` trong các snapshot references S2 đã
@@ -316,8 +330,9 @@ giữ nguyên; enrichment chỉ diễn ra lúc export, áp dụng cả dữ li�
 Export kiểm tra checksum các JSON thực sự sử dụng và cache trong một lần
 chạy, không đọc lại mọi file TeX/Bib. Đây không phải full source audit; dùng
 cell audit riêng nếu cần kiểm tra toàn bộ source. `ref_submission_date` có
-nguồn S2 publicationDate, không khẳng định là ngày nộp arXiv. References là
-snapshot cấp paper, không phải bibliography từng version.
+nguồn S2 publicationDate, không khẳng định là ngày nộp arXiv. Reference snapshot
+truy vấn theo URL vN; việc S2 trả đúng bibliography lịch sử từng version chưa
+được xác minh. Legacy v0 vẫn giữ riêng.
 
 DOCX độc lập được nhận diện qua cấu trúc OOXML, XML và CRC của ZIP, giữ các
 giới hạn kích thước; hợp lệ thì no_tex với inventory. HTML/ZIP không nhận diện
@@ -370,6 +385,8 @@ specific cause of an existing Colab session's slowdown requires its diagnostics.
 This patch has no live Colab throughput benchmark.
 
 
+Reference-page recovery and S2 dispatch pacing are implemented in
+`src/crawler/reference_worker.py` and `src/crawler/scheduler.py`.
 Details of the reference-page recovery and S2 dispatch-pacing update:
 [change report](docs/reference-resume-and-s2-pacing.md).
 

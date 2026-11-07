@@ -18,6 +18,23 @@ def test_missing_metadata_stays_in_ledger_only(tmp_path,monkeypatch):
     assert manifest['input_fingerprint']
 
 
+def test_version_metrics_exposes_metadata_status(tmp_path, monkeypatch):
+    import csv
+    monkeypatch.chdir(tmp_path)
+    config = CrawlerConfig(); config.range['end_id'] = 2523
+    store = ProgressStore('runtime'); store.initialize(['2504.02523'])
+    key = ('2504.02523', 1, 'source', 0)
+    store.add(key)
+    store.finish(key, 'failed', 'test')
+    metadata_key = ('2504.02523', 1, 'metadata', 0)
+    store.add(metadata_key)
+    store.finish(metadata_key, 'failed', 'test')
+    export_snapshot(config, 'metadata-status')
+    with (tmp_path/'runtime/exports/metadata-status/version_metrics.csv').open() as file:
+        rows = list(csv.DictReader(file))
+    assert rows[0]['metadata_status'] == 'failed'
+
+
 def test_export_venue_and_no_full_source_hash(tmp_path,monkeypatch):
     import json
     from crawler.storage import Storage
