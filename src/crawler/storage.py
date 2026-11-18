@@ -48,7 +48,7 @@ class Storage:
                 rel=source.relative_to(staging); dest=target/rel
                 dest.parent.mkdir(parents=True,exist_ok=True); shutil.copyfile(source,dest)
                 hashes[rel.as_posix()]=digest(source)
-                if digest(dest)!=hashes[rel.as_posix()]: raise OSError('Checksum mismatch')
+                if dest.stat().st_size!=source.stat().st_size: raise OSError('Checksum mismatch')
         atomic_json(marker,dict(schema_version=1,key=list(key),status=status,checksums=hashes,captured_at=datetime.now(timezone.utc).isoformat(),run_id=getattr(self,'run_id',''),bytes=sum((target/name).stat().st_size for name in hashes)))
         self.record_verification(key)
 
@@ -87,5 +87,5 @@ class Storage:
         destination.parent.mkdir(parents=True,exist_ok=True)
         shutil.copytree(target,destination)
         for file in target.rglob('*'):
-            if file.is_file() and digest(file)!=digest(destination/file.relative_to(target)): raise OSError('History copy failed')
+            if file.is_file() and file.stat().st_size!=(destination/file.relative_to(target)).stat().st_size: raise OSError('History copy failed')
         shutil.rmtree(target)

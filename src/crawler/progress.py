@@ -19,8 +19,9 @@ class ProgressStore:
         self._saved_rows={}
         if self.path.exists() or self.path.with_suffix('.bak').exists() or self.path.with_suffix('.csv.json').exists() or (self.root/'progress/papers.csv').exists() or (self.root/'progress/versions.csv').exists() or (self.root/'progress/backups').exists() or (self.root/'data').exists() or self.journal.path.exists(): self.load()
     def load(self):
-        self.journal=ProgressJournal(self.root/'progress/jobs.journal.jsonl')
+        last_error=None
         for path in (self.path,self.path.with_suffix('.bak')):
+            self.journal=ProgressJournal(self.root/'progress/jobs.journal.jsonl')
             try:
                 manifest=json.loads(path.with_suffix(path.suffix+'.json').read_text())
                 if digest(path)!=manifest['sha256']: raise ValueError('Invalid checksum')

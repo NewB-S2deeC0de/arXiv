@@ -33,3 +33,43 @@ def test_reference_page_resume(tmp_path,monkeypatch):
         return httpx.Response(200,json={'data':[]})
     asyncio.run(run_pipeline(c,{'s2'},limit=1,transport=httpx.MockTransport(finish)))
     assert calls.count(0)==1
+
+
+def test_arxiv_source_pipelining(tmp_path, monkeypatch):
+    import gzip
+    from crawler.progress import ProgressStore
+    monkeypatch.chdir(tmp_path)
+    c = CrawlerConfig()
+    c.range['start_id'] = 2523
+    c.range['end_id'] = 2524  # 2 papers
+    clock = [1000.0]
+
+    async def mock_sleep(n):
+        clock[0] += n
+
+    class StreamBody(httpx.AsyncByteStream):
+        def __init__(self, data):
+            self.data = data
+        async def __aiter__(self):
+            for offset in range(0, len(self.data), 1024):
+                yield self.data[offset:offset+1024]
+
+    def handler(request):
+        url = str(request.url)
+        if 'api/query' in url:
+            ids = request.url.params['id_list'].split(',')
+            entries = ''.join(f'<entry><id>http://arxiv.org/abs/{i if "v" in i else i+"v1"}</id></entry>' for i in ids)
+            return httpx.Response(200, content=f'<feed xmlns="http://www.w3.org/2005/Atom">{entries}</feed>'.encode())
+        if '/src/' in url:
+            tex_content = b'\\documentclass{article}\\begin{document}Hello world\\end{document}'
+            compressed = gzip.compress(tex_content)
+            return httpx.Response(200, stream=StreamBody(compressed), headers={'content-type': 'application/x-eprint-tar'})
+        return httpx.Response(404)
+
+    summary = asyncio.run(run_pipeline(c, {'arxiv'}, limit=2, transport=httpx.MockTransport(handler), now=lambda: clock[0], sleep=mock_sleep))
+    store = ProgressStore('runtime')
+    counts = store.status_counts()
+    assert counts['discovery']['succeeded'] == 2
+    assert counts['metadata']['succeeded'] == 2
+    assert counts['source']['succeeded'] == 2
+

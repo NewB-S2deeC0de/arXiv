@@ -59,3 +59,49 @@ class ProgressJournal:
             finally:
                 if descriptor is not None: os.close(descriptor)
         self.sequence+=1; self.previous=checksum; self.valid_size+=len(line)
+
+
+def inspect_journal_sequence(path):
+    path = Path(path)
+    if not path.exists(): return 0
+    sequence = 0
+    previous = ''
+    with path.open('rb') as stream:
+        for line in stream:
+            if not line.endswith(b'\n'): break
+            try:
+                entry = json.loads(line)
+                checksum = entry.pop('checksum')
+                if entry['sequence'] != sequence + 1 or entry['previous'] != previous or hashlib.sha256(encode(entry)).hexdigest() != checksum:
+                    break
+                sequence = entry['sequence']
+                previous = checksum
+            except (ValueError, KeyError, TypeError):
+                break
+    return sequence
+
+
+def repair_journal_sequence(root):
+    root = Path(root)
+    progress_dir = root / 'progress'
+    journal_path = progress_dir / 'jobs.journal.jsonl'
+    target_seq = inspect_journal_sequence(journal_path)
+    repaired = False
+    details = {}
+    for meta_name in ('jobs.csv.json', 'jobs.bak.json'):
+        meta_path = progress_dir / meta_name
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text())
+                seq = meta.get('journal_sequence', 0)
+                if seq > target_seq:
+                    meta['journal_sequence'] = target_seq
+                    tmp = meta_path.with_suffix('.tmp')
+                    tmp.write_text(json.dumps(meta, indent=2))
+                    tmp.replace(meta_path)
+                    repaired = True
+                    details[meta_name] = {'previous': seq, 'current': target_seq}
+            except (OSError, ValueError, KeyError):
+                pass
+    return dict(repaired=repaired, target_sequence=target_seq, details=details)
+
