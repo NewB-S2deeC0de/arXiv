@@ -105,7 +105,7 @@ PYTHONPATH=src python -m crawler.cli export --run-id export-001
 ```
 
 CLI `retry-failed` chỉ reset failed stages của service được chọn, không gọi mạng.
-Notebook có các chế độ: toàn range (`arxiv` + `s2`), chỉ discovery (`discovery`), chỉ arXiv (`arxiv`), hoặc chỉ S2 (`s2`).
+Notebook chạy toàn range qua quy trình 2 giai đoạn tự động tại cell 5: tự động chạy Discovery trước (~5 phút) rồi cào song song arXiv + S2. CLI hỗ trợ chạy toàn range hoặc từng stage riêng (`discovery`, `arxiv`, `s2`).
 Chế độ `discovery` quét nhanh Atom XML toàn bộ ID (50 ID / request, ~5 phút) để xác định phiên bản và khởi tạo version jobs trước khi chạy S2 hoặc Source.
 Khi bị ngắt phiên đột ngột trên Drive/Colab gây lệch sequence giữa journal và snapshot (`jobs.csv.json`), dùng tiện ích `repair_journal_sequence` (hoặc cell sửa đồng bộ trong notebook) để tự động cân chỉnh lại sequence an toàn.
 `recheck-not-found` riêng cho not_found.
