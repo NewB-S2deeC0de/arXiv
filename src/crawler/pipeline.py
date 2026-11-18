@@ -64,7 +64,11 @@ async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeov
     async def rows_for(stage):
         return await progress.call(lambda:[(k,dict(store.get(k))) for k in store.pending(stage) if k[0] in selected])
 
+    metadata_done_count = 0
+    source_done_count = 0
+
     async def metadata_batch(keys,scheduler):
+        nonlocal metadata_done_count
         identifiers=[f'{key[0]}v{key[1]}' for key in keys]
         artifact=await scheduler.request(keys,'arxiv','https://export.arxiv.org/api/query',params={'id_list':','.join(identifiers),'max_results':len(keys)},validate=lambda raw:(raw,parse_version_batch(raw,identifiers)))
         if artifact is None: return
@@ -85,6 +89,8 @@ async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeov
             results.append((key,status,''))
         await progress.call(store.finish_many,results)
         await telemetry.call(metrics.touch,store.journal.path)
+        metadata_done_count += len(keys)
+        log(f'arXiv Metadata: batch finished ({len(keys)} versions, cumulative: {metadata_done_count})')
 
     async def arxiv(scheduler, source_queue):
         discovery_turn = True
@@ -151,6 +157,10 @@ async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeov
                     await arxiv_io.call(shutil.rmtree,staging_dir)
                     await telemetry.call(metrics.touch,staging_dir)
                     await telemetry.call(metrics.sample,force_disk=True)
+                    nonlocal source_done_count
+                    source_done_count += 1
+                    if source_done_count % 25 == 0 or source_done_count == 1:
+                        log(f'arXiv Source: {source_done_count} sources published (latest: {job_key[0]}v{job_key[1]})')
                 finally:
                     source_inflight.discard(job_key)
             await source_queue.submit(publish_source, key, archive, staging, result['status'])
@@ -184,7 +194,6 @@ async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeov
             def add_versions():
                 for version in range(1,parsed.get('version',0)+1):
                     for stage in ('metadata','source','references'): store.add((paper,version,stage,0))
-                store.save()
             await progress.call(add_versions)
             await telemetry.call(metrics.touch,store.storage.result_dir(key),staging)
             await telemetry.call(metrics.record,'commit',job=key,seconds=time.monotonic()-before)
@@ -192,6 +201,8 @@ async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeov
             results.append((key,status,''))
         await progress.call(store.finish_many,results)
         await telemetry.call(metrics.touch,store.journal.path)
+        total_succeeded = sum(1 for r in results if r[1] == 'succeeded')
+        log(f'arXiv Discovery: batch finished ({len(batch_keys)} papers, {total_succeeded} succeeded)')
     reference_worker=ReferenceWorker(config,store,progress,s2_io,reader,telemetry,metrics,scratch,selected)
     discovery_done=asyncio.Event()
     has_arxiv='arxiv' in stages or 'discovery' in stages
