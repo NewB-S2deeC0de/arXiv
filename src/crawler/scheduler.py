@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlsplit
 import httpx
+from .console import log
 from .workers import join
 from .retry import parse_retry_after
 from .storage import atomic_json, digest
@@ -51,7 +52,11 @@ class Scheduler:
     async def io(self,function,*args,**kwargs):
         if self.io_worker: return await self.io_worker.call(function,*args,**kwargs)
         return function(*args,**kwargs)
-    async def wait(self,deadline,job=None,reason='service_cooldown',jobs=None):
+    async def wait(self,deadline,job=None,reason='service_cooldown',jobs=None,service=None):
+        remaining = deadline - self.now()
+        if remaining > 3.0:
+            svc_tag = f'[{service}] ' if service else ''
+            log(f'Scheduler: {svc_tag}waiting {remaining:.1f}s ({reason})')
         while self.now()+1e-9<deadline:
             duration=min(30,deadline-self.now())
             await self.event_async('waiting',job=job,jobs=jobs,reason=reason,remaining_seconds=deadline-self.now())
@@ -92,7 +97,7 @@ class Scheduler:
                 if service == 's2' and not self.api_key and len(state['recent'])>=net['s2_anonymous_window_requests']:
                     deadline = max(
                         deadline, state['recent'][0] + net['s2_anonymous_window_seconds'])
-                await self.wait(deadline, primary_key,jobs=batch_keys)
+                await self.wait(deadline, primary_key,jobs=batch_keys,service=service)
                 await self.store_call('start_attempts',batch_keys)
                 if service == 's2':
                     state['recent'].append(self.now())
@@ -109,7 +114,7 @@ class Scheduler:
                         # Check again AFTER durable writes/logging; their latency can vary.
                         while self.monotonic()+1e-9<self.s2_next_send or self.now()+1e-9<deadline:
                             remaining=max(self.s2_next_send-self.monotonic(),deadline-self.now(),0)
-                            await self.wait(self.now()+remaining,primary_key,reason='dispatch_pacing',jobs=batch_keys)
+                            await self.wait(self.now()+remaining,primary_key,reason='dispatch_pacing',jobs=batch_keys,service=service)
                         sent_at=self.now()
                         state['recent'][-1]=sent_at
                     async with self.client.stream(method,url,params=params,json=json_body,headers=headers,follow_redirects=False) as response:
@@ -119,7 +124,9 @@ class Scheduler:
                             state['backoff'] = state['backoff']*2 or 60
                             if service=='s2':
                                 state['backoff'] = min(state['backoff'],net['s2_max_backoff_seconds'])
-                            state['deadline'] = max(state['deadline'],self.now()+(retry_after if retry_after is not None else state['backoff']))
+                            delay = retry_after if retry_after is not None else state['backoff']
+                            state['deadline'] = max(state['deadline'],self.now()+delay)
+                            log(f'RateLimit: [{service}] received HTTP 429 Too Many Requests; backoff set to {delay:.0f}s (retry_after={retry_after})')
                         else:
                             state['backoff'] = 0
                             if retry_after is not None:
@@ -239,6 +246,8 @@ class Scheduler:
                             'retry', job=primary_key,
                             error_code=f'http_{code}' if code else error_code,
                             backoff_seconds = delay)
+                        if code != 429:
+                            log(f'Retry: [{service}] attempt {attempt} failed ({error_code if code == 0 else f"http_{code}"}); retrying in {delay}s')
                 else:
                     await self.store_call('finish_many',[(k,'failed',f'http_{code}' if code else error_code) for k in batch_keys])
             unfinished=[(k,'failed','attempts_exhausted') for k in batch_keys if (await self.store_call('get',k))['status'] in ('pending','running')]
