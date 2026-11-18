@@ -288,21 +288,9 @@ và không xóa journal hoặc services.json khi resume.
 
 Resume chỉ phục hồi job pending/running đã tiêu hao lượt thử trong phạm vi
 được chọn; không checksum lại toàn bộ kết quả thành công. Dữ liệu cũ giữ nguyên
-trạng thái và được audit riêng. Kết quả mới có `verification.json` sau khi
-publish và đối chiếu nội dung thành công. Receipt gắn với SHA-256 của manifest;
-receipt không bảo đảm phát hiện sửa đổi âm thầm của nội dung sau lần xác minh.
-
-Notebook có cell `RUN_AUDIT`: mặc định chọn `AUDIT_STAGES` gồm `metadata`,
-`source`, `references` (cả legacy v0 và vN), bỏ qua receipt hợp lệ, kiểm tra phần
-còn lại và lưu sau từng kết quả. Discovery không nằm trong audit riêng mặc định;
-export vẫn đối chiếu checksum của `discovery/normalized.json` trước khi dùng.
-Audit source vẫn hash các file đã publish, không chỉ `inventory.json`.
-`FULL_AUDIT=True` bắt đầu/tiếp tục một lượt kiểm tra lại phạm vi đã chọn,
-checkpoint tại `progress/audit.json`; sau khi hoàn tất, gọi full lần nữa tạo
-lượt mới. Đổi `AUDIT_STAGES` khi lượt full đang dở sẽ bắt đầu lượt mới. Audit
-không gọi API, không reset trạng thái crawl, và dùng cùng DatasetLock nên phải
-chạy khi crawler dừng. Invalid cần được xem xét riêng (kể cả not_found không
-có payload/marker). File hỏng không được cấp dấu xác minh mới.
+trạng thái. Kết quả mới có `verification.json` sau khi
+publish thành công, đối chiếu kích thước file và lưu mã băm chuẩn vào manifest.
+Quá trình commit không đọc ngược lại toàn bộ file qua Drive FUSE để tối ưu hóa thời gian I/O.
 
 `TAKEOVER_STALE` mặc định False. Chỉ bật sau lỗi dấu khóa cũ khi đã dừng/restart
 runtime cũ và chắc chắn không có runtime khác ghi dataset. Đóng tab hay mất
@@ -330,8 +318,7 @@ nhắc tới trong các snapshot có thể vẫn thiếu venue. Metadata arXiv r
 giữ nguyên; enrichment chỉ diễn ra lúc export, áp dụng cả dữ liệu cũ.
 
 Export kiểm tra checksum các JSON thực sự sử dụng và cache trong một lần
-chạy, không đọc lại mọi file TeX/Bib. Đây không phải full source audit; dùng
-cell audit riêng nếu cần kiểm tra toàn bộ source. `ref_submission_date` có
+chạy, không đọc lại mọi file TeX/Bib. `ref_submission_date` có
 nguồn S2 publicationDate, không khẳng định là ngày nộp arXiv. Reference snapshot
 truy vấn theo URL vN; việc S2 trả đúng bibliography lịch sử từng version chưa
 được xác minh. Legacy v0 vẫn giữ riêng.
