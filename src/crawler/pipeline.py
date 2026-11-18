@@ -42,7 +42,7 @@ async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeov
     log('Startup: progress loaded; initializing/checkpointing jobs')
     await progress.call(store.initialize,ids,versioned=True)
     print('[Startup] Recovering interrupted jobs in selected scope',flush=True)
-    recovery_stages=({'discovery','metadata','source'} if 'arxiv' in stages else set()) | ({'references'} if 's2' in stages else set())
+    recovery_stages=({'discovery','metadata','source'} if 'arxiv' in stages else ({'discovery'} if 'discovery' in stages else set())) | ({'references'} if 's2' in stages else set())
     await progress.call(store.reconcile,ids=selected,stages=recovery_stages,recovery_only=True,skip_legacy_references=True)
     await progress.call(store.enable_version_references)
     await progress.call(store.save)
@@ -88,8 +88,18 @@ async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeov
 
     async def arxiv(scheduler):
         discovery_turn = True
+        only_discovery = 'discovery' in stages and 'arxiv' not in stages
         while 'arxiv' not in scheduler.stopped:
             discoveries=[k for k,r in await rows_for('discovery')]
+            if not discoveries and not discovery_done.is_set():
+                discovery_done.set()
+            if only_discovery:
+                if not discoveries: break
+                attempts=(await progress.call(lambda:dict(store.get(discoveries[0]))))['attempts']
+                size=min(config.network['discovery_batch_size'],config.execution['queue_capacity'])
+                batch=[k for k,r in await rows_for('discovery') if r['attempts']==attempts][:size]
+                await run_discovery_batch(batch,scheduler)
+                continue
             version_rows=(await rows_for('metadata'))+(await rows_for('source'))
             versions=sorted([k for k,r in version_rows],key=lambda k:(k[0],k[1],k[2]=='source'))
             if not discoveries and not versions: break
@@ -165,10 +175,12 @@ async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeov
         await telemetry.call(metrics.touch,store.journal.path)
     reference_worker=ReferenceWorker(config,store,progress,s2_io,reader,telemetry,metrics,scratch,selected)
     discovery_done=asyncio.Event()
+    has_arxiv='arxiv' in stages or 'discovery' in stages
+    has_s2='s2' in stages
+    if not has_arxiv or not await rows_for('discovery'): discovery_done.set()
     async def arxiv_run(scheduler):
         try: await arxiv(scheduler)
         finally: discovery_done.set()
-    if 'arxiv' not in stages: discovery_done.set()
     completed=False
     try:
         timeout=httpx.Timeout(config.network['read_timeout_seconds'],connect=config.network['connect_timeout_seconds'])
@@ -176,8 +188,8 @@ async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeov
             log('Run: loading service cooldowns and starting selected workers')
             scheduler=await progress.call(Scheduler,config,store,client,api_key=api_key,metrics=metrics,now=now,sleep=sleep,progress_worker=progress,metrics_worker=telemetry,io_worker=arxiv_io)
             async with asyncio.TaskGroup() as group:
-                if 'arxiv' in stages: group.create_task(arxiv_run(scheduler))
-                if 's2' in stages: group.create_task(reference_worker.run(scheduler,discovery_done))
+                if has_arxiv: group.create_task(arxiv_run(scheduler))
+                if has_s2: group.create_task(reference_worker.run(scheduler,discovery_done))
         completed=True
     finally:
         monitor.cancel()
