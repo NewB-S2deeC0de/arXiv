@@ -72,20 +72,29 @@ async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeov
         identifiers=[f'{key[0]}v{key[1]}' for key in keys]
         artifact=await scheduler.request(keys,'arxiv','https://export.arxiv.org/api/query',params={'id_list':','.join(identifiers),'max_results':len(keys)},validate=lambda raw:(raw,parse_version_batch(raw,identifiers)))
         if artifact is None: return
-        raw,parsed_versions=artifact; results=[]
-        for key,identifier in zip(keys,identifiers):
-            parsed=parsed_versions[identifier]
-            staging=scratch/f'{quote(key[0],safe="")}-v{key[1]}-metadata'
-            await arxiv_io.call(staging.mkdir,parents=True,exist_ok=True)
-            await arxiv_io.call((staging/'response.xml').write_bytes,raw)
-            await arxiv_io.call(atomic_json,staging/'request.json',dict(id_list=identifiers,max_results=len(keys)))
-            await arxiv_io.call(atomic_json,staging/'normalized.json',parsed)
-            before=time.monotonic()
-            status='not_found' if parsed.get('not_found') else 'succeeded'
-            await publish(key,staging,status)
-            await telemetry.call(metrics.touch,store.storage.result_dir(key),staging)
-            await telemetry.call(metrics.record,'commit',job=key,seconds=time.monotonic()-before)
-            await arxiv_io.call(shutil.rmtree,staging); await telemetry.call(metrics.touch,staging)
+        raw,parsed_versions=artifact
+        request_data=dict(id_list=identifiers,max_results=len(keys))
+        def write_and_commit_metadata():
+            records=[]
+            for key,identifier in zip(keys,identifiers):
+                parsed=parsed_versions[identifier]
+                staging=scratch/f'{quote(key[0],safe="")}-v{key[1]}-metadata'
+                staging.mkdir(parents=True,exist_ok=True)
+                (staging/'response.xml').write_bytes(raw)
+                atomic_json(staging/'request.json',request_data)
+                atomic_json(staging/'normalized.json',parsed)
+                status='not_found' if parsed.get('not_found') else 'succeeded'
+                before=time.monotonic()
+                store.storage.commit(key,staging,status)
+                duration=time.monotonic()-before
+                shutil.rmtree(staging)
+                records.append((key,status,duration,store.storage.result_dir(key),staging))
+            return records
+        records=await arxiv_io.call(write_and_commit_metadata)
+        results=[]
+        for key,status,duration,result_dir,staging in records:
+            await telemetry.call(metrics.touch,result_dir,staging)
+            await telemetry.call(metrics.record,'commit',job=key,seconds=duration)
             results.append((key,status,''))
         await progress.call(store.finish_many,results)
         await telemetry.call(metrics.touch,store.journal.path)
@@ -96,67 +105,74 @@ async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeov
         discovery_turn = True
         only_discovery = 'discovery' in stages and 'arxiv' not in stages
         source_inflight = set()
+        discovery_inflight = set()
         while 'arxiv' not in scheduler.stopped:
-            discoveries=[k for k,r in await rows_for('discovery')]
-            if not discoveries and not discovery_done.is_set():
+            discoveries = [k for k, r in await rows_for('discovery') if k not in discovery_inflight]
+            if not discoveries and not discovery_inflight and not source_queue.used_items and not discovery_done.is_set():
                 discovery_done.set()
             if only_discovery:
-                if not discoveries: break
-                attempts=(await progress.call(lambda:dict(store.get(discoveries[0]))))['attempts']
-                size=min(config.network['discovery_batch_size'],config.execution['queue_capacity'])
-                batch=[k for k,r in await rows_for('discovery') if r['attempts']==attempts][:size]
-                await run_discovery_batch(batch,scheduler)
+                if not discoveries:
+                    if source_queue.used_items or discovery_inflight:
+                        await asyncio.sleep(0.01)
+                        continue
+                    break
+                attempts = (await progress.call(lambda: dict(store.get(discoveries[0]))))['attempts']
+                size = min(config.network['discovery_batch_size'], config.execution['queue_capacity'])
+                batch = [k for k, r in await rows_for('discovery') if k not in discovery_inflight and r['attempts'] == attempts][:size]
+                discovery_inflight.update(batch)
+                await run_discovery_batch(batch, scheduler, source_queue, discovery_inflight, async_publish=True)
                 continue
-            version_rows=[(k,r) for k,r in (await rows_for('metadata'))+(await rows_for('source')) if k not in source_inflight]
-            versions=sorted([k for k,r in version_rows],key=lambda k:(k[0],k[1],k[2]=='source'))
+            version_rows = [(k, r) for k, r in (await rows_for('metadata')) + (await rows_for('source')) if k not in source_inflight]
+            versions = sorted([k for k, r in version_rows], key=lambda k: (k[0], k[1], k[2] == 'source'))
             if not discoveries and not versions:
-                if source_queue.used_items:
+                if source_queue.used_items or discovery_inflight:
                     await asyncio.sleep(0.01)
                     continue
                 break
             if discoveries and (discovery_turn or not versions):
                 # Regroup after restart by remaining budget. Never reset attempts
                 # to make a new batch: all members must be eligible for every send.
-                attempts=(await progress.call(lambda:dict(store.get(discoveries[0]))))['attempts']
-                size=min(config.network['discovery_batch_size'],config.execution['queue_capacity'])
-                batch=[k for k,r in await rows_for('discovery') if r['attempts']==attempts][:size]
-                await run_discovery_batch(batch,scheduler)
-                discovery_turn=False
+                attempts = (await progress.call(lambda: dict(store.get(discoveries[0]))))['attempts']
+                size = min(config.network['discovery_batch_size'], config.execution['queue_capacity'])
+                batch = [k for k, r in await rows_for('discovery') if k not in discovery_inflight and r['attempts'] == attempts][:size]
+                discovery_inflight.update(batch)
+                await run_discovery_batch(batch, scheduler, source_queue, discovery_inflight, async_publish=False)
+                discovery_turn = False
                 continue
-            key=versions[0]
-            discovery_turn=True
-            if key[2]=='metadata':
-                attempts=(await progress.call(lambda:dict(store.get(key))))['attempts']
-                size=min(config.network['metadata_batch_size'],config.execution['queue_capacity'])
-                batch=[k for k,r in version_rows if k[2]=='metadata' and r['attempts']==attempts][:size]
-                await metadata_batch(batch,scheduler)
+            key = versions[0]
+            discovery_turn = True
+            if key[2] == 'metadata':
+                attempts = (await progress.call(lambda: dict(store.get(key))))['attempts']
+                size = min(config.network['metadata_batch_size'], config.execution['queue_capacity'])
+                batch = [k for k, r in version_rows if k[2] == 'metadata' and r['attempts'] == attempts][:size]
+                await metadata_batch(batch, scheduler)
                 continue
             source_inflight.add(key)
-            archive=scratch/f'{quote(key[0],safe="")}v{key[1]}.download'
-            staging=scratch/f'{quote(key[0],safe="")}v{key[1]}-source'
+            archive = scratch / f'{quote(key[0], safe="")}v{key[1]}.download'
+            staging = scratch / f'{quote(key[0], safe="")}v{key[1]}-source'
             try:
-                result=await scheduler.request(key,'arxiv',f'https://export.arxiv.org/src/{key[0]}v{key[1]}',target=archive,validate=lambda p:inspect_and_extract(p,staging,config))
+                result = await scheduler.request(key, 'arxiv', f'https://export.arxiv.org/src/{key[0]}v{key[1]}', target=archive, validate=lambda p: inspect_and_extract(p, staging, config))
             except RuntimeError as exc:
                 source_inflight.discard(key)
-                if str(exc)!='resource_limit': raise
-                await progress.call(store.finish,key,'failed','resource_limit'); continue
+                if str(exc) != 'resource_limit': raise
+                await progress.call(store.finish, key, 'failed', 'resource_limit'); continue
             if not result:
                 source_inflight.discard(key)
                 continue
             async def publish_source(job_key, archive_path, staging_dir, status):
                 try:
-                    response_info=archive_path.with_suffix('.response.json')
+                    response_info = archive_path.with_suffix('.response.json')
                     if await arxiv_io.call(response_info.exists):
-                        await arxiv_io.call(shutil.copyfile,response_info,staging_dir/'response.json')
-                    before=time.monotonic()
-                    await publish(job_key,staging_dir,status)
-                    await progress.call(store.finish,job_key,status)
-                    await arxiv_io.call(archive_path.unlink,missing_ok=True)
-                    await telemetry.call(metrics.record,'commit',job=job_key,seconds=time.monotonic()-before)
-                    await telemetry.call(metrics.touch,store.storage.result_dir(job_key),archive_path,staging_dir)
-                    await arxiv_io.call(shutil.rmtree,staging_dir)
-                    await telemetry.call(metrics.touch,staging_dir)
-                    await telemetry.call(metrics.sample,force_disk=True)
+                        await arxiv_io.call(shutil.copyfile, response_info, staging_dir / 'response.json')
+                    before = time.monotonic()
+                    await publish(job_key, staging_dir, status)
+                    await progress.call(store.finish, job_key, status)
+                    await arxiv_io.call(archive_path.unlink, missing_ok=True)
+                    await telemetry.call(metrics.record, 'commit', job=job_key, seconds=time.monotonic() - before)
+                    await telemetry.call(metrics.touch, store.storage.result_dir(job_key), archive_path, staging_dir)
+                    await arxiv_io.call(shutil.rmtree, staging_dir)
+                    await telemetry.call(metrics.touch, staging_dir)
+                    await telemetry.call(metrics.sample, force_disk=True)
                     nonlocal source_done_count
                     source_done_count += 1
                     if source_done_count % 25 == 0 or source_done_count == 1:
@@ -164,45 +180,76 @@ async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeov
                 finally:
                     source_inflight.discard(job_key)
             await source_queue.submit(publish_source, key, archive, staging, result['status'])
-    async def run_discovery_batch(batch_keys, scheduler):
+
+    async def run_discovery_batch(batch_keys, scheduler, source_queue=None, discovery_inflight=None, async_publish=False):
         papers = [k[0] for k in batch_keys]
         id_list = ",".join(papers)
         # Quan trọng: arXiv mặc định max_results=10, nên phải truyền max_results=len(papers)
-        raw = await scheduler.request(
-            batch_keys,
-            "arxiv",
-            "https://export.arxiv.org/api/query",
-            params={"id_list": id_list, "max_results": len(papers)},
-            validate=lambda raw: (raw, parse_atom_batch(raw, papers)),
-        )
-        if raw is None:
-            return
-        raw, batch_parsed = raw
-        results=[]
-        for key in batch_keys:
-            paper=key[0]; parsed=batch_parsed[paper]
-            staging=scratch/f'{quote(paper,safe="")}-discovery'
-            await arxiv_io.call(staging.mkdir,parents=True,exist_ok=True)
-            await arxiv_io.call((staging/'response.xml').write_bytes,raw)
-            await arxiv_io.call(atomic_json,staging/'request.json',dict(id_list=papers,max_results=len(papers)))
-            await arxiv_io.call(atomic_json,staging/'normalized.json',parsed)
-            before=time.monotonic()
-            status='not_found' if parsed.get('not_found') else 'succeeded'
-            await publish(key,staging,status)
-            # Marker first, then version rows, then terminal CSV state. Recovery
-            # reconstructs missing rows from any valid discovery marker.
-            def add_versions():
-                for version in range(1,parsed.get('version',0)+1):
-                    for stage in ('metadata','source','references'): store.add((paper,version,stage,0))
-            await progress.call(add_versions)
-            await telemetry.call(metrics.touch,store.storage.result_dir(key),staging)
-            await telemetry.call(metrics.record,'commit',job=key,seconds=time.monotonic()-before)
-            await arxiv_io.call(shutil.rmtree,staging); await telemetry.call(metrics.touch,staging)
-            results.append((key,status,''))
-        await progress.call(store.finish_many,results)
-        await telemetry.call(metrics.touch,store.journal.path)
-        total_succeeded = sum(1 for r in results if r[1] == 'succeeded')
-        log(f'arXiv Discovery: batch finished ({len(batch_keys)} papers, {total_succeeded} succeeded)')
+        try:
+            raw = await scheduler.request(
+                batch_keys,
+                "arxiv",
+                "https://export.arxiv.org/api/query",
+                params={"id_list": id_list, "max_results": len(papers)},
+                validate=lambda raw: (raw, parse_atom_batch(raw, papers)),
+            )
+            if raw is None:
+                if discovery_inflight: discovery_inflight.difference_update(batch_keys)
+                return
+            raw, batch_parsed = raw
+            request_data = dict(id_list=papers, max_results=len(papers))
+
+            async def publish_discovery():
+                try:
+                    def write_and_commit():
+                        records = []
+                        for key in batch_keys:
+                            paper = key[0]
+                            parsed = batch_parsed[paper]
+                            staging = scratch / f'{quote(paper, safe="")}-discovery'
+                            staging.mkdir(parents=True, exist_ok=True)
+                            (staging / 'response.xml').write_bytes(raw)
+                            atomic_json(staging / 'request.json', request_data)
+                            atomic_json(staging / 'normalized.json', parsed)
+                            status = 'not_found' if parsed.get('not_found') else 'succeeded'
+                            before = time.monotonic()
+                            store.storage.commit(key, staging, status)
+                            duration = time.monotonic() - before
+                            shutil.rmtree(staging)
+                            records.append((key, status, duration, store.storage.result_dir(key), staging))
+                        return records
+
+                    records = await arxiv_io.call(write_and_commit)
+                    results = []
+                    for key, status, duration, result_dir, staging in records:
+                        await telemetry.call(metrics.touch, result_dir, staging)
+                        await telemetry.call(metrics.record, 'commit', job=key, seconds=duration)
+                        results.append((key, status, ''))
+
+                    def add_all_versions():
+                        for key in batch_keys:
+                            paper = key[0]
+                            parsed = batch_parsed[paper]
+                            for version in range(1, parsed.get('version', 0) + 1):
+                                for stage in ('metadata', 'source', 'references'):
+                                    store.add((paper, version, stage, 0))
+
+                    await progress.call(add_all_versions)
+                    await progress.call(store.finish_many, results)
+                    await telemetry.call(metrics.touch, store.journal.path)
+                    await telemetry.call(metrics.sample, force_disk=True)
+                    total_succeeded = sum(1 for r in results if r[1] == 'succeeded')
+                    log(f'arXiv Discovery: batch finished ({len(batch_keys)} papers, {total_succeeded} succeeded)')
+                finally:
+                    if discovery_inflight: discovery_inflight.difference_update(batch_keys)
+
+            if async_publish and source_queue:
+                await source_queue.submit(publish_discovery)
+            else:
+                await publish_discovery()
+        except Exception:
+            if discovery_inflight: discovery_inflight.difference_update(batch_keys)
+            raise
     reference_worker=ReferenceWorker(config,store,progress,s2_io,reader,telemetry,metrics,scratch,selected)
     discovery_done=asyncio.Event()
     has_arxiv='arxiv' in stages or 'discovery' in stages

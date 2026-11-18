@@ -197,3 +197,38 @@ def test_metadata_batch_pipeline_distinct_dates_and_retry(tmp_path,monkeypatch):
     before=len(calls)
     asyncio.run(run_pipeline(config,{'arxiv'},limit=1,transport=httpx.MockTransport(handler),now=lambda:clock[0],sleep=sleep))
     assert len(calls)==before
+
+def test_discovery_pipelining(tmp_path, monkeypatch):
+    from crawler.pipeline import run_pipeline
+    from crawler.storage import Storage
+    monkeypatch.chdir(tmp_path)
+    config = CrawlerConfig()
+    config.range['end_id'] = 2524
+    config.network['discovery_batch_size'] = 1
+    events = []
+    original_commit = Storage.commit
+    def delayed_commit(self, key, staging, status='succeeded', *, include=None):
+        events.append(('commit_start', key[0]))
+        import time as pytime
+        pytime.sleep(0.05)
+        res = original_commit(self, key, staging, status, include=include)
+        events.append(('commit_end', key[0]))
+        return res
+    monkeypatch.setattr(Storage, 'commit', delayed_commit)
+
+    def handler(request):
+        ids = request.url.params['id_list'].split(',')
+        events.append(('request', ids[0]))
+        return httpx.Response(200, content=feed(ids))
+
+    asyncio.run(run_pipeline(config, {'discovery'}, limit=2, transport=httpx.MockTransport(handler)))
+    store = ProgressStore('runtime')
+    assert store.status_counts()['discovery'] == {'succeeded': 2}
+    for paper in IDS:
+        key = (paper, 0, 'discovery', 0)
+        assert store.storage.verify(key)
+    # Check that both requests were made and both commits succeeded
+    req_events = [e for e in events if e[0] == 'request']
+    assert len(req_events) == 2
+    commit_ends = [e for e in events if e[0] == 'commit_end']
+    assert len(commit_ends) == 2
