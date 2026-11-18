@@ -21,6 +21,7 @@ class Scheduler:
         # Injected wall clocks also serve as elapsed clocks in deterministic tests.
         self.monotonic=monotonic or (time.monotonic if now is time.time else now)
         self.s2_next_send=0.
+        self.arxiv_next_send=0.
         self.path=store.root/'progress'/'services.json'
         self.state=json.loads(self.path.read_text()) if self.path.exists() else {s:dict(deadline=0,backoff=0,recent=[]) for s in ('arxiv','s2')}
         if self.state['s2'].get('dispatch_pending'):
@@ -109,8 +110,17 @@ class Scheduler:
                 code=0; error_code='unknown'; received=0; redirected=False
                 started=time.monotonic()
                 await emit('request_start',job = primary_key, service=service,attempt=(await self.store_call('get',primary_key))['attempts'],journal_directory_sync=self.store.journal.directory_sync_supported)
+                sent_at=self.now()
                 try:
-                    if service=='s2':
+                    if service=='arxiv':
+                        while self.monotonic()+1e-9<self.arxiv_next_send or self.now()+1e-9<deadline:
+                            remaining=max(self.arxiv_next_send-self.monotonic(),deadline-self.now(),0)
+                            await self.wait(self.now()+remaining,primary_key,reason='dispatch_pacing',jobs=batch_keys,service=service)
+                        sent_at=self.now()
+                        sent_mono=self.monotonic()
+                        self.arxiv_next_send=sent_mono+gap
+                        state['deadline']=max(state['deadline'],sent_at+gap)
+                    elif service=='s2':
                         # Check again AFTER durable writes/logging; their latency can vary.
                         while self.monotonic()+1e-9<self.s2_next_send or self.now()+1e-9<deadline:
                             remaining=max(self.s2_next_send-self.monotonic(),deadline-self.now(),0)
@@ -220,7 +230,7 @@ class Scheduler:
                     error_code = PAYLOAD_CODES.get(str(exc),'payload_'+type(exc).__name__)
                 finally:
                     if service!='s2':
-                        state['deadline'] = max(state['deadline'], self.now()+gap)
+                        state['deadline'] = max(state['deadline'], sent_at+gap)
                     # Cleared only when the actual dispatch timestamp/cooldown is persisted.
                     if service=='s2': state['dispatch_pending']=False
                     await self.persist_async()

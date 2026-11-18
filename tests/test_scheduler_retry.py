@@ -86,3 +86,21 @@ def test_s2_batch_post_retries_transport_failure_with_same_body(tmp_path):
         assert result==b'[]'
         assert calls==[('POST',{'ids':['URL:v1','URL:v2']})]*2
     asyncio.run(check())
+
+def test_arxiv_dispatch_pacing(tmp_path):
+    import pytest
+    async def check():
+        store=ProgressStore(tmp_path); store.initialize(['2504.02523','2504.02524'])
+        clock=[1000.0]; dispatch_times=[]
+        async def sleep(n): clock[0]+=n
+        def handle(request):
+            dispatch_times.append(clock[0])
+            clock[0]+=1.5
+            return httpx.Response(200,content=b'<feed></feed>')
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            scheduler=Scheduler(CrawlerConfig(),store,client,now=lambda:clock[0],sleep=sleep)
+            await scheduler.request(('2504.02523',0,'discovery',0),'arxiv','https://export.arxiv.org/api/query')
+            await scheduler.request(('2504.02524',0,'discovery',0),'arxiv','https://export.arxiv.org/api/query')
+        assert len(dispatch_times)==2
+        assert dispatch_times[1]-dispatch_times[0]==pytest.approx(3.0)
+    asyncio.run(check())
