@@ -108,6 +108,7 @@ class Scheduler:
                 headers={'User-Agent':net['user_agent']}
                 if service=='s2' and self.api_key: headers['x-api-key']=self.api_key
                 code=0; error_code='unknown'; received=0; redirected=False
+                download_finished_at=None; download_finished_mono=None
                 started=time.monotonic()
                 await emit('request_start',job = primary_key, service=service,attempt=(await self.store_call('get',primary_key))['attempts'],journal_directory_sync=self.store.journal.directory_sync_supported)
                 sent_at=self.now()
@@ -196,6 +197,8 @@ class Scheduler:
                                 bytes_received = received,
                                 seconds = time.monotonic()-started
                             )
+                            download_finished_at=self.now()
+                            download_finished_mono=self.monotonic()
 
                             if validate:
                                 extract_started = time.monotonic()
@@ -225,8 +228,8 @@ class Scheduler:
                     error_code = PAYLOAD_CODES.get(str(exc),'payload_'+type(exc).__name__)
                 finally:
                     if service!='s2':
-                        finished_at = self.now()
-                        finished_mono = self.monotonic()
+                        finished_at = download_finished_at or self.now()
+                        finished_mono = download_finished_mono or self.monotonic()
                         state['deadline'] = max(state['deadline'], finished_at+gap)
                         self.arxiv_next_send = finished_mono+gap
                     # Cleared only when the actual dispatch timestamp/cooldown is persisted.
