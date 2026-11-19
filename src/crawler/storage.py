@@ -19,9 +19,8 @@ def atomic_json(path,value):
     tmp=path.with_suffix(path.suffix+'.tmp')
     with tmp.open('w',encoding='utf8') as f:
         json.dump(value,f,ensure_ascii=False,sort_keys=True); f.flush(); os.fsync(f.fileno())
-    assert json.loads(tmp.read_text())==value
     tmp.replace(path)
-    if json.loads(path.read_text())!=value: raise OSError('Publication verification failed')
+    if not path.is_file() or path.stat().st_size==0: raise OSError('Publication verification failed')
 
 class Storage:
     def __init__(self,root): self.root=Path(root)

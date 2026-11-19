@@ -159,19 +159,23 @@ async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeov
             if not result:
                 source_inflight.discard(key)
                 continue
+            def commit_source_files(job_key, archive_path, staging_dir, status):
+                response_info = archive_path.with_suffix('.response.json')
+                if response_info.exists():
+                    shutil.copyfile(response_info, staging_dir / 'response.json')
+                before = time.monotonic()
+                store.storage.commit(job_key, staging_dir, status)
+                duration = time.monotonic() - before
+                archive_path.unlink(missing_ok=True)
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                return duration
+
             async def publish_source(job_key, archive_path, staging_dir, status):
                 try:
-                    response_info = archive_path.with_suffix('.response.json')
-                    if await arxiv_io.call(response_info.exists):
-                        await arxiv_io.call(shutil.copyfile, response_info, staging_dir / 'response.json')
-                    before = time.monotonic()
-                    await publish(job_key, staging_dir, status)
+                    duration = await arxiv_io.call(commit_source_files, job_key, archive_path, staging_dir, status)
                     await progress.call(store.finish, job_key, status)
-                    await arxiv_io.call(archive_path.unlink, missing_ok=True)
-                    await telemetry.call(metrics.record, 'commit', job=job_key, seconds=time.monotonic() - before)
+                    await telemetry.call(metrics.record, 'commit', job=job_key, seconds=duration)
                     await telemetry.call(metrics.touch, store.storage.result_dir(job_key), archive_path, staging_dir)
-                    await arxiv_io.call(shutil.rmtree, staging_dir)
-                    await telemetry.call(metrics.touch, staging_dir)
                     await telemetry.call(metrics.sample, force_disk=True)
                     nonlocal source_done_count
                     source_done_count += 1
@@ -268,7 +272,7 @@ async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeov
         timeout=httpx.Timeout(config.network['read_timeout_seconds'],connect=config.network['connect_timeout_seconds'])
         async with httpx.AsyncClient(timeout=timeout,transport=transport,follow_redirects=False) as client:
             log('Run: loading service cooldowns and starting selected workers')
-            scheduler=await progress.call(Scheduler,config,store,client,api_key=api_key,metrics=metrics,now=now,sleep=sleep,progress_worker=progress,metrics_worker=telemetry,io_worker=arxiv_io)
+            scheduler=await progress.call(Scheduler,config,store,client,api_key=api_key,metrics=metrics,now=now,sleep=sleep,progress_worker=progress,metrics_worker=telemetry)
             async with asyncio.TaskGroup() as group:
                 if has_arxiv: group.create_task(arxiv_run(scheduler))
                 if has_s2: group.create_task(reference_worker.run(scheduler,discovery_done))

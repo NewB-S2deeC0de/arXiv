@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import uuid
 import time
 from urllib.parse import quote
@@ -127,7 +128,7 @@ class ReferenceWorker:
             if not outcome['complete']:
                 acknowledgements.append((key,None,outcome['error'])); continue
             query,fingerprint=query_identity(key[0],key[1],self.config.network['s2_page_size'])
-            directory=self.store.reference_cache_root(*key[:2])/fingerprint
+            directory=self.scratch/f'{quote(key[0],safe="")}-v{key[1]}-ref-{fingerprint[:8]}'
             directory.mkdir(parents=True,exist_ok=True)
             references=outcome['references']
             atomic_json(directory/'normalized.json',dict(references=references,unresolved_count=0,
@@ -137,6 +138,7 @@ class ReferenceWorker:
                 batch_provenance={'batch_id':batch_id,'pass':pass_number,'index':index,
                     'sha256':checksum,'returned_paper_id':outcome['returned_paper_id']},**query))
             self.store.storage.commit(key,directory,include=['normalized.json'])
+            shutil.rmtree(directory,ignore_errors=True)
             acknowledgements.append((key,len(references),''))
         local.unlink()
         return batch_path,acknowledgements
