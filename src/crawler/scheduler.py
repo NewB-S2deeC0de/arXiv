@@ -115,11 +115,8 @@ class Scheduler:
                     if service=='arxiv':
                         while self.monotonic()+1e-9<self.arxiv_next_send or self.now()+1e-9<deadline:
                             remaining=max(self.arxiv_next_send-self.monotonic(),deadline-self.now(),0)
-                            await self.wait(self.now()+remaining,primary_key,reason='dispatch_pacing',jobs=batch_keys,service=service)
+                            await self.wait(self.now()+remaining,primary_key,reason='service_cooldown',jobs=batch_keys,service=service)
                         sent_at=self.now()
-                        sent_mono=self.monotonic()
-                        self.arxiv_next_send=sent_mono+gap
-                        state['deadline']=max(state['deadline'],sent_at+gap)
                     elif service=='s2':
                         # Check again AFTER durable writes/logging; their latency can vary.
                         while self.monotonic()+1e-9<self.s2_next_send or self.now()+1e-9<deadline:
@@ -134,6 +131,8 @@ class Scheduler:
                             state['backoff'] = state['backoff']*2 or 60
                             if service=='s2':
                                 state['backoff'] = min(state['backoff'],net['s2_max_backoff_seconds'])
+                            elif service=='arxiv':
+                                state['backoff'] = min(state['backoff'],60)
                             delay = retry_after if retry_after is not None else state['backoff']
                             state['deadline'] = max(state['deadline'],self.now()+delay)
                             log(f'RateLimit: [{service}] received HTTP 429 Too Many Requests; backoff set to {delay:.0f}s (retry_after={retry_after})')
@@ -226,7 +225,10 @@ class Scheduler:
                     error_code = PAYLOAD_CODES.get(str(exc),'payload_'+type(exc).__name__)
                 finally:
                     if service!='s2':
-                        state['deadline'] = max(state['deadline'], sent_at+gap)
+                        finished_at = self.now()
+                        finished_mono = self.monotonic()
+                        state['deadline'] = max(state['deadline'], finished_at+gap)
+                        self.arxiv_next_send = finished_mono+gap
                     # Cleared only when the actual dispatch timestamp/cooldown is persisted.
                     if service=='s2': state['dispatch_pending']=False
                     await self.persist_async()
