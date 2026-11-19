@@ -95,3 +95,66 @@ def test_arxiv_source_pipelining(tmp_path, monkeypatch):
     download_starts = [e for e in events if e[0] == 'download_start']
     assert len(download_starts) == 2
 
+
+def test_arxiv_metadata_pipelining(tmp_path, monkeypatch):
+    import gzip
+    import time
+    from crawler.progress import ProgressStore
+    from crawler.storage import Storage
+    monkeypatch.chdir(tmp_path)
+    c = CrawlerConfig()
+    c.range['start_id'] = 2523
+    c.range['end_id'] = 2523  # 1 paper
+    clock = [1000.0]
+
+    async def mock_sleep(n):
+        clock[0] += n
+
+    class StreamBody(httpx.AsyncByteStream):
+        def __init__(self, data):
+            self.data = data
+        async def __aiter__(self):
+            for offset in range(0, len(self.data), 1024):
+                yield self.data[offset:offset+1024]
+
+    events = []
+    original_commit = Storage.commit
+    def delayed_commit(self, key, staging, status='succeeded', *, include=None):
+        events.append((f'commit_start_{key[2]}', key[0]))
+        if key[2] == 'metadata':
+            time.sleep(0.05)
+        res = original_commit(self, key, staging, status, include=include)
+        events.append((f'commit_end_{key[2]}', key[0]))
+        return res
+    monkeypatch.setattr(Storage, 'commit', delayed_commit)
+
+    def handler(request):
+        url = str(request.url)
+        if 'api/query' in url:
+            ids = request.url.params['id_list'].split(',')
+            entries = ''.join(f'<entry><id>http://arxiv.org/abs/{i if "v" in i else i+"v1"}</id></entry>' for i in ids)
+            return httpx.Response(200, content=f'<feed xmlns="http://www.w3.org/2005/Atom">{entries}</feed>'.encode())
+        if '/src/' in url:
+            paper_id = url.split('/src/')[-1].split('v')[0]
+            events.append(('download_start_source', paper_id))
+            tex_content = b'\\documentclass{article}\\begin{document}Hello world\\end{document}'
+            compressed = gzip.compress(tex_content)
+            return httpx.Response(200, stream=StreamBody(compressed), headers={'content-type': 'application/x-eprint-tar'})
+        return httpx.Response(404)
+
+    summary = asyncio.run(run_pipeline(c, {'arxiv'}, limit=1, transport=httpx.MockTransport(handler), now=lambda: clock[0], sleep=mock_sleep))
+    store = ProgressStore('runtime')
+    counts = store.status_counts()
+    assert counts['discovery']['succeeded'] == 1
+    assert counts['metadata']['succeeded'] == 1
+    assert counts['source']['succeeded'] == 1
+
+    event_names = [e[0] for e in events]
+    assert 'commit_start_metadata' in event_names
+    assert 'download_start_source' in event_names
+    meta_start_idx = event_names.index('commit_start_metadata')
+    meta_end_idx = event_names.index('commit_end_metadata')
+    source_download_idx = event_names.index('download_start_source')
+    assert meta_start_idx < source_download_idx < meta_end_idx
+
+
