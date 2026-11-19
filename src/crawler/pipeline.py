@@ -67,48 +67,70 @@ async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeov
     metadata_done_count = 0
     source_done_count = 0
 
-    async def metadata_batch(keys,scheduler):
-        nonlocal metadata_done_count
-        identifiers=[f'{key[0]}v{key[1]}' for key in keys]
-        artifact=await scheduler.request(keys,'arxiv','https://export.arxiv.org/api/query',params={'id_list':','.join(identifiers),'max_results':len(keys)},validate=lambda raw:(raw,parse_version_batch(raw,identifiers)))
-        if artifact is None: return
-        raw,parsed_versions=artifact
-        request_data=dict(id_list=identifiers,max_results=len(keys))
-        def write_and_commit_metadata():
-            records=[]
-            for key,identifier in zip(keys,identifiers):
-                parsed=parsed_versions[identifier]
-                staging=scratch/f'{quote(key[0],safe="")}-v{key[1]}-metadata'
-                staging.mkdir(parents=True,exist_ok=True)
-                (staging/'response.xml').write_bytes(raw)
-                atomic_json(staging/'request.json',request_data)
-                atomic_json(staging/'normalized.json',parsed)
-                status='not_found' if parsed.get('not_found') else 'succeeded'
-                before=time.monotonic()
-                store.storage.commit(key,staging,status)
-                duration=time.monotonic()-before
-                shutil.rmtree(staging)
-                records.append((key,status,duration,store.storage.result_dir(key),staging))
-            return records
-        records=await arxiv_io.call(write_and_commit_metadata)
-        results=[]
-        for key,status,duration,result_dir,staging in records:
-            await telemetry.call(metrics.touch,result_dir,staging)
-            await telemetry.call(metrics.record,'commit',job=key,seconds=duration)
-            results.append((key,status,''))
-        await progress.call(store.finish_many,results)
-        await telemetry.call(metrics.touch,store.journal.path)
-        metadata_done_count += len(keys)
-        log(f'arXiv Metadata: batch finished ({len(keys)} versions, cumulative: {metadata_done_count})')
+    async def metadata_batch(keys, scheduler, source_queue, metadata_inflight):
+        try:
+            nonlocal metadata_done_count
+            identifiers = [f'{key[0]}v{key[1]}' for key in keys]
+            artifact = await scheduler.request(
+                keys,
+                'arxiv',
+                'https://export.arxiv.org/api/query',
+                params={'id_list': ','.join(identifiers), 'max_results': len(keys)},
+                validate=lambda raw: (raw, parse_version_batch(raw, identifiers)),
+            )
+            if artifact is None:
+                metadata_inflight.difference_update(keys)
+                return
+            raw, parsed_versions = artifact
+            request_data = dict(id_list=identifiers, max_results=len(keys))
+
+            async def publish_metadata():
+                try:
+                    def write_and_commit_metadata():
+                        records = []
+                        for key, identifier in zip(keys, identifiers):
+                            parsed = parsed_versions[identifier]
+                            staging = scratch / f'{quote(key[0], safe="")}-v{key[1]}-metadata'
+                            staging.mkdir(parents=True, exist_ok=True)
+                            (staging / 'response.xml').write_bytes(raw)
+                            atomic_json(staging / 'request.json', request_data)
+                            atomic_json(staging / 'normalized.json', parsed)
+                            status = 'not_found' if parsed.get('not_found') else 'succeeded'
+                            before = time.monotonic()
+                            store.storage.commit(key, staging, status)
+                            duration = time.monotonic() - before
+                            shutil.rmtree(staging)
+                            records.append((key, status, duration, store.storage.result_dir(key), staging))
+                        return records
+
+                    records = await arxiv_io.call(write_and_commit_metadata)
+                    results = []
+                    for key, status, duration, result_dir, staging in records:
+                        await telemetry.call(metrics.touch, result_dir, staging)
+                        await telemetry.call(metrics.record, 'commit', job=key, seconds=duration)
+                        results.append((key, status, ''))
+                    await progress.call(store.finish_many, results)
+                    await telemetry.call(metrics.touch, store.journal.path)
+                    nonlocal metadata_done_count
+                    metadata_done_count += len(keys)
+                    log(f'arXiv Metadata: batch finished ({len(keys)} versions, cumulative: {metadata_done_count})')
+                finally:
+                    metadata_inflight.difference_update(keys)
+
+            await source_queue.submit(publish_metadata)
+        except Exception:
+            metadata_inflight.difference_update(keys)
+            raise
 
     async def arxiv(scheduler, source_queue):
         discovery_turn = True
         only_discovery = 'discovery' in stages and 'arxiv' not in stages
         source_inflight = set()
         discovery_inflight = set()
+        metadata_inflight = set()
         while 'arxiv' not in scheduler.stopped:
             discoveries = [k for k, r in await rows_for('discovery') if k not in discovery_inflight]
-            if not discoveries and not discovery_inflight and not source_queue.used_items and not discovery_done.is_set():
+            if not discoveries and not discovery_inflight and not discovery_done.is_set():
                 discovery_done.set()
             if only_discovery:
                 if not discoveries:
@@ -122,10 +144,10 @@ async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeov
                 discovery_inflight.update(batch)
                 await run_discovery_batch(batch, scheduler, source_queue, discovery_inflight, async_publish=True)
                 continue
-            version_rows = [(k, r) for k, r in (await rows_for('metadata')) + (await rows_for('source')) if k not in source_inflight]
+            version_rows = [(k, r) for k, r in (await rows_for('metadata')) + (await rows_for('source')) if k not in source_inflight and k not in metadata_inflight]
             versions = sorted([k for k, r in version_rows], key=lambda k: (k[0], k[1], k[2] == 'source'))
             if not discoveries and not versions:
-                if source_queue.used_items or discovery_inflight:
+                if source_queue.used_items or discovery_inflight or metadata_inflight or source_inflight:
                     await asyncio.sleep(0.01)
                     continue
                 break
@@ -145,7 +167,8 @@ async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeov
                 attempts = (await progress.call(lambda: dict(store.get(key))))['attempts']
                 size = min(config.network['metadata_batch_size'], config.execution['queue_capacity'])
                 batch = [k for k, r in version_rows if k[2] == 'metadata' and r['attempts'] == attempts][:size]
-                await metadata_batch(batch, scheduler)
+                metadata_inflight.update(batch)
+                await metadata_batch(batch, scheduler, source_queue, metadata_inflight)
                 continue
             source_inflight.add(key)
             archive = scratch / f'{quote(key[0], safe="")}v{key[1]}.download'
