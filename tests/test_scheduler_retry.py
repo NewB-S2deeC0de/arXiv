@@ -102,5 +102,21 @@ def test_arxiv_dispatch_pacing(tmp_path):
             await scheduler.request(('2504.02523',0,'discovery',0),'arxiv','https://export.arxiv.org/api/query')
             await scheduler.request(('2504.02524',0,'discovery',0),'arxiv','https://export.arxiv.org/api/query')
         assert len(dispatch_times)==2
-        assert dispatch_times[1]-dispatch_times[0]==pytest.approx(3.0)
+        assert dispatch_times[1]-1001.5==pytest.approx(3.0)
     asyncio.run(check())
+
+
+def test_arxiv_429_backoff_capped_at_60s(tmp_path):
+    async def check():
+        store = ProgressStore(tmp_path); store.initialize(['2504.02523'])
+        key = ('2504.02523', 0, 'discovery', 0)
+        clock = [1000.0]
+        async def sleep(n): clock[0] += n
+        transport = httpx.MockTransport(lambda r: httpx.Response(429))
+        async with httpx.AsyncClient(transport=transport) as client:
+            s = Scheduler(CrawlerConfig(), store, client, now=lambda: clock[0], sleep=sleep)
+            result = await s.request(key, 'arxiv', 'https://export.arxiv.org/api/query')
+            assert result is None
+            assert s.state['arxiv']['backoff'] == 60
+    asyncio.run(check())
+
