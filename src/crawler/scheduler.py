@@ -154,7 +154,7 @@ class Scheduler:
                             url=redirect; params=None; redirected=True
                         elif code==200:
                             if target:
-                                await self.io(target.parent.mkdir,parents=True,exist_ok=True)
+                                target.parent.mkdir(parents=True,exist_ok=True)
                                 metadata = dict(
                                     status_code=code,
                                     content_type=response.headers.get('content-type'),
@@ -163,24 +163,20 @@ class Scheduler:
                                     effective_url=str(response.url.copy_with(query=None)),
                                     bytes_received=0,
                                     complete=False)
-                                await self.io(atomic_json,target.with_suffix('.response.json'),metadata)
-                                f=await self.io(target.open,'wb')
-                                try:
-                                    # Preserve the actual compressed entity; extraction owns gzip validation.
+                                atomic_json(target.with_suffix('.response.json'),metadata)
+                                if shutil.disk_usage(target.parent).free < self.config.execution['min_free_disk_bytes']:
+                                    raise OSError('Insufficient disk space during download')
+                                with target.open('wb') as f:
                                     async for chunk in response.aiter_raw():
-                                        if (await self.io(shutil.disk_usage,target.parent)).free < len(chunk) + self.config.execution['min_free_disk_bytes']:
-                                            raise OSError('Insufficient disk space during download')
-                                        await self.io(f.write,chunk)
+                                        f.write(chunk)
                                         received+=len(chunk)
-                                finally:
-                                    await self.io(f.close)
                                 metadata.update(
                                     bytes_received = received,
                                     complete = True,
-                                    sha256 = await self.io(digest,target),
+                                    sha256 = digest(target),
                                     download_seconds = time.monotonic()-started
                                 )
-                                await self.io(atomic_json,target.with_suffix('.response.json'),metadata)
+                                atomic_json(target.with_suffix('.response.json'),metadata)
                                 result=target
                             else:
                                 if service=='s2':
