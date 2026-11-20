@@ -245,7 +245,7 @@ class Scheduler:
                     if self.metrics:
                         if target: await self.metric('touch',target,target.with_suffix('.response.json'))
                         await self.metric('touch',self.path,self.store.journal.path)
-                        await self.metric('sample',force_disk=True)
+                        await self.metric('sample')
 
                 attempt=(await self.store_call('get',primary_key))['attempts']
                 if attempt<3:

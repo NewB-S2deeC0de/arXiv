@@ -144,7 +144,7 @@ class ProgressStore:
                 if key not in self.rows: raise KeyError(key)
             for key,status,error in results: self.rows[key].update(status=status,error=error)
             self.dirty_count+=len(results)
-            with_views=self.dirty_count>=50
+            with_views=self.dirty_count>=500
             self.save(with_views=with_views)
             if with_views: self.dirty_count=0
 

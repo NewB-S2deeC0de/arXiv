@@ -73,9 +73,9 @@ class MetricsRecorder:
             for name in ('environment.json','checkpoint.json','resources.csv','paper_metrics.csv','summary.json'): self.disk.touch(self.directory/name)
             self.disk.touch(self.root/'logs'/self.run_id/'events.jsonl')
             self.last_disk=elapsed
+            atomic_json(self.directory/'checkpoint.json',dict(run_id=self.run_id,started_at=self.started_at,last_sample_at=utc_now(),wall_seconds=elapsed,incomplete=True,event_seconds=self.durations,disk_measurement_scope='session_touched_paths'))
         self.disk_bytes=self.disk.total
         self.samples.append((elapsed,rss,self.disk_bytes))
-        atomic_json(self.directory/'checkpoint.json',dict(run_id=self.run_id,started_at=self.started_at,last_sample_at=utc_now(),wall_seconds=elapsed,incomplete=True,event_seconds=self.durations,disk_measurement_scope='session_touched_paths'))
         self.writer.writerow(dict(elapsed_seconds=elapsed,utc=utc_now(),rss_bytes=rss,disk_bytes=self.disk_bytes)); self.resources.flush()
     def touch(self,*paths):
         for path in paths: self.disk.touch(path)

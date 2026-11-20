@@ -104,9 +104,11 @@ async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeov
                         return records
 
                     records = await arxiv_io.call(write_and_commit_metadata)
+                    touched_dirs = [p for _, _, _, result_dir, staging in records for p in (result_dir, staging)]
+                    if touched_dirs:
+                        await telemetry.call(metrics.touch, *touched_dirs)
                     results = []
                     for key, status, duration, result_dir, staging in records:
-                        await telemetry.call(metrics.touch, result_dir, staging)
                         await telemetry.call(metrics.record, 'commit', job=key, seconds=duration)
                         results.append((key, status, ''))
                     await progress.call(store.finish_many, results)
@@ -199,7 +201,6 @@ async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeov
                     await progress.call(store.finish, job_key, status)
                     await telemetry.call(metrics.record, 'commit', job=job_key, seconds=duration)
                     await telemetry.call(metrics.touch, store.storage.result_dir(job_key), archive_path, staging_dir)
-                    await telemetry.call(metrics.sample, force_disk=True)
                     nonlocal source_done_count
                     source_done_count += 1
                     if source_done_count % 25 == 0 or source_done_count == 1:
