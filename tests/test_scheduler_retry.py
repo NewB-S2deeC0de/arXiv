@@ -120,3 +120,28 @@ def test_arxiv_429_backoff_capped_at_60s(tmp_path):
             assert s.state['arxiv']['backoff'] == 60
     asyncio.run(check())
 
+
+def test_arxiv_validation_overlaps_pacing(tmp_path):
+    import pytest
+    async def check():
+        store = ProgressStore(tmp_path); store.initialize(['2504.02523', '2504.02524'])
+        clock = [1000.0]; dispatch_times = []
+        async def sleep(n): clock[0] += n
+        def handle(request):
+            dispatch_times.append(clock[0])
+            clock[0] += 0.5  # download takes 0.5s
+            return httpx.Response(200, content=b'<feed></feed>')
+        def slow_validate(raw):
+            clock[0] += 1.0  # validate takes 1.0s of CPU time
+            return raw
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            scheduler = Scheduler(CrawlerConfig(), store, client, now=lambda: clock[0], sleep=sleep)
+            await scheduler.request(('2504.02523', 0, 'discovery', 0), 'arxiv', 'https://export.arxiv.org/api/query', validate=slow_validate)
+            await scheduler.request(('2504.02524', 0, 'discovery', 0), 'arxiv', 'https://export.arxiv.org/api/query')
+        assert len(dispatch_times) == 2
+        # Request 1 started at 1000.0, download finished at 1000.5.
+        # With overlapping validation, 3.0s cooldown starts at 1000.5, so Request 2 starts at 1003.5.
+        assert dispatch_times[1] == pytest.approx(1003.5)
+    asyncio.run(check())
+
+
