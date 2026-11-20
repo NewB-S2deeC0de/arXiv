@@ -210,3 +210,51 @@ def test_metrics_scope_and_explicit_scan_are_separate(tmp_path,monkeypatch):
     assert summary['disk_observed_peak_bytes']<100000
     env=json.loads((metrics.directory/'environment.json').read_text())
     assert env['disk_measurement_scope']=='session_touched_paths'
+
+
+def test_metrics_checkpoint_throttled_to_disk_interval(tmp_path, monkeypatch):
+    import time
+    from crawler.metrics import MetricsRecorder
+    monkeypatch.chdir(tmp_path); Path('runtime').mkdir()
+    metrics = MetricsRecorder(CrawlerConfig())
+    writes = []
+    import crawler.metrics as cm
+    orig_atomic = cm.atomic_json
+    def spy_atomic(path, val):
+        if 'checkpoint.json' in str(path): writes.append(val)
+        return orig_atomic(path, val)
+    monkeypatch.setattr(cm, 'atomic_json', spy_atomic)
+    metrics.start('run1')
+    assert len(writes) == 1  # initial sample in start()
+    # sample at 1s, 2s, 3s without force_disk should NOT rewrite checkpoint.json
+    metrics.started = time.monotonic() - 1
+    metrics.sample()
+    metrics.started = time.monotonic() - 2
+    metrics.sample()
+    assert len(writes) == 1
+    # sample past 10s should rewrite checkpoint.json
+    metrics.started = time.monotonic() - 11
+    metrics.sample()
+    assert len(writes) == 2
+    metrics.stop()
+
+
+def test_finish_many_throttles_view_writing(tmp_path):
+    store = ProgressStore(tmp_path)
+    papers = [f'2504.025{i:02d}' for i in range(100)]
+    store.initialize(papers)
+    keys = [(p, 0, 'discovery', 0) for p in papers]
+    view_writes = []
+    orig_write = store.write_views
+    def spy_write():
+        view_writes.append(1)
+        return orig_write()
+    store.write_views = spy_write
+    # Finish 50 items: should append to journal without full view rewrite (threshold 500)
+    store.finish_many([(k, 'succeeded', '') for k in keys[:50]])
+    assert len(view_writes) == 0
+    assert store.dirty_count == 50
+    # Explicit save with views still works
+    store.save(with_views=True)
+    assert len(view_writes) == 1
+
