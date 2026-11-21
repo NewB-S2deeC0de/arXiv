@@ -162,3 +162,42 @@ async def test_run_range_queue_logs_api_wait_telemetry(tmp_path, monkeypatch):
     assert len(results) == 1
     assert any("Rate-limit stall: 50.0s" in m and "Effective crawl: 70.0s" in m for m in logs)
 
+def test_normalize_target_s2_api_key():
+    target = {
+        "start_month": "2025-04",
+        "start_id": 1,
+        "end_month": "2025-04",
+        "end_id": 5,
+        "s2_api_key": "  my-secret-key-123  ",
+    }
+    norm = normalize_target(target)
+    assert norm["s2_api_key"] == "my-secret-key-123"
+
+    with pytest.raises(ValueError, match="s2_api_key must be a string or None"):
+        normalize_target({
+            "start_month": "2025-04",
+            "start_id": 1,
+            "end_month": "2025-04",
+            "end_id": 5,
+            "s2_api_key": 12345,
+        })
+
+@pytest.mark.anyio
+async def test_run_range_queue_passes_target_api_key(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    mock_runner = AsyncMock(return_value={"wall_seconds": 10.0})
+    config = CrawlerConfig()
+    target = {
+        "start_month": "2025-04",
+        "start_id": 1,
+        "end_month": "2025-04",
+        "end_id": 2,
+        "folder": "datasets/t1",
+        "s2_api_key": "member-custom-key",
+    }
+    await run_range_queue(config, [target], stages={"arxiv", "s2"}, runner=mock_runner)
+    # Check that mock_runner was called with api_key="member-custom-key"
+    called_api_keys = [c.kwargs.get("api_key") for c in mock_runner.call_args_list]
+    assert "member-custom-key" in called_api_keys
+
+

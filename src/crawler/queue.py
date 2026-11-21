@@ -8,6 +8,7 @@ from .console import log
 from .config import CrawlerConfig
 from .ids import generate_ids
 from .progress import ProgressStore
+from .secrets import resolve_s2_key
 
 
 def build_target_folder(start_month: str, start_id: int, end_month: str, end_id: int) -> str:
@@ -29,6 +30,10 @@ def normalize_target(target: dict[str, Any]) -> dict[str, Any]:
     monthly_end_ids = target.get("monthly_end_ids")
     if monthly_end_ids is not None and not isinstance(monthly_end_ids, dict):
         raise ValueError("monthly_end_ids must be a dict mapping month (YYYY-MM) to last serial")
+
+    s2_api_key = target.get("s2_api_key")
+    if s2_api_key is not None and not isinstance(s2_api_key, str):
+        raise ValueError("s2_api_key must be a string or None")
 
     # generate_ids validates month format, integer bounds, and cross-month completeness
     expected_ids = generate_ids(
@@ -54,6 +59,7 @@ def normalize_target(target: dict[str, Any]) -> dict[str, Any]:
         "end_month": end_month,
         "end_id": end_id,
         "monthly_end_ids": monthly_end_ids,
+        "s2_api_key": s2_api_key.strip() if s2_api_key and s2_api_key.strip() else None,
         "folder": folder,
         "expected_ids": expected_ids,
     }
@@ -144,8 +150,10 @@ async def run_range_queue(
     for index, target in enumerate(normalized_targets, start=1):
         folder = target["folder"]
         expected_ids = target["expected_ids"]
+        target_api_key = resolve_s2_key(target.get("s2_api_key"))
+        key_label = f"S2 key: {target['s2_api_key']}" if target.get("s2_api_key") else "S2 key: default"
         range_desc = f"{target['start_month']}.{target['start_id']:05d} -> {target['end_month']}.{target['end_id']:05d}"
-        log(f"Queue: [{index}/{len(normalized_targets)}] target {range_desc} (folder: {folder})")
+        log(f"Queue: [{index}/{len(normalized_targets)}] target {range_desc} (folder: {folder}, {key_label})")
 
         if is_target_completed(folder, expected_ids):
             log(f"Queue: target {folder} already completed 100%. Skipping.")
@@ -190,6 +198,7 @@ async def run_range_queue(
                 resume=True,
                 limit=limit,
                 takeover_stale=takeover_stale,
+                api_key=target_api_key,
             )
 
         parallel_stages = stages - {"discovery"}
@@ -201,6 +210,7 @@ async def run_range_queue(
                 resume=True,
                 limit=limit,
                 takeover_stale=takeover_stale,
+                api_key=target_api_key,
             )
         else:
             summary = {"status": "discovery_only"}

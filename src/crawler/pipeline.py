@@ -20,7 +20,7 @@ from .workers import ThreadWorker
 from .reference_worker import ReferenceWorker
 from contextlib import AsyncExitStack
 
-async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeover_stale=False,transport=None,run_id=None,now=time.time,sleep=asyncio.sleep,progress=None,telemetry=None,arxiv_io=None,s2_io=None,reader=None):
+async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeover_stale=False,transport=None,run_id=None,now=time.time,sleep=asyncio.sleep,progress=None,telemetry=None,arxiv_io=None,s2_io=None,reader=None,api_key=None):
     log('Startup: validating configuration and selecting IDs')
     config.validate(); stages=stages or {'arxiv','s2'}
     ids=generate_ids(**config.range)
@@ -34,7 +34,8 @@ async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeov
     if shutil.disk_usage(root).free<config.execution['min_free_disk_bytes']: raise OSError('Insufficient disk space')
     log('Startup: disk space check complete')
     log('Startup: loading S2 credentials if selected')
-    api_key=load_semantic_scholar_key() if 's2' in stages else None
+    if api_key is None:
+        api_key=load_semantic_scholar_key() if 's2' in stages else None
     if 's2' in stages and not api_key and not config.execution['allow_anonymous_s2']:
         raise RuntimeError('Set API key or explicitly allow anonymous S2')
     print('[Startup] Loading progress snapshot and journal',flush=True)
@@ -318,17 +319,17 @@ async def _run_pipeline_inner(config,stages=None,resume=True,*,limit=None,takeov
     return summary
 
 
-async def _run_pipeline(config,*args,**kwargs):
+async def _run_pipeline(config,*args,api_key=None,**kwargs):
     async with AsyncExitStack() as stack:
         workers={}
         for name in ('progress','telemetry','arxiv_io','s2_io','reader'):
             capacity=config.execution['progress_queue_capacity'] if name=='progress' else 8
             workers[name]=await stack.enter_async_context(ThreadWorker(capacity=capacity,name=name))
-        return await _run_pipeline_inner(config,*args,**kwargs,**workers)
+        return await _run_pipeline_inner(config,*args,api_key=api_key,**kwargs,**workers)
 
 
-async def run_pipeline(config,stages=None,resume=True,*,limit=None,takeover_stale=False,transport=None,now=time.time,sleep=asyncio.sleep):
+async def run_pipeline(config,stages=None,resume=True,*,limit=None,takeover_stale=False,transport=None,now=time.time,sleep=asyncio.sleep,api_key=None):
     log('Startup: pipeline entered; acquiring dataset lock')
     run_id=uuid.uuid4().hex
     with DatasetLock(config.paths['persistent_root'],run_id,takeover_stale):
-        return await _run_pipeline(config,stages,resume,limit=limit,takeover_stale=takeover_stale,transport=transport,run_id=run_id,now=now,sleep=sleep)
+        return await _run_pipeline(config,stages,resume,limit=limit,takeover_stale=takeover_stale,transport=transport,run_id=run_id,now=now,sleep=sleep,api_key=api_key)
