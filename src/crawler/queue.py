@@ -1,6 +1,10 @@
+import json
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from .ids import generate_ids
+from .progress import ProgressStore
 
 
 def build_target_folder(start_month: str, start_id: int, end_month: str, end_id: int) -> str:
@@ -50,3 +54,69 @@ def normalize_target(target: dict[str, Any]) -> dict[str, Any]:
         "folder": folder,
         "expected_ids": expected_ids,
     }
+
+
+def mark_target_completed(persistent_root: Path | str, metadata: dict[str, Any] | None = None) -> None:
+    """Write lightweight completed.json marker to make future checks instantaneous."""
+    root = Path(persistent_root)
+    root.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        **(metadata or {}),
+    }
+    marker = root / "completed.json"
+    marker.write_text(json.dumps(payload, indent=2))
+
+
+def is_target_completed(persistent_root: Path | str, expected_ids: list[str]) -> bool:
+    """Check if target has completed. Uses sub-millisecond marker file when available."""
+    root = Path(persistent_root)
+    marker = root / "completed.json"
+    if marker.exists():
+        return True
+
+    progress_dir = root / "progress"
+    journal = progress_dir / "jobs.journal.jsonl"
+    jobs_csv = progress_dir / "jobs.csv"
+    if not journal.exists() and not jobs_csv.exists():
+        return False
+
+    try:
+        store = ProgressStore(root)
+    except Exception:
+        return False
+
+    if not store.rows:
+        return False
+
+    # All expected papers must have completed discovery
+    for paper in expected_ids:
+        disc_key = (paper, 0, "discovery", 0)
+        row = store.rows.get(disc_key)
+        if not row or row["status"] not in ("succeeded", "not_found"):
+            return False
+
+    # No pending or running jobs
+    for key, row in store.rows.items():
+        if row["status"] in ("pending", "running"):
+            return False
+
+    # Mark completed for instantaneous future checks
+    mark_target_completed(root, {"total_jobs": len(store.rows), "expected_papers": len(expected_ids)})
+    return True
+
+
+def clean_scratch_dir(scratch_path: Path | str) -> None:
+    """Purge residual files inside scratch directory without deleting the directory itself."""
+    path = Path(scratch_path).resolve()
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+        return
+    for item in path.iterdir():
+        try:
+            if item.is_dir() and not item.is_symlink():
+                shutil.rmtree(item, ignore_errors=True)
+            else:
+                item.unlink(missing_ok=True)
+        except OSError:
+            pass
