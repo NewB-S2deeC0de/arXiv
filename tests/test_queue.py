@@ -93,3 +93,49 @@ def test_clean_scratch_dir(tmp_path):
     clean_scratch_dir(scratch)
     assert scratch.exists()
     assert list(scratch.iterdir()) == []
+
+from unittest.mock import AsyncMock
+from crawler.config import CrawlerConfig
+from crawler.queue import run_range_queue
+
+@pytest.mark.anyio
+async def test_run_range_queue_executes_sequentially(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    mock_runner = AsyncMock(return_value={"wall_seconds": 10.0, "status_counts": {}})
+    config = CrawlerConfig()
+    t1_folder = "datasets/t1"
+    t2_folder = "datasets/t2"
+    targets = [
+        {"start_month": "2025-04", "start_id": 1, "end_month": "2025-04", "end_id": 5, "folder": t1_folder},
+        {"start_month": "2025-04", "start_id": 6, "end_month": "2025-04", "end_id": 10, "folder": t2_folder},
+    ]
+
+    results = await run_range_queue(config, targets, runner=mock_runner)
+    assert len(results) == 2
+    assert results[0]["folder"] == t1_folder
+    assert results[1]["folder"] == t2_folder
+    # mock_runner should have been called for t1 (discovery, arxiv+s2) and t2 (discovery, arxiv+s2)
+    assert mock_runner.call_count >= 2
+    # Verify configs passed to runner
+    first_config = mock_runner.call_args_list[0][0][0]
+    assert first_config.paths["persistent_root"] == t1_folder
+
+@pytest.mark.anyio
+async def test_run_range_queue_skips_already_completed(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    mock_runner = AsyncMock(return_value={})
+    config = CrawlerConfig()
+    t1_folder = "datasets/t1"
+    mark_target_completed(t1_folder, {"done": True})
+    targets = [
+        {"start_month": "2025-04", "start_id": 1, "end_month": "2025-04", "end_id": 5, "folder": t1_folder},
+        {"start_month": "2025-04", "start_id": 6, "end_month": "2025-04", "end_id": 10, "folder": "datasets/t2"},
+    ]
+
+    results = await run_range_queue(config, targets, runner=mock_runner)
+    assert len(results) == 2
+    assert results[0]["status"] == "skipped_completed"
+    # mock_runner should only be called for t2
+    for call in mock_runner.call_args_list:
+        cfg = call[0][0]
+        assert cfg.paths["persistent_root"] != t1_folder

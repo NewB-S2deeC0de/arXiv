@@ -1,8 +1,11 @@
+import copy
 import json
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from .console import log
+from .config import CrawlerConfig
 from .ids import generate_ids
 from .progress import ProgressStore
 
@@ -120,3 +123,101 @@ def clean_scratch_dir(scratch_path: Path | str) -> None:
                 item.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+async def run_range_queue(
+    base_config: CrawlerConfig,
+    targets: list[dict[str, Any]],
+    stages: set[str] = {"discovery", "arxiv", "s2"},
+    *,
+    takeover_stale: bool = False,
+    limit: int | None = None,
+    runner: Any = None,
+) -> list[dict[str, Any]]:
+    """Execute a sequence of crawl targets sequentially, skipping completed ranges."""
+    from .pipeline import run_pipeline
+    pipeline_runner = runner or run_pipeline
+
+    normalized_targets = [normalize_target(t) for t in targets]
+    results = []
+
+    for index, target in enumerate(normalized_targets, start=1):
+        folder = target["folder"]
+        expected_ids = target["expected_ids"]
+        range_desc = f"{target['start_month']}.{target['start_id']:05d} -> {target['end_month']}.{target['end_id']:05d}"
+        log(f"Queue: [{index}/{len(normalized_targets)}] target {range_desc} (folder: {folder})")
+
+        if is_target_completed(folder, expected_ids):
+            log(f"Queue: target {folder} already completed 100%. Skipping.")
+            results.append({
+                "target": target,
+                "folder": folder,
+                "status": "skipped_completed",
+            })
+            continue
+
+        target_config = copy.deepcopy(base_config)
+        target_config.range = {
+            "start_month": target["start_month"],
+            "start_id": target["start_id"],
+            "end_month": target["end_month"],
+            "end_id": target["end_id"],
+        }
+        if target["monthly_end_ids"]:
+            target_config.range["monthly_end_ids"] = target["monthly_end_ids"]
+        target_config.paths["persistent_root"] = folder
+        target_config.validate()
+
+        # Check if discovery already done in folder
+        needs_discovery = True
+        journal_p = Path(folder) / "progress" / "jobs.journal.jsonl"
+        jobs_csv_p = Path(folder) / "progress" / "jobs.csv"
+        if journal_p.exists() or jobs_csv_p.exists():
+            try:
+                store = ProgressStore(folder)
+                disc_keys = [(p, 0, "discovery", 0) for p in expected_ids]
+                if all(k in store.rows and store.rows[k]["status"] in ("succeeded", "not_found") for k in disc_keys):
+                    needs_discovery = False
+            except Exception:
+                pass
+
+        summary: dict[str, Any] = {}
+        if needs_discovery and ("discovery" in stages):
+            log(f"Queue: [{folder}] running Stage 1: Discovery...")
+            await pipeline_runner(
+                target_config,
+                {"discovery"},
+                resume=True,
+                limit=limit,
+                takeover_stale=takeover_stale,
+            )
+
+        parallel_stages = stages - {"discovery"}
+        if parallel_stages:
+            log(f"Queue: [{folder}] running Stage 2: {parallel_stages}...")
+            summary = await pipeline_runner(
+                target_config,
+                parallel_stages,
+                resume=True,
+                limit=limit,
+                takeover_stale=takeover_stale,
+            )
+        else:
+            summary = {"status": "discovery_only"}
+
+        completed = is_target_completed(folder, expected_ids)
+        if completed:
+            mark_target_completed(folder, summary if isinstance(summary, dict) else {})
+
+        # Clean scratch SSD directory between targets
+        clean_scratch_dir(target_config.paths.get("scratch_root", "scratch"))
+
+        results.append({
+            "target": target,
+            "folder": folder,
+            "status": "completed" if completed else "incomplete",
+            "summary": summary,
+        })
+
+    log(f"Queue: all {len(normalized_targets)} targets processed.")
+    return results
