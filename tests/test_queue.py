@@ -139,3 +139,26 @@ async def test_run_range_queue_skips_already_completed(tmp_path, monkeypatch):
     for call in mock_runner.call_args_list:
         cfg = call[0][0]
         assert cfg.paths["persistent_root"] != t1_folder
+
+@pytest.mark.anyio
+async def test_run_range_queue_logs_api_wait_telemetry(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    summary_with_wait = {
+        "wall_seconds": 120.0,
+        "api_wait_seconds": {
+            "arxiv": {"pacing_seconds": 10.0, "rate_limit_seconds": 30.0},
+            "s2": {"pacing_seconds": 5.0, "rate_limit_seconds": 20.0},
+            "total_rate_limit_seconds": 50.0,
+            "effective_crawler_seconds": 70.0,
+        }
+    }
+    mock_runner = AsyncMock(return_value=summary_with_wait)
+    config = CrawlerConfig()
+    target = {"start_month": "2025-04", "start_id": 1, "end_month": "2025-04", "end_id": 2, "folder": "datasets/t1"}
+    
+    logs = []
+    monkeypatch.setattr("crawler.queue.log", lambda msg: logs.append(msg))
+    results = await run_range_queue(config, [target], runner=mock_runner)
+    assert len(results) == 1
+    assert any("Rate-limit stall: 50.0s" in m and "Effective crawl: 70.0s" in m for m in logs)
+

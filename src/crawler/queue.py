@@ -209,6 +209,19 @@ async def run_range_queue(
         if completed:
             mark_target_completed(folder, summary if isinstance(summary, dict) else {})
 
+        if isinstance(summary, dict) and "api_wait_seconds" in summary:
+            api_wait = summary.get("api_wait_seconds", {})
+            wall = summary.get("wall_seconds", 0.0)
+            total_rl = api_wait.get("total_rate_limit_seconds", 0.0)
+            ax_rl = api_wait.get("arxiv", {}).get("rate_limit_seconds", 0.0)
+            s2_rl = api_wait.get("s2", {}).get("rate_limit_seconds", 0.0)
+            effective = api_wait.get("effective_crawler_seconds", max(0.0, wall - total_rl))
+            log(
+                f"Queue: [{folder}] Wall: {wall:.1f}s | "
+                f"Rate-limit stall: {total_rl:.1f}s (arXiv: {ax_rl:.1f}s, S2: {s2_rl:.1f}s) | "
+                f"Effective crawl: {effective:.1f}s"
+            )
+
         # Clean scratch SSD directory between targets
         clean_scratch_dir(target_config.paths.get("scratch_root", "scratch"))
 
