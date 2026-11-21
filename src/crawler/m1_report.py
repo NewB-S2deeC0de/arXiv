@@ -162,6 +162,13 @@ def prepare_report(export_dir, runtime_roots, output_dir, *, scan_storage=False)
                                if path.is_file())
     def rate(numerator, denominator):
         return numerator / denominator if denominator else None
+    total_rl = sum(row.get('api_wait_seconds', {}).get('total_rate_limit_seconds', 0.0) for row in runs.values())
+    ax_pacing = sum(row.get('api_wait_seconds', {}).get('arxiv', {}).get('pacing_seconds', 0.0) for row in runs.values())
+    ax_rl = sum(row.get('api_wait_seconds', {}).get('arxiv', {}).get('rate_limit_seconds', 0.0) for row in runs.values())
+    s2_pacing = sum(row.get('api_wait_seconds', {}).get('s2', {}).get('pacing_seconds', 0.0) for row in runs.values())
+    s2_rl = sum(row.get('api_wait_seconds', {}).get('s2', {}).get('rate_limit_seconds', 0.0) for row in runs.values())
+    effective_crawler_seconds = max(0.0, (active_wall or 0.0) - total_rl) if active_wall is not None else None
+    effective_throughput = (manifest['papers'] / (effective_crawler_seconds / 3600.0)) if (effective_crawler_seconds and effective_crawler_seconds > 0) else None
     output = {
         'provenance': {'export_run_id': manifest.get('run_id'),
                        'export_manifest_sha256': digest(export_dir / 'manifest.json'),
@@ -205,7 +212,14 @@ def prepare_report(export_dir, runtime_roots, output_dir, *, scan_storage=False)
                         'export_snapshot_logical_bytes': export_logical_bytes,
                         'paper_observed_span_mean_seconds': _mean(list(per_paper.values())),
                         'paper_observed_span_sample_count': len(per_paper),
-                        'discovery_observed_span_seconds': sum(discovery_spans) if discovery_spans else None},
+                        'discovery_observed_span_seconds': sum(discovery_spans) if discovery_spans else None,
+                        'api_wait_seconds': {
+                            'arxiv': {'pacing_seconds': ax_pacing, 'rate_limit_seconds': ax_rl},
+                            's2': {'pacing_seconds': s2_pacing, 'rate_limit_seconds': s2_rl},
+                            'total_rate_limit_seconds': total_rl,
+                            'effective_crawler_seconds': effective_crawler_seconds,
+                        },
+                        'effective_crawler_throughput_per_hour': effective_throughput},
         'limitations': [
             'Version reference correspondence with arXiv revisions is unverified.',
             'Source unpacked_bytes includes all archive members; kept_bytes includes only .tex/.bib.',

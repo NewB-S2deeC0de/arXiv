@@ -53,17 +53,19 @@ class Scheduler:
     async def io(self,function,*args,**kwargs):
         if self.io_worker: return await self.io_worker.call(function,*args,**kwargs)
         return function(*args,**kwargs)
-    async def wait(self,deadline,job=None,reason='service_cooldown',jobs=None,service=None):
+    async def wait(self,deadline,job=None,reason='service_cooldown',jobs=None,service=None,wait_category=None):
+        if wait_category is None:
+            wait_category = 'rate_limit' if reason in ('service_cooldown', 'retry') else 'pacing'
         remaining = deadline - self.now()
         if remaining > 3.0:
             svc_tag = f'[{service}] ' if service else ''
             log(f'Scheduler: {svc_tag}waiting {remaining:.1f}s ({reason})')
         while self.now()+1e-9<deadline:
             duration=min(30,deadline-self.now())
-            await self.event_async('waiting',job=job,jobs=jobs,reason=reason,remaining_seconds=deadline-self.now())
+            await self.event_async('waiting',job=job,jobs=jobs,reason=reason,remaining_seconds=deadline-self.now(),service=service,wait_category=wait_category)
             before=time.monotonic()
             await self.sleep(duration)
-            await self.event_async('wait_end',job=job,jobs=jobs,reason=reason,seconds=time.monotonic()-before)
+            await self.event_async('wait_end',job=job,jobs=jobs,reason=reason,seconds=time.monotonic()-before,service=service,wait_category=wait_category)
     async def request(self, key, service, url, params=None, target=None, validate=None,method='GET',json_body=None):
         if service in self.stopped:
             return None
@@ -98,7 +100,7 @@ class Scheduler:
                 if service == 's2' and not self.api_key and len(state['recent'])>=net['s2_anonymous_window_requests']:
                     deadline = max(
                         deadline, state['recent'][0] + net['s2_anonymous_window_seconds'])
-                await self.wait(deadline, primary_key,jobs=batch_keys,service=service)
+                await self.wait(deadline, primary_key,jobs=batch_keys,service=service,wait_category='rate_limit' if deadline > self.now() else 'pacing')
                 await self.store_call('start_attempts',batch_keys)
                 if service == 's2':
                     state['recent'].append(self.now())
@@ -115,14 +117,24 @@ class Scheduler:
                 try:
                     if service=='arxiv':
                         while self.monotonic()+1e-9<self.arxiv_next_send or self.now()+1e-9<deadline:
-                            remaining=max(self.arxiv_next_send-self.monotonic(),deadline-self.now(),0)
-                            await self.wait(self.now()+remaining,primary_key,reason='service_cooldown',jobs=batch_keys,service=service)
+                            if self.now()+1e-9<deadline:
+                                remaining=max(deadline-self.now(),0)
+                                cat='rate_limit'; rsn='service_cooldown'
+                            else:
+                                remaining=max(self.arxiv_next_send-self.monotonic(),0)
+                                cat='pacing'; rsn='dispatch_pacing'
+                            await self.wait(self.now()+remaining,primary_key,reason=rsn,jobs=batch_keys,service=service,wait_category=cat)
                         sent_at=self.now()
                     elif service=='s2':
                         # Check again AFTER durable writes/logging; their latency can vary.
                         while self.monotonic()+1e-9<self.s2_next_send or self.now()+1e-9<deadline:
-                            remaining=max(self.s2_next_send-self.monotonic(),deadline-self.now(),0)
-                            await self.wait(self.now()+remaining,primary_key,reason='dispatch_pacing',jobs=batch_keys,service=service)
+                            if self.now()+1e-9<deadline:
+                                remaining=max(deadline-self.now(),0)
+                                cat='rate_limit'; rsn='service_cooldown'
+                            else:
+                                remaining=max(self.s2_next_send-self.monotonic(),0)
+                                cat='pacing'; rsn='dispatch_pacing'
+                            await self.wait(self.now()+remaining,primary_key,reason=rsn,jobs=batch_keys,service=service,wait_category=cat)
                         sent_at=self.now()
                         state['recent'][-1]=sent_at
                     async with self.client.stream(method,url,params=params,json=json_body,headers=headers,follow_redirects=False) as response:
