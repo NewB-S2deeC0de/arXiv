@@ -41,3 +41,27 @@ def test_scheduler_emits_wait_category(tmp_path):
     assert wait_ends[0]["wait_category"] == "pacing"
     assert wait_ends[1]["service"] == "arxiv"
     assert wait_ends[1]["wait_category"] == "rate_limit"
+
+from crawler.metrics import MetricsRecorder
+
+def test_metrics_aggregates_api_wait_seconds(tmp_path):
+    config = CrawlerConfig()
+    config.paths["persistent_root"] = str(tmp_path)
+    metrics = MetricsRecorder(config, auth_mode="key")
+    metrics.start("run-1")
+
+    metrics.record("wait_end", service="arxiv", wait_category="pacing", seconds=10.5)
+    metrics.record("wait_end", service="arxiv", wait_category="rate_limit", seconds=60.0)
+    metrics.record("wait_end", service="s2", wait_category="pacing", seconds=5.0)
+    metrics.record("wait_end", service="s2", wait_category="rate_limit", seconds=120.0)
+
+    summary = metrics.stop(store=None)
+    api_wait = summary["api_wait_seconds"]
+    assert api_wait["arxiv"]["pacing_seconds"] == pytest.approx(10.5)
+    assert api_wait["arxiv"]["rate_limit_seconds"] == pytest.approx(60.0)
+    assert api_wait["s2"]["pacing_seconds"] == pytest.approx(5.0)
+    assert api_wait["s2"]["rate_limit_seconds"] == pytest.approx(120.0)
+    assert api_wait["total_rate_limit_seconds"] == pytest.approx(180.0)
+    assert "effective_crawler_seconds" in api_wait
+    assert "total_pacing_seconds" not in api_wait
+    assert "total_wait_seconds" not in api_wait

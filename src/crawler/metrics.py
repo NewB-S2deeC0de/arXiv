@@ -34,6 +34,34 @@ class MetricsRecorder:
     def __init__(self,config,auth_mode='anonymous'):
         self.config=config; self.root=Path(config.paths['persistent_root']); self.auth_mode=auth_mode
         self.samples=[]; self.paper_start={}; self.paper_end={}; self.disk_bytes=0; self.last_disk=-float('inf'); self.task=None; self.durations={}
+        self.api_wait={'arxiv':{'pacing':0.0,'rate_limit':0.0},'s2':{'pacing':0.0,'rate_limit':0.0}}
+
+    def format_api_wait(self, wall_seconds, previous=None):
+        prev = previous or []
+        prev_ax_pacing = sum(r.get('api_wait_seconds', {}).get('arxiv', {}).get('pacing_seconds', 0.0) for r in prev)
+        prev_ax_rl = sum(r.get('api_wait_seconds', {}).get('arxiv', {}).get('rate_limit_seconds', 0.0) for r in prev)
+        prev_s2_pacing = sum(r.get('api_wait_seconds', {}).get('s2', {}).get('pacing_seconds', 0.0) for r in prev)
+        prev_s2_rl = sum(r.get('api_wait_seconds', {}).get('s2', {}).get('rate_limit_seconds', 0.0) for r in prev)
+
+        ax_pacing = self.api_wait['arxiv']['pacing'] + prev_ax_pacing
+        ax_rl = self.api_wait['arxiv']['rate_limit'] + prev_ax_rl
+        s2_pacing = self.api_wait['s2']['pacing'] + prev_s2_pacing
+        s2_rl = self.api_wait['s2']['rate_limit'] + prev_s2_rl
+        total_rl = ax_rl + s2_rl
+        effective = max(0.0, wall_seconds - total_rl)
+
+        return {
+            'arxiv': {
+                'pacing_seconds': ax_pacing,
+                'rate_limit_seconds': ax_rl,
+            },
+            's2': {
+                'pacing_seconds': s2_pacing,
+                'rate_limit_seconds': s2_rl,
+            },
+            'total_rate_limit_seconds': total_rl,
+            'effective_crawler_seconds': effective,
+        }
     def start(self,run_id):
         console_log('Metrics: creating log and resource files')
         self.run_id=run_id; self.started=time.monotonic(); self.started_at=utc_now()
@@ -58,6 +86,12 @@ class MetricsRecorder:
         row=dict(event=event,run_id=self.run_id,utc=utc_now(),elapsed_seconds=time.monotonic()-self.started,**fields)
         self.log.write(json.dumps(row,ensure_ascii=False)+'\n'); self.log.flush()
         if 'seconds' in fields: self.durations[event]=self.durations.get(event,0)+fields['seconds']
+        if event == 'wait_end':
+            svc = fields.get('service')
+            cat = fields.get('wait_category')
+            sec = fields.get('seconds', 0.0)
+            if svc in self.api_wait and cat in ('pacing', 'rate_limit'):
+                self.api_wait[svc][cat] += sec
         jobs=fields.get('jobs') or ([fields['job']] if fields.get('job') else [])
         for job in jobs:
             self.paper_start.setdefault(job[0],row['elapsed_seconds'])
@@ -73,7 +107,7 @@ class MetricsRecorder:
             for name in ('environment.json','checkpoint.json','resources.csv','paper_metrics.csv','summary.json'): self.disk.touch(self.directory/name)
             self.disk.touch(self.root/'logs'/self.run_id/'events.jsonl')
             self.last_disk=elapsed
-            atomic_json(self.directory/'checkpoint.json',dict(run_id=self.run_id,started_at=self.started_at,last_sample_at=utc_now(),wall_seconds=elapsed,incomplete=True,event_seconds=self.durations,disk_measurement_scope='session_touched_paths'))
+            atomic_json(self.directory/'checkpoint.json',dict(run_id=self.run_id,started_at=self.started_at,last_sample_at=utc_now(),wall_seconds=elapsed,incomplete=True,event_seconds=self.durations,api_wait_seconds=self.format_api_wait(elapsed),disk_measurement_scope='session_touched_paths'))
         self.disk_bytes=self.disk.total
         self.samples.append((elapsed,rss,self.disk_bytes))
         self.writer.writerow(dict(elapsed_seconds=elapsed,utc=utc_now(),rss_bytes=rss,disk_bytes=self.disk_bytes)); self.resources.flush()
@@ -117,7 +151,9 @@ class MetricsRecorder:
             except (OSError,ValueError): pass
         summary['incomplete']=incomplete
         summary['event_seconds']=self.durations
-        summary['active_wall_seconds']=wall+sum(r.get('wall_seconds',0) for r in previous)
+        total_wall = wall+sum(r.get('wall_seconds',0) for r in previous)
+        summary['active_wall_seconds']=total_wall
+        summary['api_wait_seconds']=self.format_api_wait(total_wall, previous)
         summary['contributing_run_ids']=[r.get('run_id') for r in previous]+[self.run_id]
         summary['interrupted_run_ids']=interrupted
         starts=[r.get('started_at',self.started_at) for r in previous]+[self.started_at]
