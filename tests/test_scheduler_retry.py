@@ -102,7 +102,7 @@ def test_arxiv_dispatch_pacing(tmp_path):
             await scheduler.request(('2504.02523',0,'discovery',0),'arxiv','https://export.arxiv.org/api/query')
             await scheduler.request(('2504.02524',0,'discovery',0),'arxiv','https://export.arxiv.org/api/query')
         assert len(dispatch_times)==2
-        assert dispatch_times[1]-1001.5==pytest.approx(3.0)
+        assert dispatch_times[1]-1000.0==pytest.approx(3.0)
     asyncio.run(check())
 
 
@@ -140,8 +140,30 @@ def test_arxiv_validation_overlaps_pacing(tmp_path):
             await scheduler.request(('2504.02524', 0, 'discovery', 0), 'arxiv', 'https://export.arxiv.org/api/query')
         assert len(dispatch_times) == 2
         # Request 1 started at 1000.0, download finished at 1000.5.
-        # With overlapping validation, 3.0s cooldown starts at 1000.5, so Request 2 starts at 1003.5.
-        assert dispatch_times[1] == pytest.approx(1003.5)
+        # With overlapping pacing, next dispatch is max(1000.0 + 3.0, 1000.5) = 1003.0.
+        assert dispatch_times[1] == pytest.approx(1003.0)
     asyncio.run(check())
+
+
+def test_arxiv_slow_download_dispatches_immediately(tmp_path):
+    import pytest
+    async def check():
+        store = ProgressStore(tmp_path); store.initialize(['2504.02523', '2504.02524'])
+        clock = [1000.0]; dispatch_times = []
+        async def sleep(n): clock[0] += n
+        def handle(request):
+            dispatch_times.append(clock[0])
+            clock[0] += 4.0  # download takes 4.0s (> 3.0s gap)
+            return httpx.Response(200, content=b'<feed></feed>')
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            scheduler = Scheduler(CrawlerConfig(), store, client, now=lambda: clock[0], monotonic=lambda: clock[0], sleep=sleep)
+            await scheduler.request(('2504.02523', 0, 'discovery', 0), 'arxiv', 'https://export.arxiv.org/api/query')
+            await scheduler.request(('2504.02524', 0, 'discovery', 0), 'arxiv', 'https://export.arxiv.org/api/query')
+        assert len(dispatch_times) == 2
+        # Request 1 started at 1000.0, download finished at 1004.0.
+        # Since 1004.0 >= 1000.0 + 3.0, next request dispatches immediately at 1004.0.
+        assert dispatch_times[1] == pytest.approx(1004.0)
+    asyncio.run(check())
+
 
 

@@ -114,3 +114,31 @@ def test_export_and_report_include_api_wait_seconds(tmp_path):
     export_target = tmp_path / "exports" / "export-test-1"
     run_metrics = json.loads((export_target / "run_metrics.json").read_text())
     assert run_metrics[0]["api_wait_seconds"]["total_rate_limit_seconds"] == pytest.approx(1800.0)
+
+
+def test_normal_crawl_emits_pacing_not_rate_limit(tmp_path):
+    from crawler.progress import ProgressStore
+    import httpx
+    async def check():
+        store = ProgressStore(tmp_path); store.initialize(['2504.02523', '2504.02524'])
+        clock = [1000.0]
+        async def sleep(n): clock[0] += n
+        events = []
+        metrics = MagicMock()
+        metrics.record.side_effect = lambda name, **fields: events.append((name, fields))
+
+        def handle(request):
+            clock[0] += 1.0  # 1.0s download
+            return httpx.Response(200, content=b'<feed></feed>')
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            scheduler = Scheduler(CrawlerConfig(), store, client, now=lambda: clock[0], monotonic=lambda: clock[0], sleep=sleep, metrics=metrics)
+            await scheduler.request(('2504.02523', 0, 'discovery', 0), 'arxiv', 'https://export.arxiv.org/api/query')
+            await scheduler.request(('2504.02524', 0, 'discovery', 0), 'arxiv', 'https://export.arxiv.org/api/query')
+
+        wait_ends = [e[1] for e in events if e[0] == 'wait_end']
+        # The inter-request spacing must be categorized as pacing, not rate_limit
+        assert any(w.get('service') == 'arxiv' and w.get('wait_category') == 'pacing' for w in wait_ends)
+        assert not any(w.get('service') == 'arxiv' and w.get('wait_category') == 'rate_limit' for w in wait_ends)
+    anyio.run(check)
+
