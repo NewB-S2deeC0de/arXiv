@@ -819,3 +819,25 @@ def test_two_version_same_key_different_doi_remaps_content(tmp_path, make_source
     canonical = {item['canonical_key'] for item in mapping if item['old_key'] == 'same'}
     assert keys == {f'Version-specific result \\cite{{{key}}}.'
                     for key in canonical}
+
+
+def test_multiprocessing_workers_parses_multiple_publications(tmp_path, make_source):
+    root = tmp_path / 'runtime'
+    for aid in ('2411.00001', '2411.00002', '2411.00003'):
+        make_source(root, aid, 1, {
+            'main.tex': r'\documentclass{article}\begin{document}\section{Intro}Hello world\end{document}',
+        }, 'succeeded')
+
+    log = []
+    manifest = run_parser(root, workers=2, log=log.append)
+    assert manifest['papers_total'] == 3
+    assert manifest['papers_processed'] == 3
+    assert manifest['versions']['versions_parsed'] == 3
+    assert (root / 'parsed' / 'elements.parquet').exists()
+    assert (root / 'parsed' / 'checkpoint.json').exists()
+
+    # Resume with workers=2 should skip all processed
+    log_resume = []
+    manifest_resume = run_parser(root, workers=2, resume=True, log=log_resume.append)
+    assert manifest_resume['papers_processed'] == 3
+    assert len([line for line in log_resume if 'skip' in line]) == 3

@@ -8,6 +8,7 @@ merged by streaming the per-publication shards.
 from __future__ import annotations
 
 import csv
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -837,6 +838,87 @@ def _max_rss_bytes() -> int | None:
     return usage if platform.system() == 'Darwin' else usage * 1024
 
 
+_WORKER_SERVICES = None
+
+
+def _get_worker_services(custom_services: ParserServices | None = None) -> ParserServices:
+    global _WORKER_SERVICES
+    if custom_services is not None:
+        return custom_services
+    if _WORKER_SERVICES is None:
+        _WORKER_SERVICES = load_services()
+    return _WORKER_SERVICES
+
+
+def _worker_process_publication(payload: dict) -> dict:
+    """Worker task executed in a worker process for a single publication."""
+    arxiv_id = payload['arxiv_id']
+    paper_dir = Path(payload['paper_dir'])
+    parts_root = Path(payload['parts_root'])
+    include_partial = payload['include_partial']
+    selected_bib_files = payload.get('selected_bib_files')
+    approved_metadata_candidates = payload.get('approved_metadata_candidates')
+    services = _get_worker_services(payload.get('services'))
+
+    records = [read_source_record(arxiv_id, version, paper_dir / 'versions' / f'v{version}')
+               for version in version_numbers(paper_dir)]
+    input_fingerprint = _publication_input_fingerprint(
+        arxiv_id, records, selected_bib_files=selected_bib_files,
+        approved_metadata_candidates=approved_metadata_candidates)
+    policy_fingerprint = _policy_fingerprint(include_partial, services)
+
+    cached_info = payload.get('cached_info')
+    if (cached_info is not None
+            and _shards_exist(parts_root, arxiv_id)
+            and cached_info.get('input_fingerprint') == input_fingerprint
+            and cached_info.get('policy_fingerprint') == policy_fingerprint):
+        return {
+            'arxiv_id': arxiv_id,
+            'skipped': True,
+            'records_count': len(records),
+            'input_fingerprint': input_fingerprint,
+            'policy_fingerprint': policy_fingerprint,
+            'stats': cached_info.get('stats'),
+            'errors': cached_info.get('errors', []),
+            'warnings': cached_info.get('warnings', []),
+            'seconds': 0.0,
+        }
+
+    publication_started = time.perf_counter()
+    try:
+        stats, errors, warnings, rows, audit = _process_publication(
+            arxiv_id, records, services, include_partial=include_partial,
+            selected_bib_files=selected_bib_files,
+            approved_metadata_candidates=approved_metadata_candidates,
+        )
+        stats['seconds'] = round(time.perf_counter() - publication_started, 3)
+        _write_shards(parts_root, arxiv_id, rows, audit)
+        return {
+            'arxiv_id': arxiv_id,
+            'skipped': False,
+            'records_count': len(records),
+            'input_fingerprint': input_fingerprint,
+            'policy_fingerprint': policy_fingerprint,
+            'stats': stats,
+            'errors': errors,
+            'warnings': warnings,
+            'seconds': stats['seconds'],
+        }
+    except Exception as exc:
+        elapsed = round(time.perf_counter() - publication_started, 3)
+        return {
+            'arxiv_id': arxiv_id,
+            'skipped': False,
+            'records_count': len(records),
+            'input_fingerprint': input_fingerprint,
+            'policy_fingerprint': policy_fingerprint,
+            'stats': dict(seconds=elapsed),
+            'errors': [dict(arxiv_id=arxiv_id, stage='process', error=f'{type(exc).__name__}:{exc}')],
+            'warnings': [],
+            'seconds': elapsed,
+        }
+
+
 def _tree_bytes(path: Path) -> int:
     return sum(item.stat().st_size for item in path.rglob('*') if item.is_file())
 
@@ -849,7 +931,8 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
                services: ParserServices | None = None,
                include_partial: bool = False,
                selected_bib_files: dict | None = None,
-               approved_metadata_candidates: dict | None = None) -> dict:
+               approved_metadata_candidates: dict | None = None,
+               workers: int | None = 1) -> dict:
     """Parse all Milestone 1 publications and write the three M2 tables.
 
     ``services`` injects the A1/A2/A3/B1/B2/B3 boundary. When omitted, the real
@@ -906,38 +989,71 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
     dirty = False
     flush_every = 25
     total_publications = len(publication_entries)
-    for index, (arxiv_id, paper_dir) in enumerate(publication_entries, start=1):
-        records = [read_source_record(arxiv_id, version, paper_dir / 'versions' / f'v{version}')
-                   for version in version_numbers(paper_dir)]
-        input_fingerprint = _publication_input_fingerprint(
-            arxiv_id, records, selected_bib_files=selected_bib_files,
-            approved_metadata_candidates=approved_metadata_candidates)
-        if (resume_effective and arxiv_id in processed
-                and _shards_exist(parts_root, arxiv_id)
-                and processed[arxiv_id].get('input_fingerprint') == input_fingerprint
-                and processed[arxiv_id].get('policy_fingerprint') == policy_fingerprint):
+    num_workers = int(workers) if workers is not None and workers > 0 else 1
+
+    if num_workers <= 1:
+        for index, (arxiv_id, paper_dir) in enumerate(publication_entries, start=1):
+            payload = {
+                'arxiv_id': arxiv_id,
+                'paper_dir': str(paper_dir),
+                'parts_root': str(parts_root),
+                'include_partial': include_partial,
+                'selected_bib_files': selected_bib_files,
+                'approved_metadata_candidates': approved_metadata_candidates,
+                'services': services,
+                'cached_info': processed.get(arxiv_id) if resume_effective else None,
+            }
+            res = _worker_process_publication(payload)
+            if res['skipped']:
+                if log:
+                    log(f'[{index}/{total_publications}] skip {arxiv_id} (checkpoint)')
+                continue
             if log:
-                log(f'[{index}/{total_publications}] skip {arxiv_id} (checkpoint)')
-            continue
-        if log:
-            log(f'[{index}/{total_publications}] parse {arxiv_id} ({len(records)} versions)')
-        publication_started = time.perf_counter()
-        stats, errors, warnings, rows, audit = _process_publication(
-            arxiv_id, records, services, include_partial=include_partial,
-            selected_bib_files=selected_bib_files,
-            approved_metadata_candidates=approved_metadata_candidates,
-        )
-        stats['seconds'] = round(time.perf_counter() - publication_started, 3)
-        _write_shards(parts_root, arxiv_id, rows, audit)
-        processed[arxiv_id] = dict(stats=stats, errors=errors, warnings=warnings,
-                                   input_fingerprint=input_fingerprint,
-                                   policy_fingerprint=policy_fingerprint)
-        dirty = True
-        if index % flush_every == 0 or index == total_publications:
-            checkpoint['processed'] = processed
-            checkpoint['errors'] = [error for item in processed.values() for error in item.get('errors', [])]
-            _atomic_json(checkpoint_path, checkpoint)
-            dirty = False
+                log(f'[{index}/{total_publications}] parse {arxiv_id} ({res["records_count"]} versions)')
+            processed[arxiv_id] = dict(stats=res['stats'], errors=res['errors'], warnings=res['warnings'],
+                                       input_fingerprint=res['input_fingerprint'],
+                                       policy_fingerprint=res['policy_fingerprint'])
+            dirty = True
+            if index % flush_every == 0 or index == total_publications:
+                checkpoint['processed'] = processed
+                checkpoint['errors'] = [error for item in processed.values() for error in item.get('errors', [])]
+                _atomic_json(checkpoint_path, checkpoint)
+                dirty = False
+    else:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+            future_to_pub = {
+                executor.submit(_worker_process_publication, {
+                    'arxiv_id': arxiv_id,
+                    'paper_dir': str(paper_dir),
+                    'parts_root': str(parts_root),
+                    'include_partial': include_partial,
+                    'selected_bib_files': selected_bib_files,
+                    'approved_metadata_candidates': approved_metadata_candidates,
+                    'services': services,
+                    'cached_info': processed.get(arxiv_id) if resume_effective else None,
+                }): (index, arxiv_id)
+                for index, (arxiv_id, paper_dir) in enumerate(publication_entries, start=1)
+            }
+            completed_count = 0
+            for future in concurrent.futures.as_completed(future_to_pub):
+                index, arxiv_id = future_to_pub[future]
+                completed_count += 1
+                res = future.result()
+                if res['skipped']:
+                    if log:
+                        log(f'[{completed_count}/{total_publications}] skip {arxiv_id} (checkpoint)')
+                    continue
+                if log:
+                    log(f'[{completed_count}/{total_publications}] parse {arxiv_id} ({res["records_count"]} versions)')
+                processed[arxiv_id] = dict(stats=res['stats'], errors=res['errors'], warnings=res['warnings'],
+                                           input_fingerprint=res['input_fingerprint'],
+                                           policy_fingerprint=res['policy_fingerprint'])
+                dirty = True
+                if completed_count % flush_every == 0 or completed_count == total_publications:
+                    checkpoint['processed'] = processed
+                    checkpoint['errors'] = [error for item in processed.values() for error in item.get('errors', [])]
+                    _atomic_json(checkpoint_path, checkpoint)
+                    dirty = False
     if dirty:
         checkpoint['processed'] = processed
         checkpoint['errors'] = [error for item in processed.values() for error in item.get('errors', [])]
