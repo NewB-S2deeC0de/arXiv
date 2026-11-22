@@ -57,7 +57,7 @@ class Scheduler:
         if wait_category is None:
             wait_category = 'rate_limit' if reason in ('service_cooldown', 'retry') else 'pacing'
         remaining = deadline - self.now()
-        if remaining > 3.0:
+        if remaining > 3.0 and reason not in ('dispatch_pacing', 'pacing'):
             svc_tag = f'[{service}] ' if service else ''
             log(f'Scheduler: {svc_tag}waiting {remaining:.1f}s ({reason})')
         while self.now()+1e-9<deadline:
@@ -100,7 +100,8 @@ class Scheduler:
                 if service == 's2' and not self.api_key and len(state['recent'])>=net['s2_anonymous_window_requests']:
                     deadline = max(
                         deadline, state['recent'][0] + net['s2_anonymous_window_seconds'])
-                await self.wait(deadline, primary_key,jobs=batch_keys,service=service,wait_category='rate_limit' if deadline > self.now() else 'pacing')
+                if deadline > self.now():
+                    await self.wait(deadline, primary_key, jobs=batch_keys, service=service, wait_category='rate_limit', reason='service_cooldown')
                 await self.store_call('start_attempts',batch_keys)
                 if service == 's2':
                     state['recent'].append(self.now())
@@ -114,6 +115,7 @@ class Scheduler:
                 started=time.monotonic()
                 await emit('request_start',job = primary_key, service=service,attempt=(await self.store_call('get',primary_key))['attempts'],journal_directory_sync=self.store.journal.directory_sync_supported)
                 sent_at=self.now()
+                sent_mono=self.monotonic()
                 try:
                     if service=='arxiv':
                         while self.monotonic()+1e-9<self.arxiv_next_send or self.now()+1e-9<deadline:
@@ -125,6 +127,7 @@ class Scheduler:
                                 cat='pacing'; rsn='dispatch_pacing'
                             await self.wait(self.now()+remaining,primary_key,reason=rsn,jobs=batch_keys,service=service,wait_category=cat)
                         sent_at=self.now()
+                        sent_mono=self.monotonic()
                     elif service=='s2':
                         # Check again AFTER durable writes/logging; their latency can vary.
                         while self.monotonic()+1e-9<self.s2_next_send or self.now()+1e-9<deadline:
@@ -136,6 +139,7 @@ class Scheduler:
                                 cat='pacing'; rsn='dispatch_pacing'
                             await self.wait(self.now()+remaining,primary_key,reason=rsn,jobs=batch_keys,service=service,wait_category=cat)
                         sent_at=self.now()
+                        sent_mono=self.monotonic()
                         state['recent'][-1]=sent_at
                     async with self.client.stream(method,url,params=params,json=json_body,headers=headers,follow_redirects=False) as response:
                         code=response.status_code
@@ -222,7 +226,6 @@ class Scheduler:
                                 )
                             if service=='s2':
                                 self.s2_next_send=self.monotonic()+gap
-                                state['deadline']=max(state['deadline'],self.now()+gap)
                             return result
                         elif code not in (408,429) and code<500:
                             if code in (401,403):
@@ -239,13 +242,13 @@ class Scheduler:
                     code=0
                     error_code = PAYLOAD_CODES.get(str(exc),'payload_'+type(exc).__name__)
                 finally:
-                    if service!='s2':
-                        finished_at = download_finished_at or self.now()
-                        finished_mono = download_finished_mono or self.monotonic()
-                        state['deadline'] = max(state['deadline'], finished_at+gap)
-                        self.arxiv_next_send = finished_mono+gap
-                    # Cleared only when the actual dispatch timestamp/cooldown is persisted.
-                    if service=='s2': state['dispatch_pending']=False
+                    finished_mono = download_finished_mono or self.monotonic()
+                    if service == 'arxiv':
+                        self.arxiv_next_send = max(sent_mono + gap, finished_mono)
+                    elif service == 's2':
+                        if code != 200:
+                            self.s2_next_send = max(sent_mono + gap, finished_mono)
+                        state['dispatch_pending'] = False
                     await self.persist_async()
                     await emit(
                         'request_end', job=primary_key,
