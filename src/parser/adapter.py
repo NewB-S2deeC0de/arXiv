@@ -109,11 +109,18 @@ def read_source_record(arxiv_id: str, version: int, version_dir: Path) -> Source
                             error=str(exc))
 
     tex_dir = source_dir / 'tex'
-    tex_files = tuple(sorted(tex_dir.rglob('*.tex'))) if tex_dir.is_dir() else ()
-    bib_files = tuple(sorted(tex_dir.rglob('*.bib'))) if tex_dir.is_dir() else ()
+    tex_files: list[Path] = []
+    bib_files: list[Path] = []
+    if tex_dir.is_dir():
+        for path in tex_dir.rglob('*'):
+            if path.is_file():
+                if path.suffix == '.tex':
+                    tex_files.append(path)
+                elif path.suffix == '.bib':
+                    bib_files.append(path)
     resolved = SourceStatus.SUCCEEDED if status == 'succeeded' else SourceStatus.NO_TEX
     return SourceRecord(arxiv_id, version, resolved, source_dir,
-                        tex_files=tex_files, bib_files=bib_files)
+                        tex_files=tuple(sorted(tex_files)), bib_files=tuple(sorted(bib_files)))
 
 
 def iter_source_records(persistent_root: str | Path, *, limit: int | None = None):

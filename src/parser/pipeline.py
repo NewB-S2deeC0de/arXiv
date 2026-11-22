@@ -25,7 +25,7 @@ import pyarrow.parquet as pq
 
 from crawler.storage import digest
 
-from .adapter import publications_with_records
+from .adapter import list_publications, read_source_record, version_numbers
 from .contract import (BIBTEX_SCHEMA, ELEMENTS_SCHEMA, HIERARCHY_SCHEMA,
                        GatheredSource, GatherError, ParsedDocument,
                        ParserServices, SourceStatus, TreeNode, VersionInput,
@@ -870,9 +870,11 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
 
     started_at = datetime.now(timezone.utc)
     started = time.perf_counter()
-    publications = publications_with_records(root, limit=limit)
-    input_ids = [arxiv_id for arxiv_id, _ in publications]
-    if services is None and publications:
+    publication_entries = list_publications(root)
+    if limit is not None:
+        publication_entries = publication_entries[:limit]
+    input_ids = [arxiv_id for arxiv_id, _ in publication_entries]
+    if services is None and publication_entries:
         services = load_services()
 
     # A service without a reliable fingerprint cannot prove that cached shards
@@ -903,7 +905,10 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
 
     dirty = False
     flush_every = 25
-    for index, (arxiv_id, records) in enumerate(publications, start=1):
+    total_publications = len(publication_entries)
+    for index, (arxiv_id, paper_dir) in enumerate(publication_entries, start=1):
+        records = [read_source_record(arxiv_id, version, paper_dir / 'versions' / f'v{version}')
+                   for version in version_numbers(paper_dir)]
         input_fingerprint = _publication_input_fingerprint(
             arxiv_id, records, selected_bib_files=selected_bib_files,
             approved_metadata_candidates=approved_metadata_candidates)
@@ -912,10 +917,10 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
                 and processed[arxiv_id].get('input_fingerprint') == input_fingerprint
                 and processed[arxiv_id].get('policy_fingerprint') == policy_fingerprint):
             if log:
-                log(f'[{index}/{len(publications)}] skip {arxiv_id} (checkpoint)')
+                log(f'[{index}/{total_publications}] skip {arxiv_id} (checkpoint)')
             continue
         if log:
-            log(f'[{index}/{len(publications)}] parse {arxiv_id} ({len(records)} versions)')
+            log(f'[{index}/{total_publications}] parse {arxiv_id} ({len(records)} versions)')
         publication_started = time.perf_counter()
         stats, errors, warnings, rows, audit = _process_publication(
             arxiv_id, records, services, include_partial=include_partial,
@@ -928,7 +933,7 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
                                    input_fingerprint=input_fingerprint,
                                    policy_fingerprint=policy_fingerprint)
         dirty = True
-        if index % flush_every == 0 or index == len(publications):
+        if index % flush_every == 0 or index == total_publications:
             checkpoint['processed'] = processed
             checkpoint['errors'] = [error for item in processed.values() for error in item.get('errors', [])]
             _atomic_json(checkpoint_path, checkpoint)
@@ -977,7 +982,7 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
         'persistent_root': str(root),
         'output_root': str(output),
         'limit': limit,
-        'papers_total': len(publications),
+        'papers_total': len(publication_entries),
         'papers_processed': len(processed),
         'versions': {key: aggregate[key] for key in (
             'versions_total', 'versions_parsed', 'versions_empty',
