@@ -821,6 +821,17 @@ def test_two_version_same_key_different_doi_remaps_content(tmp_path, make_source
                     for key in canonical}
 
 
+class SlowServices(FakeServices):
+    def parse_document(self, gathered, arxiv_id, version):
+        if arxiv_id == '2411.00002':
+            import time
+            time.sleep(3)
+        return super().parse_document(gathered, arxiv_id, version)
+
+    def cache_fingerprint(self):
+        return 'slow-services-v1'
+
+
 def test_multiprocessing_workers_parses_multiple_publications(tmp_path, make_source):
     root = tmp_path / 'runtime'
     for aid in ('2411.00001', '2411.00002', '2411.00003'):
@@ -841,3 +852,48 @@ def test_multiprocessing_workers_parses_multiple_publications(tmp_path, make_sou
     manifest_resume = run_parser(root, workers=2, resume=True, log=log_resume.append)
     assert manifest_resume['papers_processed'] == 3
     assert len([line for line in log_resume if 'skip' in line]) == 3
+
+
+def test_publication_timeout_skips_and_records_error(tmp_path, make_source):
+    root = tmp_path / 'runtime'
+    make_source(root, '2411.00001', 1, {
+        'main.tex': r'\documentclass{article}\begin{document}\section{Intro}Fast paper\end{document}',
+    }, 'succeeded')
+    make_source(root, '2411.00002', 1, {
+        'main.tex': r'\documentclass{article}\begin{document}\section{Intro}Slow paper\end{document}',
+    }, 'succeeded')
+
+    log = []
+    manifest = run_parser(
+        root,
+        services=SlowServices(),
+        timeout_seconds=1,
+        workers=2,
+        log=log.append,
+    )
+    assert manifest['papers_total'] == 2
+    assert manifest['papers_processed'] == 2
+    assert manifest['versions']['versions_parsed'] == 1
+
+    errors_path = root / 'parsed' / 'errors.json'
+    assert errors_path.exists()
+    errors = json.loads(errors_path.read_text(encoding='utf8'))
+    timeout_errors = [e for e in errors if e.get('arxiv_id') == '2411.00002' and 'timeout' in e.get('error', '').lower()]
+    assert len(timeout_errors) == 1
+
+    assert any('TIMED OUT' in line and '2411.00002' in line for line in log), log
+
+    # Resume should skip both the succeeded and the timed-out publication without hanging
+    log_resume = []
+    manifest_resume = run_parser(
+        root,
+        services=SlowServices(),
+        timeout_seconds=1,
+        workers=2,
+        resume=True,
+        log=log_resume.append,
+    )
+    assert manifest_resume['papers_processed'] == 2
+    assert len([line for line in log_resume if 'skip' in line and 'checkpoint' in line]) == 2
+
+
