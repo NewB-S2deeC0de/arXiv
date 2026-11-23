@@ -799,6 +799,8 @@ def _merge_parts(parts_root: Path, output_root: Path, arxiv_ids) -> dict[str, in
         final = output_root / f'{name}.parquet'
         writer = pq.ParquetWriter(final, schema, compression='snappy')
         total = 0
+        buffer = []
+        buffered_rows = 0
         try:
             for part_dir in part_dirs:
                 part = part_dir / f'{name}.parquet'
@@ -806,9 +808,20 @@ def _merge_parts(parts_root: Path, output_root: Path, arxiv_ids) -> dict[str, in
                     continue
                 table = pq.ParquetFile(part).read()
                 total += table.num_rows
-                writer.write_table(table)
+                buffer.append(table)
+                buffered_rows += table.num_rows
+                if buffered_rows >= 25000:
+                    writer.write_table(pa.concat_tables(buffer))
+                    buffer.clear()
+                    buffered_rows = 0
+            if buffer:
+                writer.write_table(pa.concat_tables(buffer))
+                buffer.clear()
         finally:
             writer.close()
+            import gc
+            pa.default_memory_pool().release_unused()
+            gc.collect()
         counts[name] = total
     return counts
 
@@ -888,6 +901,13 @@ def _worker_process_publication(payload: dict) -> dict:
             and _shards_exist(parts_root, arxiv_id)
             and cached_info.get('input_fingerprint') == input_fingerprint
             and cached_info.get('policy_fingerprint') == policy_fingerprint):
+        cached_warnings = cached_info.get('warnings')
+        if cached_warnings is None:
+            audit_path = parts_root / quote(arxiv_id, safe='') / 'audit.json'
+            if audit_path.is_file():
+                cached_warnings = _read_json(audit_path, {}).get('warnings', [])
+            else:
+                cached_warnings = []
         return {
             'arxiv_id': arxiv_id,
             'skipped': True,
@@ -896,7 +916,7 @@ def _worker_process_publication(payload: dict) -> dict:
             'policy_fingerprint': policy_fingerprint,
             'stats': cached_info.get('stats'),
             'errors': cached_info.get('errors', []),
-            'warnings': cached_info.get('warnings', []),
+            'warnings': cached_warnings,
             'seconds': 0.0,
         }
 
@@ -980,6 +1000,20 @@ def _worker_process_publication(payload: dict) -> dict:
 
 def _tree_bytes(path: Path) -> int:
     return sum(item.stat().st_size for item in path.rglob('*') if item.is_file())
+
+
+def _flush_checkpoint(checkpoint_path: Path, checkpoint: dict, processed: dict) -> None:
+    checkpoint['processed'] = {
+        arxiv_id: {
+            'stats': item['stats'],
+            'errors': item['errors'],
+            'input_fingerprint': item['input_fingerprint'],
+            'policy_fingerprint': item['policy_fingerprint'],
+        }
+        for arxiv_id, item in processed.items()
+    }
+    checkpoint['errors'] = [error for item in processed.values() for error in item.get('errors', [])]
+    _atomic_json(checkpoint_path, checkpoint)
 
 
 def run_parser(persistent_root: str | Path = 'runtime', *,
@@ -1079,9 +1113,7 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
                                        policy_fingerprint=res['policy_fingerprint'])
             dirty = True
             if index % flush_every == 0 or index == total_publications:
-                checkpoint['processed'] = processed
-                checkpoint['errors'] = [error for item in processed.values() for error in item.get('errors', [])]
-                _atomic_json(checkpoint_path, checkpoint)
+                _flush_checkpoint(checkpoint_path, checkpoint, processed)
                 dirty = False
     else:
         with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
@@ -1118,15 +1150,13 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
                                            policy_fingerprint=res['policy_fingerprint'])
                 dirty = True
                 if completed_count % flush_every == 0 or completed_count == total_publications:
-                    checkpoint['processed'] = processed
-                    checkpoint['errors'] = [error for item in processed.values() for error in item.get('errors', [])]
-                    _atomic_json(checkpoint_path, checkpoint)
+                    _flush_checkpoint(checkpoint_path, checkpoint, processed)
                     dirty = False
     if dirty:
-        checkpoint['processed'] = processed
-        checkpoint['errors'] = [error for item in processed.values() for error in item.get('errors', [])]
-        _atomic_json(checkpoint_path, checkpoint)
+        _flush_checkpoint(checkpoint_path, checkpoint, processed)
 
+    import gc
+    gc.collect()
     counts = _merge_parts(parts_root, output, input_ids)
     _write_coverage(output, processed)
     audits = _publication_audits(parts_root, input_ids)
