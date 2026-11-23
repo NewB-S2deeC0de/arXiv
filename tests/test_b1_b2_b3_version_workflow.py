@@ -369,6 +369,17 @@ class BibtexB3Tests(unittest.TestCase):
         self.assertTrue(all(r.eligible for r in result.records))
         self.assertEqual(len(result.groups),1)
 
+    def test_read_bibtex_with_allowed_keys_filters_entries(self):
+        raw = (
+            '@article{k1, title={Title 1}, year={2020}}\n'
+            '@article{k2, title={Title 2}, year={2021}}\n'
+            '@article{k3, title={Title 3}, year={2022}}\n'
+        )
+        result = read_bibtex(raw, allowed_keys={'k1', 'k3'})
+        self.assertEqual(len(result.entries), 2)
+        keys = {e.citation_key for e in result.entries}
+        self.assertEqual(keys, {'k1', 'k3'})
+
 
 if __name__ == '__main__':
     unittest.main()

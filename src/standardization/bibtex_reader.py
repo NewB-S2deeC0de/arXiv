@@ -10,6 +10,8 @@ from .models import SourceContext
 from .models import Diagnostic
 from .citations import _KEY
 
+_HEADER = re.compile(r'@([A-Za-z][A-Za-z0-9_-]*)\s*([({])')
+
 
 @dataclass(frozen=True)
 class BibtexField:
@@ -170,11 +172,13 @@ def _literal(raw, start, end):
     return None
 
 
-def read_bibtex(raw, *, source=None):
+def read_bibtex(raw, *, source=None, allowed_keys=None):
     """Read caller-supplied .bib text, retaining unsupported directives/values.
 
     Values preserve TeX spelling. Duplicated fields/keys remain separate records
     with diagnostics; callers must not silently convert fields to a dict.
+    When ``allowed_keys`` is provided, entries whose keys are not in ``allowed_keys``
+    are skipped without field parsing.
     """
     if not isinstance(raw, str):
         raise TypeError('raw must be str')
@@ -192,14 +196,24 @@ def read_bibtex(raw, *, source=None):
             pos = _skip(raw, pos, limit)
             continue
         if raw[pos] != '@':
-            pos += 1
-            continue
-        header = re.match(r'@([A-Za-z][A-Za-z0-9_-]*)\s*([({])', raw[pos:])
+            at = raw.find('@', pos)
+            if at == -1:
+                pos = limit
+                break
+            last_nl = raw.rfind('\n', pos, at)
+            line_start = 0 if last_nl == -1 else last_nl + 1
+            pct = raw.find('%', line_start, at)
+            if pct != -1:
+                nl = raw.find('\n', at)
+                pos = limit if nl == -1 else nl + 1
+                continue
+            pos = at
+        header = _HEADER.match(raw, pos)
         if header is None:
             warnings.append(Diagnostic('bibtex_invalid_header', 'Unrecognized @ header retained.', pos, pos + 1))
             pos += 1
             continue
-        opening = pos + header.end() - 1
+        opening = header.end() - 1
         end = _end(raw, opening, limit)
         if end is None:
             warnings.append(Diagnostic('bibtex_unclosed_record', 'Unclosed record; remaining raw retained without speculative recovery.', pos, limit))
@@ -216,6 +230,9 @@ def read_bibtex(raw, *, source=None):
             key_start = _skip(raw, key_start, key_end)
             key_raw = raw[key_start:key_end].strip()
             key = key_raw if _KEY.fullmatch(key_raw) and key_raw != '*' else None
+            if allowed_keys is not None and (key is None or key not in allowed_keys):
+                pos, gap = end, end
+                continue
             local, fields, names = [], [], set()
             if key is None:
                 local.append(Diagnostic('bibtex_invalid_key', 'Invalid key retained without exportable identity.', key_start, key_end))
