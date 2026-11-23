@@ -7,7 +7,7 @@ from .parser_adapter import (inspect_version_bibliography, _replace_fields)
 from .bibitem_metadata import extract_bibitem_metadata
 from .c_bibentry_adapter import prepare_c_bibentry
 from .reference_candidates import make_reference_occurrence
-from .citations import remap_citations
+from .citations import remap_citations, scan_citations
 from .bibtex_reader import BibtexReadResult, read_bibtex
 from .c_bibentry_adapter import prepare_bibtex_entry
 from .models import SourceContext
@@ -33,7 +33,8 @@ class PreparedVersionBibliography:
 
 
 def prepare_version_bibliography(hierarchy, gathered, *, source_texts=None,
-                                 source_dir=None, selected_bib_files=()):
+                                 source_dir=None, selected_bib_files=(),
+                                 allowed_keys=None):
     """Stage A3 bibitems and explicitly selected A1-listed BibTeX resources.
 
     Accept A1 GatheredVersion or C GatheredSource carrying its raw A1 result.
@@ -83,6 +84,23 @@ def prepare_version_bibliography(hierarchy, gathered, *, source_texts=None,
             metadata_results.append(metadata)
     resources = []
     if selected:
+        filter_keys = set(allowed_keys) if allowed_keys is not None else None
+        if filter_keys is None:
+            texts = []
+            if source_texts and hasattr(source_texts, 'values'):
+                texts.extend(source_texts.values())
+            elif hasattr(gathered, 'text') and gathered.text:
+                texts.append(gathered.text)
+            elif hasattr(gathered, 'segments') and gathered.segments:
+                texts.extend(s.raw for s in gathered.segments if hasattr(s, 'raw'))
+            if texts:
+                combined = '\n'.join(texts)
+                scan = scan_citations(combined)
+                if not any(c.wildcard for c in scan.citations):
+                    extracted = {k.value for c in scan.citations for k in c.keys if k.value is not None}
+                    if extracted:
+                        filter_keys = extracted
+
         root = Path(source_dir).resolve()
         inventory = set(gathered.bib_files)
         for name in selected:
@@ -104,7 +122,8 @@ def prepare_version_bibliography(hierarchy, gathered, *, source_texts=None,
                 resources.append(BibResourceRead(name, None, Diagnostic(
                     'bib_resource_read_failed', str(exc), 0, 0)))
                 continue
-            parsed = read_bibtex(raw, source=SourceContext(inspection.arxiv_id, inspection.version, name))
+            parsed = read_bibtex(raw, source=SourceContext(inspection.arxiv_id, inspection.version, name),
+                                 allowed_keys=filter_keys)
             resources.append(BibResourceRead(name, parsed))
             pieces = (SourceMapPiece(0, len(raw), MappedSourceSpan(name, 0, len(raw))),) if raw else ()
             source_map = RawSourceMap(raw, pieces)
