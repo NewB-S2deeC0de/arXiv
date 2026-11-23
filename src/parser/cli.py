@@ -21,6 +21,8 @@ def main() -> None:
                         help='Also export partial versions to the three tables')
     parser.add_argument('--workers', type=int, default=1,
                         help='Number of worker processes (default: 1)')
+    parser.add_argument('--timeout', type=int, default=180,
+                        help='Per-publication timeout in seconds (default: 180, 0 to disable)')
     parser.add_argument('--quiet', action='store_true', help='Do not print per-publication progress')
     args = parser.parse_args()
 
@@ -28,7 +30,8 @@ def main() -> None:
     manifest = run_parser(args.persistent_root, output_root=args.out, limit=args.limit,
                           resume=not args.no_resume, log=log,
                           include_partial=args.include_partial,
-                          workers=args.workers)
+                          workers=args.workers,
+                          timeout_seconds=args.timeout if args.timeout and args.timeout > 0 else None)
     summary = {key: manifest[key] for key in ('papers_processed', 'versions', 'elements', 'bibtex')}
     print(json.dumps(summary, indent=2, ensure_ascii=False))
 

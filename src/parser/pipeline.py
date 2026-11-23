@@ -14,6 +14,7 @@ import json
 import os
 import platform
 import shutil
+import signal
 import time
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
@@ -341,6 +342,8 @@ def _process_publication_legacy(arxiv_id: str, records, services: ParserServices
             errors.append(dict(arxiv_id=arxiv_id, version=record.version,
                                status='failed', error=f'gather:{exc}'))
             continue
+        except TimeoutError:
+            raise
         except Exception as exc:
             stats['gather_failed'] += 1
             stats['versions_failed'] += 1
@@ -382,6 +385,8 @@ def _process_publication_legacy(arxiv_id: str, records, services: ParserServices
     for version, gathered in gathered_versions:
         try:
             parsed = services.parse_document(gathered, arxiv_id, version)
+        except TimeoutError:
+            raise
         except Exception as exc:  # parser failures are reported, never silent success
             stats['versions_failed'] += 1
             errors.append(dict(arxiv_id=arxiv_id, version=version,
@@ -504,6 +509,8 @@ def _process_publication_b(arxiv_id: str, records, services: ParserServices, *,
             errors.append(dict(arxiv_id=arxiv_id, version=record.version,
                                status='failed', error=f'gather:{exc}'))
             continue
+        except TimeoutError:
+            raise
         except Exception as exc:
             stats['gather_failed'] += 1
             stats['versions_failed'] += 1
@@ -544,6 +551,8 @@ def _process_publication_b(arxiv_id: str, records, services: ParserServices, *,
     for version, gathered, source_dir in gathered_versions:
         try:
             parsed = services.parse_document(gathered, arxiv_id, version)
+        except TimeoutError:
+            raise
         except Exception as exc:
             stats['versions_failed'] += 1
             errors.append(dict(arxiv_id=arxiv_id, version=version,
@@ -619,6 +628,8 @@ def _process_publication_b(arxiv_id: str, records, services: ParserServices, *,
             include_partial=include_partial,
             approved_metadata_candidates=approved,
         )
+    except TimeoutError:
+        raise
     except Exception as exc:
         for version, _, _, _ in parsed_versions:
             if version in read_failed_versions:
@@ -850,6 +861,10 @@ def _get_worker_services(custom_services: ParserServices | None = None) -> Parse
     return _WORKER_SERVICES
 
 
+def _timeout_handler(signum, frame):
+    raise TimeoutError("Per-publication processing time limit exceeded")
+
+
 def _worker_process_publication(payload: dict) -> dict:
     """Worker task executed in a worker process for a single publication."""
     arxiv_id = payload['arxiv_id']
@@ -858,6 +873,7 @@ def _worker_process_publication(payload: dict) -> dict:
     include_partial = payload['include_partial']
     selected_bib_files = payload.get('selected_bib_files')
     approved_metadata_candidates = payload.get('approved_metadata_candidates')
+    timeout_seconds = payload.get('timeout_seconds')
     services = _get_worker_services(payload.get('services'))
 
     records = [read_source_record(arxiv_id, version, paper_dir / 'versions' / f'v{version}')
@@ -885,6 +901,16 @@ def _worker_process_publication(payload: dict) -> dict:
         }
 
     publication_started = time.perf_counter()
+    timer_set = False
+    old_handler = None
+    if timeout_seconds and hasattr(signal, 'SIGALRM'):
+        try:
+            old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+            signal.alarm(max(1, int(timeout_seconds)))
+            timer_set = True
+        except (ValueError, OSError):
+            pass
+
     try:
         stats, errors, warnings, rows, audit = _process_publication(
             arxiv_id, records, services, include_partial=include_partial,
@@ -896,6 +922,7 @@ def _worker_process_publication(payload: dict) -> dict:
         return {
             'arxiv_id': arxiv_id,
             'skipped': False,
+            'timed_out': False,
             'records_count': len(records),
             'input_fingerprint': input_fingerprint,
             'policy_fingerprint': policy_fingerprint,
@@ -906,17 +933,49 @@ def _worker_process_publication(payload: dict) -> dict:
         }
     except Exception as exc:
         elapsed = round(time.perf_counter() - publication_started, 3)
+        is_timeout = isinstance(exc, TimeoutError) or 'time limit exceeded' in str(exc).lower()
+        err_msg = (f'timeout: publication exceeded {timeout_seconds}s limit'
+                   if is_timeout else f'{type(exc).__name__}:{exc}')
+
+        audit_stub = dict(
+            schema_version=1,
+            arxiv_id=arxiv_id,
+            status='timeout' if is_timeout else 'failed',
+            error=err_msg,
+            records=[dict(version=r.version, status=_status_text(r.status)) for r in records],
+            seconds=elapsed,
+        )
+        empty_rows = {name: [] for name, _ in TABLES}
+        try:
+            _write_shards(parts_root, arxiv_id, empty_rows, audit_stub)
+        except Exception:
+            pass
+
+        fail_stats = _version_stats()
+        fail_stats['versions_total'] = len(records)
+        fail_stats['versions_failed'] = len(records)
+        fail_stats['seconds'] = elapsed
+
         return {
             'arxiv_id': arxiv_id,
             'skipped': False,
+            'timed_out': is_timeout,
             'records_count': len(records),
             'input_fingerprint': input_fingerprint,
             'policy_fingerprint': policy_fingerprint,
-            'stats': dict(seconds=elapsed),
-            'errors': [dict(arxiv_id=arxiv_id, stage='process', error=f'{type(exc).__name__}:{exc}')],
+            'stats': fail_stats,
+            'errors': [dict(arxiv_id=arxiv_id, stage='process', error=err_msg)],
             'warnings': [],
             'seconds': elapsed,
         }
+    finally:
+        if timer_set:
+            try:
+                signal.alarm(0)
+                if old_handler is not None:
+                    signal.signal(signal.SIGALRM, old_handler)
+            except (ValueError, OSError):
+                pass
 
 
 def _tree_bytes(path: Path) -> int:
@@ -932,7 +991,8 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
                include_partial: bool = False,
                selected_bib_files: dict | None = None,
                approved_metadata_candidates: dict | None = None,
-               workers: int | None = 1) -> dict:
+               workers: int | None = 1,
+               timeout_seconds: int | None = 180) -> dict:
     """Parse all Milestone 1 publications and write the three M2 tables.
 
     ``services`` injects the A1/A2/A3/B1/B2/B3 boundary. When omitted, the real
@@ -1002,13 +1062,17 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
                 'approved_metadata_candidates': approved_metadata_candidates,
                 'services': services,
                 'cached_info': processed.get(arxiv_id) if resume_effective else None,
+                'timeout_seconds': timeout_seconds,
             }
             res = _worker_process_publication(payload)
-            if res['skipped']:
+            if res.get('timed_out'):
+                if log:
+                    log(f'[{index}/{total_publications}] parse {arxiv_id} TIMED OUT (> {timeout_seconds}s) -> skipped')
+            elif res['skipped']:
                 if log:
                     log(f'[{index}/{total_publications}] skip {arxiv_id} (checkpoint)')
                 continue
-            if log:
+            elif log:
                 log(f'[{index}/{total_publications}] parse {arxiv_id} ({res["records_count"]} versions)')
             processed[arxiv_id] = dict(stats=res['stats'], errors=res['errors'], warnings=res['warnings'],
                                        input_fingerprint=res['input_fingerprint'],
@@ -1031,6 +1095,7 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
                     'approved_metadata_candidates': approved_metadata_candidates,
                     'services': services,
                     'cached_info': processed.get(arxiv_id) if resume_effective else None,
+                    'timeout_seconds': timeout_seconds,
                 }): (index, arxiv_id)
                 for index, (arxiv_id, paper_dir) in enumerate(publication_entries, start=1)
             }
@@ -1039,11 +1104,14 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
                 index, arxiv_id = future_to_pub[future]
                 completed_count += 1
                 res = future.result()
-                if res['skipped']:
+                if res.get('timed_out'):
+                    if log:
+                        log(f'[{completed_count}/{total_publications}] parse {arxiv_id} TIMED OUT (> {timeout_seconds}s) -> skipped')
+                elif res['skipped']:
                     if log:
                         log(f'[{completed_count}/{total_publications}] skip {arxiv_id} (checkpoint)')
                     continue
-                if log:
+                elif log:
                     log(f'[{completed_count}/{total_publications}] parse {arxiv_id} ({res["records_count"]} versions)')
                 processed[arxiv_id] = dict(stats=res['stats'], errors=res['errors'], warnings=res['warnings'],
                                            input_fingerprint=res['input_fingerprint'],
