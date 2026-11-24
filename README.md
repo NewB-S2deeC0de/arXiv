@@ -145,14 +145,17 @@ Notebook có sáu cell thực thi, kèm hướng dẫn tiếng Việt trước t
 | 5 | Nạp lại tiến độ và đếm số nhãn xác nhận theo từng publication |
 | 6 | Đóng bảng, đọc lại file tiến độ để bàn giao |
 
-Colab mặc định dùng code tại `/content/arxiv_m3_e1`, dữ liệu ở
-`/content/drive/MyDrive/Data_Crawl_Last`. Hiếu chọn member1/hieu,
-Anh chọn member2/anh, Kiên chọn member3/kien. Cả ba dùng cùng input và
-kế hoạch; nếu đặt bản sao trên Drive khác thì thay đường dẫn, không thay
-nội dung snapshot. PROGRESS_ROOT có thể trỏ sang Drive riêng khi dataset
-chỉ có quyền đọc. DOI_INDEX là bảng DOI đã phục hồi hoặc None khi chưa có.
-Đường dẫn demo/local cũng được giải thích trong Cell 1; không hardcode
-ổ D vào phiên Colab.
+Colab mặc định chỉ có đường dẫn code `/content/arxiv_m3_e1`. Tất cả
+đường dẫn dữ liệu, nơi lưu nhãn và MEMBER/REVIEWER được để trống để mỗi
+người tự điền trong Cell 1. Có hướng dẫn Copy path và phân biệt đường dẫn
+file với thư mục, kèm ví dụ minh họa. Cell 3 báo tên biến bắt buộc còn
+trống trước khi đọc file; không biến chuỗi rỗng thành thư mục hiện tại.
+Hiếu chọn member1/hieu, Anh chọn member2/anh, Kiên chọn member3/kien.
+Nếu dùng chung kế hoạch, input phải cùng nội dung dù đường dẫn khác nhau;
+dữ liệu khác nội dung phải có kế hoạch tương ứng. PROGRESS_ROOT có thể
+trỏ sang Drive riêng khi dataset chỉ có quyền đọc; để tiếp tục nhãn cũ
+phải giữ đúng nơi lưu trước đây. DOI_INDEX để trống hoặc None khi chưa
+có DOI bổ sung; AUTO_RUN_DIR chỉ bắt buộc trong chế độ review.
 
 Bảng giữ nguyên thứ tự ứng viên của pool, không xếp hạng hoặc chọn sẵn
 bằng matcher. Tìm kiếm theo từ trong title/tác giả/ID/năm/DOI chỉ lọc màn
@@ -177,8 +180,8 @@ auto cũ với auto v2. Nhãn review vẫn được truyền riêng bằng --rev
 bước hợp nhất; không tính là manual quota. Notebook không tự nghiệm thu
 hay xuất ground truth khi quota và nhãn chưa đủ.
 
-Mở `notebooks/labeling_tool.ipynb`. Mặc định dùng bản dữ liệu thật ngày
-24/11/2026; có thể đặt `DEMO=True` để thử giao diện. Điền reviewer và kiểm
+Mở `notebooks/labeling_tool.ipynb`. Tự điền đường dẫn tới dữ liệu của người
+dùng; có thể đặt `DEMO=True` để thử giao diện. Điền reviewer và kiểm
 tra đường dẫn hai bảng cùng file tiến độ. Công cụ hiển thị đầy đủ
 title, authors, year, DOI và đường dẫn arXiv của từng candidate cùng
 metadata entry. Year phía reference lấy từ `ref_submission_date` khi có.

@@ -87,6 +87,27 @@ def test_notebook_refuses_to_prepare_manual_on_a_different_snapshot(tmp_path):
     ns = dict(DEMO=False, MODE='manual', MEMBER='member1', REVIEWER='hieu',
         BIBTEX_PATH=bib, REFERENCES_PATH=refs, DOI_INDEX=None, PLAN_PATH=plan,
         json=json, build_candidate_pool=build_candidate_pool, pool_fingerprint=pool_fingerprint,
-        Path=Path)
+        Path=Path, PROGRESS_ROOT=tmp_path)
     with pytest.raises(ValueError, match='Snapshot khác'):
+        exec(compile(code_cells()[2], 'labeling_tool:cell3', 'exec'), ns)
+
+
+def test_shared_notebook_template_leaves_all_data_and_output_paths_blank(monkeypatch):
+    monkeypatch.chdir(ROOT)
+    ns = {}
+    exec(compile(code_cells()[0], 'labeling_tool:cell1', 'exec'), ns)
+    for name in ('BIBTEX_PATH', 'REFERENCES_PATH', 'PLAN_PATH', 'PROGRESS_ROOT',
+                 'DOI_INDEX', 'AUTO_RUN_DIR', 'MEMBER', 'REVIEWER'):
+        assert ns[name] == ''
+    assert 'DATA_ROOT' not in ns and 'DATASET_ROOT' not in ns
+
+
+@pytest.mark.parametrize('missing', ['BIBTEX_PATH', 'REFERENCES_PATH', 'PLAN_PATH',
+                                    'PROGRESS_ROOT', 'AUTO_RUN_DIR'])
+def test_blank_required_paths_are_named_before_filesystem_access(tmp_path, missing):
+    ns = dict(DEMO=False, MODE='review', MEMBER='member1', REVIEWER='hieu',
+              Path=Path, DOI_INDEX='', **{name: str(tmp_path / 'not-read-yet') for name in
+              ('BIBTEX_PATH', 'REFERENCES_PATH', 'PLAN_PATH', 'PROGRESS_ROOT', 'AUTO_RUN_DIR')})
+    ns[missing] = ''
+    with pytest.raises(ValueError, match='Chưa điền đường dẫn.*' + missing):
         exec(compile(code_cells()[2], 'labeling_tool:cell3', 'exec'), ns)
