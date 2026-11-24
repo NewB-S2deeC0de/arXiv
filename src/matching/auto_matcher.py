@@ -19,11 +19,12 @@ from .labeling import pool_fingerprint
 
 
 POLICY = {
-    'name': 'doi_or_title_surname_v1',
+    'name': 'doi_or_title_surname_v2',
     'title_threshold': 0.85,
     'title_ratio': 'SequenceMatcher_autojunk_false_on_sorted_normalized_tokens',
     'doi_comparison': 'casefold_after_literal_validation',
     'ambiguity': 'needs_review',
+    'doi_mismatch_review': 'only_without_match_and_with_title_surname_evidence',
 }
 AUTO_LABEL_SCHEMA = pa.schema([
     pa.field('arxiv_id', pa.string(), nullable=False),
@@ -183,14 +184,22 @@ def _iter_decisions(pool, paper_dois, publications, excluded_publications):
                 'ref_doi_sources': sources, 'title_similarity': similarity,
                 'shared_surnames': shared, 'outcome': outcome,
             })
+        # DOI khác chỉ loại cặp đó. Khi chưa có match, chỉ review cặp
+        # có title + họ tác giả đạt ngưỡng, không review vì một cặp bất kỳ khác DOI.
+        plausible_doi_mismatches = [
+            item['ref_arxiv_id'] for item in evidence
+            if item['outcome'] == 'doi_mismatch'
+            and item['title_similarity'] >= POLICY['title_threshold']
+            and item['shared_surnames']
+        ]
         # Một ca DOI không xác định vẫn có thể cạnh tranh với match đã tìm thấy.
         if len(qualifying) > 1 or review:
             status, reason, target = 'needs_review', 'ambiguous_candidates_or_doi_evidence', None
         elif len(qualifying) == 1:
             status, reason, target = 'matched', 'unique_rule_match', qualifying[0]
-        elif any(item['outcome'] == 'doi_mismatch' for item in evidence):
-            status, reason, target = 'needs_review', 'doi_mismatch_without_match', None
-            review = [item['ref_arxiv_id'] for item in evidence if item['outcome'] == 'doi_mismatch']
+        elif plausible_doi_mismatches:
+            status, reason, target = 'needs_review', 'doi_mismatch_with_strong_title_author', None
+            review = plausible_doi_mismatches
         else:
             status, reason, target = 'no_match', 'no_qualifying_candidate', None
         if not evidence:

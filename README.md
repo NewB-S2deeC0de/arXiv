@@ -259,7 +259,8 @@ Các quy tắc đã chốt được thực hiện như sau.
 | Có đủ hai DOI nhưng khác nhau | Loại candidate khỏi match, ghi doi_mismatch; không fallback title |
 | Ít nhất một phía thiếu DOI | Candidate đạt nếu title score ≥0,85 và có họ tác giả chung |
 | Nhiều candidate đạt, DOI malformed hoặc nguồn DOI mâu thuẫn | needs_review, groundtruth null |
-| Không có match nhưng có cặp DOI khác nhau | needs_review |
+| Không có match; DOI khác nhưng title ≥0,85 và có họ tác giả chung | needs_review |
+| DOI khác, không có cặp title–author đạt và không có bằng chứng cần review khác | no_match |
 | Không có candidate đạt và không có bằng chứng DOI cần review | no_match, groundtruth null |
 
 Match duy nhất được chấp nhận nếu không còn candidate có bằng chứng DOI
@@ -267,6 +268,17 @@ malformed/mâu thuẫn cần kiểm tra. Các candidate DOI khác nhau thông th
 không cản một match duy nhất hợp lệ. Mọi bằng chứng được lưu để review.
 Không chọn tự động giữa một candidate đạt DOI và một candidate khác đạt
 title–author; trường hợp này vẫn có nhiều candidate đạt nên cần review.
+
+Policy `doi_or_title_surname_v2` giữ nguyên bằng chứng `doi_mismatch` ở mức
+cặp, nhưng không đưa entry sang review chỉ vì DOI khác một candidate bất
+kỳ. Khi chưa có match, chỉ review các cặp khác DOI nhưng title đạt 0,85
+và có họ tác giả chung. Reason là `doi_mismatch_with_strong_title_author`;
+review_candidates chỉ gồm những candidate đạt điều kiện này. DOI khác
+không được tự chuyển thành match, kể cả DOI arXiv so với DOI tạp chí.
+Malformed DOI, DOI nguồn mâu thuẫn và nhiều candidate đạt vẫn giữ policy
+review trước đó. Summary lưu tên policy để phân biệt các lần chạy. Phải
+chạy lại vào output mới và dựng review queue từ output mới; không tái sử
+dụng file review của lần chạy cũ khi chưa đối soát từng quyết định.
 
 DOI chuẩn hóa bằng bộ nhận diện literal của B2, hỗ trợ prefix doi: và URL
 doi.org, sau đó casefold để so sánh. Giữ spelling gốc trong audit. Title

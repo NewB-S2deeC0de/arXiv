@@ -60,6 +60,45 @@ def test_unrelated_doi_mismatch_does_not_block_a_unique_valid_match():
     assert decision(pool).label['groundtruth_arxiv_id'] == '2001.00001'
 
 
+@pytest.mark.parametrize('kwargs', [
+    {'ref_title': 'Entirely unrelated subject'},
+    {'ref_authors': ['Other Person']},
+    {'bib_title': None},
+    {'bib_authors': []},
+])
+def test_doi_mismatch_alone_does_not_require_entry_review(kwargs):
+    result = decision(make_pool(bib_doi='10.1234/a', ref_doi='10.1234/b', **kwargs))
+    assert result.label['label_status'] == 'no_match'
+    assert result.label['review_candidates'] == []
+    assert result.evidence[0]['outcome'] == 'doi_mismatch'
+
+
+@pytest.mark.parametrize('score,status', [(0.85, 'needs_review'), (0.849999, 'no_match')])
+def test_doi_mismatch_review_requires_title_threshold_and_shared_surname(monkeypatch, score, status):
+    monkeypatch.setattr('matching.auto_matcher.title_token_sort_ratio', lambda *_: score)
+    result = decision(make_pool(bib_doi='10.1234/a', ref_doi='10.1234/b'))
+    assert result.label['label_status'] == status
+    assert result.label['groundtruth_arxiv_id'] is None
+
+
+def test_only_plausible_doi_mismatches_are_sent_to_review():
+    result = decision(make_pool(bib_doi='10.1234/journal',
+        ref_doi='10.48550/arXiv.2001.00001', extra_references=[
+            dict(arxiv_id='p', ref_arxiv_id='unrelated', ref_doi='10.1234/other',
+                 ref_title='Unrelated', ref_authors=['Other Person'])]))
+    assert result.label['reason'] == 'doi_mismatch_with_strong_title_author'
+    assert result.label['review_candidates'] == ['2001.00001']
+    assert result.label['qualifying_candidates'] == []
+
+
+def test_updated_policy_is_recorded_in_new_export(tmp_path):
+    report = write_auto_labels(make_pool(bib_doi='10.1234/a', ref_doi='10.1234/b',
+                                         ref_title='Unrelated'), tmp_path / 'v2')
+    assert report['policy']['name'] == 'doi_or_title_surname_v2'
+    assert report['counts'] == {'no_match': 1}
+    assert report['completed_publications'] == ['p']
+
+
 def test_multiple_qualifying_references_need_review_even_when_scores_differ():
     pool = make_pool(extra_references=[dict(arxiv_id='p', ref_arxiv_id='2002.00002',
         ref_title='Reference matching method', ref_authors=['J. Doe'])])
