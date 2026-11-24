@@ -1,6 +1,299 @@
 # Milestone 1 arXiv crawler
 
+## Milestone 3 · E1 candidate pool
+
+Candidate pool tạo tích Cartesian BibTeX × references trong từng publication.
+Khóa query là `(arxiv_id, citation_key)`, khóa candidate là
+`(arxiv_id, ref_arxiv_id)`. Bước này chưa gán nhãn hoặc chia partition.
+Module độc lập với crawler/parser, có thể kiểm tra offline khi dữ liệu thật
+đang được chuẩn bị.
+
+Đầu vào là file Parquet hoặc thư mục shards của riêng từng bảng. BibTeX cần
+`arxiv_id`, `citation_key`; references cần `arxiv_id`, `ref_arxiv_id`.
+Metadata thiếu giữ null. Các trường dùng tiếp gồm title, authors, year, DOI,
+journal, URL bên BibTeX và ref_title, ref_authors, ref_submission_date,
+ref_s2_id, ref_doi bên references. Schema M1 hiện chưa xuất ref_doi, nên
+trường này mặc định null. Các cột khác của đầu vào nằm ngoài projection này.
+
+```powershell
+$env:PYTHONPATH = 'src'
+python -m matching.candidate_pool --bibtex runtime/parsed/bibtex.parquet --references runtime/exports/EXPORT_ID/references.parquet --out runtime/matching/candidate-pool-001
+python -m pytest -q tests/test_matching_candidate_pool.py
+```
+
+Thay đường dẫn bằng output M1/M2 thực tế. Thư mục output phải là đường dẫn
+mới. Candidate pool gồm các file sau.
+
+| File | Nội dung |
+|---|---|
+| `entries.parquet` | Các query, gồm entry không có candidate |
+| `references.parquet` | References có ID, metadata được giữ theo projection trên |
+| `summary.parquet` | Số entry, reference và m×n theo publication |
+| `candidate_pairs.parquet` | Các cặp với metadata prefix bib_/ref_ |
+| `_SUCCESS` | Chỉ được tạo khi ghi xong mọi output |
+
+Giữ những publication có BibTeX trong summary. `manual_eligible` chỉ xác
+nhận có ít nhất 20 entry, cần người gán nhãn kiểm tra chất lượng trước khi
+chọn. References không có ref_arxiv_id được loại và đếm trong thông báo CLI.
+Row trùng hoàn toàn trong projection được gộp. Row cùng khóa nhưng metadata
+mâu thuẫn làm dừng xử lý. Chương trình giữ nguyên identifier, từ chối ID
+rỗng hoặc có khoảng trắng đầu/cuối. Không lọc candidate theo độ giống.
+
+Entry không có candidate vẫn được giữ trong entries với số pair bằng 0.
+Đây chưa phải nhãn no-match. Luồng gán nhãn cần xác nhận quyết định đó và
+giữ riêng trạng thái chưa gán nhãn. Pair batches mặc định 65.536 row, có
+thể đổi bằng `--batch-size`. Hai bảng đầu vào được nạp vào RAM, còn ma trận
+pair được sinh và ghi từng batch. Output này phục vụ nội bộ E1.
+
+E1 có công cụ manual labeling, heuristic matcher và partition
+theo publication. Với nhóm 3 người, manual có ít nhất 15 publication × 20
+entry, auto ít nhất max(6, ceil(10% pool ngoài manual)). Valid và test mỗi
+tập có 3 manual + 3 auto publication. Các publication còn lại vào train.
+Nhãn thủ công cần người thực hiện. Các policy DOI và nhiều ứng viên được
+mô tả ở phần heuristic bên dưới; không tự biến entry chưa gán thành nhãn âm.
+
+### Đợt dữ liệu thật ngày 24/11/2026
+
+Dữ liệu được tải bằng GET từ Drive, chỉ xử lý bản sao cục bộ tại
+`runtime/matching/real-20261124`. Không sửa dữ liệu trên Drive. Snapshot M1
+là `export-8d75eb6e065244d98ac2d45d6c9bdecd`; M2 là bản recovery sau lỗi RAM.
+`input/source_files.json` lưu file ID nguồn; `input_audit.json` lưu SHA256
+và phạm vi kiểm tra. Các bảng M1 đã đối chiếu checksum với manifest nguồn.
+
+| Kết quả thực tế | Số lượng |
+|---|---:|
+| Publication M1 | 5.000 |
+| Entry BibTeX M2 | 196.178 |
+| Publication có entry BibTeX | 2.885 |
+| Reference có arXiv ID | 89.961 |
+| Cặp ứng viên cùng publication | 5.600.665 |
+| Publication đủ điều kiện chọn trong đợt này | 2.584 |
+| Phân công manual tạm | 15 bài × 20 entry = 300 entry |
+| Auto đã chạy | 499 bài, 31.808 entry, 919.235 cặp |
+| Quyết định heuristic | 8.018 matched; 23.753 no_match; 37 needs_review |
+
+`m2_recovery_check.json` ghi kiểm tra đọc toàn bộ bảng theo batch, khóa,
+foreign key và số dòng theo checkpoint/coverage: đạt, với 3.176.600 elements,
+4.028.754 hierarchy rows và 196.178 BibTeX rows. Đây là kiểm tra toàn vẹn
+bản recovery, không phải nghiệm thu độ chính xác parse. Checkpoint vẫn ghi
+766 version failed, 575 empty và 6.990 parsed trong tổng 8.357 version.
+Không có manifest/errors/bibtex_audit gốc để khẳng định đầy đủ chất lượng.
+Hierarchy thiếu position; E1 không dùng bảng này để dựng thứ tự nội dung.
+
+`src/matching/dataset_plan.py` chọn mẫu bằng thứ hạng SHA256 với seed 42,
+trước khi chạy matcher. Chỉ chọn publication có version được đối soát đủ,
+không có lỗi/pending/conflict B2 trong checkpoint và snapshot S2 thành công
+cho mọi version. Manual yêu cầu ít nhất 20 entry và có candidate; lấy ngẫu
+nhiên tái lập 20 entry, không lọc theo confidence hay kết quả heuristic.
+Auto lấy mọi entry của các bài đã chọn, kể cả candidate pool rỗng hợp lệ.
+Các bài bị loại khỏi đợt chọn vẫn nằm trong corpus và mẫu số quota, cùng
+lý do trong kế hoạch. Tiêu chí này thu hẹp tập chọn; không coi mẫu là đại
+diện ngẫu nhiên không điều kiện của toàn bộ 5.000 bài.
+
+```powershell
+$env:PYTHONPATH = 'src'
+python -m matching.dataset_plan --input runtime/matching/real-20261124/input --out runtime/matching/real-20261124/dataset_plan-new.json
+```
+
+Kế hoạch hiện tại trong `dataset_plan.json` có tên tạm member1–member3,
+mỗi người 5 bài. Trong notebook, điền REVIEWER, chọn MEMBER và chạy các
+cell lần lượt với `MODE='manual'`. Notebook chỉ mở đúng 100 entry được
+phân công; `entry_keys` lọc giao diện và giữ fingerprint toàn snapshot.
+Quyết định lưu tại `manual/member1.parquet` tương ứng. Đổi sang
+`MODE='review'` để mở `auto/review_queue.parquet`, gồm 37 entry thuộc 16 bài;
+tiến độ review lưu riêng. Chưa có nhãn manual nào được tạo thay người dùng.
+
+Trong 300 entry manual dự kiến có 82 entry thiếu title và 99 thiếu authors
+(các nhóm có thể chồng lấp). Cần đọc nguồn khi metadata không đủ kết luận;
+dùng `s` để bỏ qua khi chưa xác minh, không chọn `n` chỉ vì thiếu trường.
+Thiếu title nhận score 0 theo heuristic hiện tại, nên nhãn auto no_match
+chưa chứng minh một tài liệu thực sự không có trong candidates. Cần đo
+chất lượng bằng nhãn manual độc lập; có thể phải bổ sung ngữ cảnh nguồn
+cho các entry khó trước khi đủ 300 nhãn xác nhận.
+
+Kết quả lưu tại `candidate_pool/` và `auto/`. Writer auto gom batch tối đa
+1.024 nhãn hoặc 8.192 evidence rows mỗi lần ghi, tránh một row group cho
+mỗi entry. Đầu vào vẫn được nạp RAM; không nạp ma trận 5,6 triệu cặp cùng
+lúc. Cả hai output có `_SUCCESS` khi ghi xong. 483 bài auto không còn
+needs_review; 16 bài còn cần người kiểm tra. Đây chưa là đánh giá accuracy.
+
+`readiness/validation_report.json` và `label_audit.parquet` được xuất thử;
+status blocked là đúng vì chưa có manual và còn review. Không có
+groundtruth.parquet hay partition cuối. Với 15 bài manual đã đủ nhãn,
+quota tạm của dải này là ceil((5000-15)/10)=499 bài auto hoàn tất. Khi chưa
+có manual, validator thấy M=0 và tính quota hiện thời là 500; đây không
+phải lỗi chọn mẫu. Nhóm còn các dải khác nên phải ghép corpus, tính lại
+quota, giữ publication manual/auto tách biệt và kiểm tra fingerprint khi
+di chuyển nhãn sang snapshot mới. Chỉ chia train/valid/test và xuất ground
+truth sau khi hoàn tất các bước này.
+
+### Sử dụng giao diện gán nhãn
+
+Mở `notebooks/labeling_tool.ipynb`. Mặc định dùng bản dữ liệu thật ngày
+24/11/2026; có thể đặt `DEMO=True` để thử giao diện. Điền reviewer và kiểm
+tra đường dẫn hai bảng cùng file tiến độ. Công cụ hiển thị đầy đủ
+title, authors, year, DOI và đường dẫn arXiv của từng candidate cùng
+metadata entry. Year phía reference lấy từ `ref_submission_date` khi có.
+Chọn một số để match, `n` để xác nhận no-match, `s` bỏ qua, `p` quay lại,
+`c` xóa quyết định hiện tại và `q` thoát. Skip giữ nguyên quyết định cũ nếu
+entry đó đã có nhãn. Có thể dùng cùng giao diện trong terminal.
+
+```powershell
+$env:PYTHONPATH = 'src'
+python -m matching.labeling --bibtex runtime/parsed/bibtex.parquet --references runtime/exports/EXPORT_ID/references.parquet --progress runtime/matching/manual_labels_member1.parquet --reviewer MEMBER1 --publication 2411.18799
+```
+
+Lặp lại `--publication` để chọn nhiều publication. Dùng file progress riêng
+cho mỗi người. Chạy lại với cùng input và progress để tiếp tục entry chưa
+gán nhãn đầu tiên. Nhãn được lưu ngay sau mỗi lựa chọn bằng file tạm rồi
+replace. File progress gồm arxiv_id, citation_key, groundtruth_arxiv_id,
+label_status, reviewer và updated_at. Match có một ID, no-match có ID null,
+còn chưa gán nhãn không có row. Đây là tiến độ manual nội bộ; partition và
+groundtruth cuối được xây ở bước sau.
+
+Fingerprint nằm trong metadata Parquet của progress, gắn với cả hai bảng
+đầu vào đã chuẩn hóa. Khi input thay đổi, chương trình yêu cầu file progress
+mới hoặc kiểm tra nhãn lại có chủ đích. Khóa `.lock` chặn hai phiên cùng ghi
+một progress file. Nếu process chết và còn lock, chỉ xóa file lock sau khi
+xác nhận phiên cũ đã dừng. Đặt progress trên Drive nếu muốn giữ qua reset
+Colab. Atomic replace và khóa phụ thuộc filesystem, cần một writer trên
+Drive và kiểm tra lại file sau khi kết nối mới.
+
 M2 A1–A3 implementation: `src/parser/gather.py`, `hierarchy.py`, `leaves.py`.
+
+### Hợp nhất nhãn, chia tập và xuất ground truth
+
+`src/matching/groundtruth.py` nhận file progress manual của các thành viên,
+thư mục output của auto matcher và bảng papers của toàn corpus đã chốt.
+Fingerprint của mọi nguồn nhãn phải khớp candidate pool. Khóa nhãn là
+`(arxiv_id, citation_key)`; ID đích phải nằm trong references của chính
+publication đó. no_match được lưu dưới dạng null có trạng thái xác nhận,
+còn entry chưa gán nhãn hoặc needs_review không trở thành nhãn âm.
+
+Nhãn trùng và đồng ý được gộp, giữ các nguồn trong audit. Các quyết định
+mâu thuẫn chặn xuất toàn bộ groundtruth cho đến khi giải quyết. Manual và
+auto là hai pool publication tách biệt. Với ca auto needs_review, dùng công
+cụ manual để ghi quyết định vào file review riêng, rồi truyền bằng
+`--review`. File này chỉ chứa các key cần review; bỏ qua entry khác khi
+gán nhãn. Review giải quyết trạng thái chưa có quyết định của auto, giữ
+publication ở pool auto và giữ cả bằng chứng ban đầu. Review không được
+ghi đè một quyết định matched/no_match đã có. Nhiều người review bất đồng
+vẫn chặn xuất.
+
+Mặc định nhóm có 3 thành viên. Validator kiểm tra ít nhất 15 publication
+manual, mỗi publication có ít nhất 20 nhãn hợp lệ, tổng ít nhất 300 nhãn.
+Mỗi thành viên phụ trách ít nhất 5 publication. Owner mặc định là reviewer
+duy nhất của publication. Khi có nhiều reviewer trên cùng một publication,
+truyền `--owners FILE.json` để chỉ định owner trong các reviewer đã tham gia,
+ví dụ `{"2411.18799": "member1"}`. Một publication chỉ tính cho một owner.
+
+Pool auto cần ít nhất `max(2*members, ceil((N-M)/10))` publication, với N
+là số arxiv_id duy nhất trong toàn bộ bảng papers được truyền vào, M là
+số publication manual. Cần dùng papers của toàn corpus, gồm cả các bài
+chưa gán nhãn; không dùng riêng bảng papers của pool đã chọn. Mọi entry
+của publication auto phải có quyết định cuối cùng. Manual chỉ cần đủ ngưỡng
+entry theo đề, các entry chưa gán nhãn không có row groundtruth.
+
+Chia theo publication, dùng seed 42. Mỗi valid/test nhận members publication
+manual và members publication auto. Phần còn lại vào train. Thuật toán sắp
+publication theo hash của seed/pool/ID, nên đổi thứ tự file đầu vào không
+đổi kết quả. Danh sách chia tập được lưu vào publication_split.parquet.
+Đây là file chia tập cần bàn giao để các luồng khác sử dụng cùng partition.
+
+```powershell
+$env:PYTHONPATH = 'src'
+python -m matching.groundtruth --bibtex runtime/parsed/bibtex.parquet --references runtime/exports/EXPORT_ID/references.parquet --papers runtime/exports/EXPORT_ID/papers.parquet --manual runtime/matching/manual_member1.parquet --manual runtime/matching/manual_member2.parquet --manual runtime/matching/manual_member3.parquet --auto runtime/matching/auto-001 --members 3 --seed 42 --out runtime/matching
+```
+
+Có thể lặp `--auto` và `--review` để nhận nhiều nguồn. Nếu không còn nguồn
+chứa quyết định sai, chạy lại khung trên với output mới để nghiệm thu.
+Source nhãn sai cần được sửa tại nơi gán nhãn; công cụ merge giữ nguyên các
+quyết định đầu vào để đối chiếu. Một file review không tự giải quyết bất
+đồng giữa hai quyết định đã có.
+
+Output khi đạt gồm groundtruth.parquet với đúng 4 cột arxiv_id, citation_key,
+groundtruth_arxiv_id và partition; publication_split.parquet; label_audit.parquet;
+validation_report.json và _SUCCESS. Partition có kiểu Arrow dictionary.
+Các kiểm tra quota hoặc review chưa đạt tạo report và audit với status
+blocked, không ghi groundtruth hay _SUCCESS. CLI trả exit code 2 khi blocked.
+Input sai snapshot/schema/ID gây exception để sửa nguồn.
+
+Output có thể nằm chung thư mục progress đã tồn tại, nhưng các tên file
+kết quả phải chưa có để tránh ghi đè. Khóa ghi dùng chung cơ chế với công
+cụ manual. Nếu export gián đoạn, giữ thư mục đó để kiểm tra và chọn output
+mới. Trước khi dùng groundtruth cần kiểm tra _SUCCESS. File audit/report là
+dữ liệu làm việc nội bộ, không thay thế schema predictions công bố của M3.
+
+API Python gồm `prepare_groundtruth`, `split_publications` và
+`write_groundtruth`. API prepare yêu cầu `publication_universe` đầy đủ để
+kiểm tra mẫu số 10%. Các test dùng dữ liệu giả lập nhóm 3 người. Đợt dữ liệu
+thật bên dưới kiểm tra khả năng xử lý và tính toàn vẹn; chất lượng nhãn vẫn
+cần đánh giá bằng nhãn manual độc lập.
+
+### Heuristic matcher E1
+
+`src/matching/auto_matcher.py` gán quyết định cho từng entry trong các
+publication được chọn, giữ nguyên candidate scope. Chọn publication bằng
+`--publication`, loại pool manual bằng `--exclude-publication`; có thể lặp
+các tham số này. Khi bỏ qua cả hai, matcher xử lý toàn bộ publication có
+entry. Chọn tập publication để đáp ứng quota và chia partition thực hiện
+ở bước riêng.
+
+```powershell
+$env:PYTHONPATH = 'src'
+python -m matching.auto_matcher --bibtex runtime/parsed/bibtex.parquet --references runtime/exports/EXPORT_ID/references.parquet --out runtime/matching/auto-001
+```
+
+Thêm `--papers PATH` khi có bảng corpus chứa `arxiv_id` và `doi`. Matcher
+ghép `references.ref_arxiv_id = papers.arxiv_id`, chỉ bổ sung DOI cho
+candidate đã có trong cùng publication. Code export M1 hiện không xuất
+cột DOI ở cả papers và references, nên chưa đủ nguồn để chạy rule DOI
+từ hai bảng chuẩn đó. Bảng papers bổ sung có thể truyền riêng mà không
+thay đổi schema công bố M1. Thiếu bảng/cột DOI được ghi vào summary.
+
+Các quy tắc đã chốt được thực hiện như sau.
+
+| Trường hợp | Quyết định |
+|---|---|
+| Hai DOI hợp lệ khớp | Candidate đạt rule DOI |
+| Có đủ hai DOI nhưng khác nhau | Loại candidate khỏi match, ghi doi_mismatch; không fallback title |
+| Ít nhất một phía thiếu DOI | Candidate đạt nếu title score ≥0,85 và có họ tác giả chung |
+| Nhiều candidate đạt, DOI malformed hoặc nguồn DOI mâu thuẫn | needs_review, groundtruth null |
+| Không có match nhưng có cặp DOI khác nhau | needs_review |
+| Không có candidate đạt và không có bằng chứng DOI cần review | no_match, groundtruth null |
+
+Match duy nhất được chấp nhận nếu không còn candidate có bằng chứng DOI
+malformed/mâu thuẫn cần kiểm tra. Các candidate DOI khác nhau thông thường
+không cản một match duy nhất hợp lệ. Mọi bằng chứng được lưu để review.
+Không chọn tự động giữa một candidate đạt DOI và một candidate khác đạt
+title–author; trường hợp này vẫn có nhiều candidate đạt nên cần review.
+
+DOI chuẩn hóa bằng bộ nhận diện literal của B2, hỗ trợ prefix doi: và URL
+doi.org, sau đó casefold để so sánh. Giữ spelling gốc trong audit. Title
+chuẩn hóa Unicode NFKD, bỏ dấu phụ, casefold, tách token chữ/số và sắp token.
+Token sort ratio được định nghĩa bằng
+`difflib.SequenceMatcher(..., autojunk=False).ratio()` trên hai chuỗi đã
+sắp token, trong thang [0,1]. Đây là định nghĩa score cố định của policy này.
+Title thiếu nhận score 0. Không cần dependency matching bổ sung.
+
+Họ tác giả lấy từ phần trước dấu phẩy hoặc token cuối trong dạng tên xuôi,
+bỏ hậu tố Jr/Sr/II/III/IV và initial một ký tự, rồi áp dụng chuẩn hóa Unicode.
+Cách này còn hạn chế với tên tập thể, thứ tự tên theo nhiều ngôn ngữ và
+cách viết LaTeX phức tạp. Chất lượng rule sẽ được kiểm chứng trên nhãn manual
+khi có dữ liệu thật. Year được giữ trong input, không dùng làm điều kiện
+match theo Mission hiện tại.
+
+Output gồm `auto_labels.parquet`, `pair_evidence.parquet`, `summary.json`
+và marker `_SUCCESS`. File label có trạng thái matched/no_match/needs_review,
+ID được chọn và các candidate cần xem. Audit cặp giữ DOI gốc/chuẩn hóa, nguồn
+DOI, title score, họ tác giả chung và lý do. Summary giữ policy, fingerprint,
+số quyết định và danh sách publication hoàn tất/cần review. Publication còn
+entry needs_review chưa được tính là hoàn tất gán nhãn tự động.
+
+Thư mục output phải mới. Dữ liệu được sinh và ghi theo entry, không giữ toàn
+bộ ma trận cặp trong RAM. Source tables và index DOI vẫn nằm trong RAM.
+Nhãn auto này chưa có partition và chưa phải groundtruth cuối. Bước hợp nhất
+phải giải quyết needs_review trước khi tính quota hoặc đưa vào train/eval.
 
 Python >=3.11, Colab CPU; inclusive range `2504.02523`–`2504.07522`.
 Metadata và source arXiv dùng chung scheduler nối tiếp; S2 có limiter riêng.
