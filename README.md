@@ -129,6 +129,54 @@ truth sau khi hoàn tất các bước này.
 
 ### Sử dụng giao diện gán nhãn
 
+Notebook hiện dùng bảng `ipywidgets`, triển khai trong
+`src/matching/labeling_table.py`. Cài môi trường notebook bằng
+`python -m pip install -r notebooks/requirements-labeling.txt`.
+CLI `run_labeling_session` vẫn dùng được và chia sẻ cùng định dạng file nhãn.
+
+Notebook có sáu cell thực thi, kèm hướng dẫn tiếng Việt trước từng cell:
+
+| Cell | Công việc |
+|---|---|
+| 1 | Điền MEMBER/REVIEWER, PROJECT_ROOT, các đường dẫn dữ liệu và nơi ghi tiến độ |
+| 2 | Mount Drive, clone/pull M3_E1 trên Colab, cài dependency, import và bật widgets |
+| 3 | Kiểm tra các file, fingerprint và phân công; review dùng đúng một auto run |
+| 4 | Mở bảng tìm kiếm/phân trang, chọn reference hoặc xác nhận no-match |
+| 5 | Nạp lại tiến độ và đếm số nhãn xác nhận theo từng publication |
+| 6 | Đóng bảng, đọc lại file tiến độ để bàn giao |
+
+Colab mặc định dùng code tại `/content/arxiv_m3_e1`, dữ liệu ở
+`/content/drive/MyDrive/Data_Crawl_Last`. Hiếu chọn member1/hieu,
+Anh chọn member2/anh, Kiên chọn member3/kien. Cả ba dùng cùng input và
+kế hoạch; nếu đặt bản sao trên Drive khác thì thay đường dẫn, không thay
+nội dung snapshot. PROGRESS_ROOT có thể trỏ sang Drive riêng khi dataset
+chỉ có quyền đọc. DOI_INDEX là bảng DOI đã phục hồi hoặc None khi chưa có.
+Đường dẫn demo/local cũng được giải thích trong Cell 1; không hardcode
+ổ D vào phiên Colab.
+
+Bảng giữ nguyên thứ tự ứng viên của pool, không xếp hạng hoặc chọn sẵn
+bằng matcher. Tìm kiếm theo từ trong title/tác giả/ID/năm/DOI chỉ lọc màn
+hình; luôn có Xem tất cả. Không có match bị khóa khi đang lọc. Ứng viên
+được phân trang, có link arXiv và tác giả mở rộng. Chọn một dòng sẽ ghi
+ngay rồi chuyển tới entry chưa gán; Chưa chắc / Tiếp không tạo nhãn mới.
+Các nhãn cũ vẫn được giữ và có thể quay lại sửa/xóa.
+
+DOI chỉ bổ sung cho hiển thị qua join ref_arxiv_id, không sửa pool hay
+fingerprint. Hiển thị mọi DOI khác nhau, nguồn và giá trị gốc cần kiểm tra;
+không tự suy luận DOI arXiv bằng DOI tạp chí. Progress dùng cùng schema
+và metadata cũ nên tiếp tục được nhãn đã gán bằng CLI. Mỗi lần ghi dùng
+khóa ngắn, nạp lại file, giữ cập nhật ở entry khác và từ chối ghi đè entry
+đã đổi ở phiên khác. Callback từ nút của bảng cũ không được gán nhãn cho
+entry tiếp theo; lỗi ghi không chuyển entry và không làm mất file cũ.
+Khóa filesystem trên Drive vẫn cần một writer cho mỗi progress file.
+
+Review lấy needs_review từ auto_labels.parquet của AUTO_RUN_DIR sau khi
+kiểm tra marker/schema/fingerprint. Tiến độ review mới tách theo tên lần
+chạy: `review/<auto-run>/<reviewer>.parquet`, tránh trộn quyết định của
+auto cũ với auto v2. Nhãn review vẫn được truyền riêng bằng --review cho
+bước hợp nhất; không tính là manual quota. Notebook không tự nghiệm thu
+hay xuất ground truth khi quota và nhãn chưa đủ.
+
 Mở `notebooks/labeling_tool.ipynb`. Mặc định dùng bản dữ liệu thật ngày
 24/11/2026; có thể đặt `DEMO=True` để thử giao diện. Điền reviewer và kiểm
 tra đường dẫn hai bảng cùng file tiến độ. Công cụ hiển thị đầy đủ

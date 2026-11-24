@@ -1,0 +1,2 @@
+-r ../src/requirements.txt
+ipywidgets>=8.1,<9
