@@ -248,7 +248,8 @@ def scan_latex(raw: str) -> ScanResult:
                 error = 'dangling_backslash'
         elif raw.startswith(('https://', 'http://'), index):
             kind = 'url'
-            end = _BARE_URL.match(raw, index).end()
+            match = _BARE_URL.match(raw, index)
+            end = match.end() if match else index + len('https://' if raw.startswith('https://', index) else 'http://')
         if kind is None:
             index += 1
             continue

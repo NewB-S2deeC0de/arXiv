@@ -351,10 +351,16 @@ def finalize_b3_tree(hierarchy, result, *, node_factory, structural_content=defa
     audit positions refer to projected content, never raw TeX spans.
     """
     view = mapping_for_version(result, arxiv_id=hierarchy.arxiv_id, version=hierarchy.version)
-    mapping = {(hierarchy.arxiv_id, hierarchy.version, key): target for key, target in view.items()}
+    mapping = {
+        (hierarchy.arxiv_id, hierarchy.version, key): target
+        for key, target in view.items()
+        if isinstance(key, str) and _KEY.fullmatch(key) and key != '*'
+    }
     for record in result.merge.records:
         if record.payload.arxiv_id == hierarchy.arxiv_id:
-            mapping[hierarchy.arxiv_id, hierarchy.version, record.payload.citation_key] = record.payload.citation_key
+            canon = record.payload.citation_key
+            if isinstance(canon, str) and _KEY.fullmatch(canon) and canon != '*':
+                mapping[hierarchy.arxiv_id, hierarchy.version, canon] = canon
     tree = to_c_tree(hierarchy, node_factory=node_factory, structural_content=structural_content)
     if tree is None:
         return FinalizedReferenceTree(None, ())
