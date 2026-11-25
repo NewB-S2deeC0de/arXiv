@@ -889,37 +889,6 @@ def _worker_process_publication(payload: dict) -> dict:
     timeout_seconds = payload.get('timeout_seconds')
     services = _get_worker_services(payload.get('services'))
 
-    records = [read_source_record(arxiv_id, version, paper_dir / 'versions' / f'v{version}')
-               for version in version_numbers(paper_dir)]
-    input_fingerprint = _publication_input_fingerprint(
-        arxiv_id, records, selected_bib_files=selected_bib_files,
-        approved_metadata_candidates=approved_metadata_candidates)
-    policy_fingerprint = _policy_fingerprint(include_partial, services)
-
-    cached_info = payload.get('cached_info')
-    if (cached_info is not None
-            and _shards_exist(parts_root, arxiv_id)
-            and cached_info.get('input_fingerprint') == input_fingerprint
-            and cached_info.get('policy_fingerprint') == policy_fingerprint):
-        cached_warnings = cached_info.get('warnings')
-        if cached_warnings is None:
-            audit_path = parts_root / quote(arxiv_id, safe='') / 'audit.json'
-            if audit_path.is_file():
-                cached_warnings = _read_json(audit_path, {}).get('warnings', [])
-            else:
-                cached_warnings = []
-        return {
-            'arxiv_id': arxiv_id,
-            'skipped': True,
-            'records_count': len(records),
-            'input_fingerprint': input_fingerprint,
-            'policy_fingerprint': policy_fingerprint,
-            'stats': cached_info.get('stats'),
-            'errors': cached_info.get('errors', []),
-            'warnings': cached_warnings,
-            'seconds': 0.0,
-        }
-
     publication_started = time.perf_counter()
     timer_set = False
     old_handler = None
@@ -931,7 +900,41 @@ def _worker_process_publication(payload: dict) -> dict:
         except (ValueError, OSError):
             pass
 
+    records = []
+    input_fingerprint = ''
+    policy_fingerprint = ''
     try:
+        records = [read_source_record(arxiv_id, version, paper_dir / 'versions' / f'v{version}')
+                   for version in version_numbers(paper_dir)]
+        input_fingerprint = _publication_input_fingerprint(
+            arxiv_id, records, selected_bib_files=selected_bib_files,
+            approved_metadata_candidates=approved_metadata_candidates)
+        policy_fingerprint = _policy_fingerprint(include_partial, services)
+
+        cached_info = payload.get('cached_info')
+        if (cached_info is not None
+                and _shards_exist(parts_root, arxiv_id)
+                and cached_info.get('input_fingerprint') == input_fingerprint
+                and cached_info.get('policy_fingerprint') == policy_fingerprint):
+            cached_warnings = cached_info.get('warnings')
+            if cached_warnings is None:
+                audit_path = parts_root / quote(arxiv_id, safe='') / 'audit.json'
+                if audit_path.is_file():
+                    cached_warnings = _read_json(audit_path, {}).get('warnings', [])
+                else:
+                    cached_warnings = []
+            return {
+                'arxiv_id': arxiv_id,
+                'skipped': True,
+                'records_count': len(records),
+                'input_fingerprint': input_fingerprint,
+                'policy_fingerprint': policy_fingerprint,
+                'stats': cached_info.get('stats'),
+                'errors': cached_info.get('errors', []),
+                'warnings': cached_warnings,
+                'seconds': 0.0,
+            }
+
         stats, errors, warnings, rows, audit = _process_publication(
             arxiv_id, records, services, include_partial=include_partial,
             selected_bib_files=selected_bib_files,
@@ -1116,7 +1119,7 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
                 _flush_checkpoint(checkpoint_path, checkpoint, processed)
                 dirty = False
     else:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers, max_tasks_per_child=150) as executor:
             future_to_pub = {
                 executor.submit(_worker_process_publication, {
                     'arxiv_id': arxiv_id,
@@ -1145,7 +1148,7 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
                     continue
                 elif log:
                     log(f'[{completed_count}/{total_publications}] parse {arxiv_id} ({res["records_count"]} versions)')
-                processed[arxiv_id] = dict(stats=res['stats'], errors=res['errors'], warnings=res['warnings'],
+                processed[arxiv_id] = dict(stats=res['stats'], errors=res['errors'],
                                            input_fingerprint=res['input_fingerprint'],
                                            policy_fingerprint=res['policy_fingerprint'])
                 dirty = True
