@@ -127,103 +127,72 @@ quota, giữ publication manual/auto tách biệt và kiểm tra fingerprint khi
 di chuyển nhãn sang snapshot mới. Chỉ chia train/valid/test và xuất ground
 truth sau khi hoàn tất các bước này.
 
-### Sử dụng giao diện gán nhãn
+### Sử dụng notebook chung để gán nhãn
 
-Notebook hiện dùng bảng `ipywidgets`, triển khai trong
-`src/matching/labeling_table.py`. Cài môi trường notebook bằng
-`python -m pip install -r notebooks/requirements-labeling.txt`.
-CLI `run_labeling_session` vẫn dùng được và chia sẻ cùng định dạng file nhãn.
+Mở `notebooks/labeling_tool.ipynb` trên Colab/Jupyter. Cả bốn người dùng
+cùng notebook, **không sửa bất kỳ cell Python nào, không thêm ROOT hay
+PROJECT_ROOT**. Cấu hình được nhập qua biểu mẫu trong
+`src/matching/notebook_tool.py`; bảng do `labeling_table.py` hiển thị.
 
-Notebook có sáu cell thực thi, kèm hướng dẫn tiếng Việt trước từng cell:
-
-| Cell | Công việc |
+| Cell | Việc cần làm |
 |---|---|
-| 1 | Điền MEMBER/REVIEWER, PROJECT_ROOT, các đường dẫn dữ liệu và nơi ghi tiến độ |
-| 2 | Mount Drive, clone/pull M3_E1 trên Colab, cài dependency, import và bật widgets |
-| 3 | Tạo/nạp kế hoạch cá nhân hoặc nạp kế hoạch cũ; kiểm tra snapshot; review đúng một auto run |
-| 4 | Mở bảng tìm kiếm/phân trang, chọn reference hoặc xác nhận no-match |
-| 5 | Nạp lại tiến độ và đếm số nhãn xác nhận theo từng publication |
-| 6 | Đóng bảng, đọc lại file tiến độ để bàn giao |
+| 1 | Bấm chạy: mount Drive, chuẩn bị source M3_E1 và thư viện, import |
+| 2 | Bấm chạy: mở biểu mẫu; chọn người/công việc/file, bấm Kiểm tra & mở bảng |
+| 3 | Khi cần: đọc lại tiến độ đã lưu theo từng bài |
+| 4 | Kết thúc: đóng bảng, chỉ ra file nhãn và kế hoạch cần bàn giao |
 
-Colab mặc định chỉ có đường dẫn code `/content/arxiv_m3_e1`. Tất cả
-đường dẫn dữ liệu, nơi lưu nhãn và MEMBER/REVIEWER được để trống để mỗi
-người tự điền trong Cell 1. Có hướng dẫn Copy path và phân biệt đường dẫn
-file với thư mục, kèm ví dụ minh họa. Cell 3 báo tên biến bắt buộc còn
-trống trước khi đọc file; không biến chuỗi rỗng thành thư mục hiện tại.
-Hiếu chọn member1/hieu, Anh chọn member2/anh, Kiên chọn member3/kien;
-người thứ tư dùng member4 và mã reviewer của mình. GROUP_MEMBERS=4.
-Nếu dùng chung kế hoạch, input phải cùng nội dung dù đường dẫn khác nhau;
-dữ liệu khác nội dung phải có kế hoạch tương ứng. PROGRESS_ROOT có thể
-trỏ sang Drive riêng khi dataset chỉ có quyền đọc; để tiếp tục nhãn cũ
-phải giữ đúng nơi lưu trước đây. DOI_INDEX để trống hoặc None khi chưa
-có DOI bổ sung; AUTO_RUN_DIR chỉ bắt buộc trong chế độ review.
+Người dùng chọn Hiếu/member1, Anh/member2, Kiên/member3 hoặc thành viên
+thứ tư/member4. Mã reviewer được điền theo người thực sự chọn nhãn; người
+thứ tư tự điền mã. Mọi ô đường dẫn đều để trống. Nút Chọn… duyệt từng
+thư mục và phân biệt file/thư mục; có thể dán Copy path từ Files của
+Colab. Không nhận link website Drive thay đường dẫn filesystem. Nơi
+lưu nhãn cần quyền ghi và có thể tách khỏi dataset chỉ có quyền đọc.
 
-Notebook hỗ trợ mỗi người chạy trên dữ liệu riêng mà không cần kế hoạch
-15 bài chung trước đây. Người bắt đầu mới dùng PLAN_MODE=personal, điền
-BIBTEX_PATH, REFERENCES_PATH và PROGRESS_ROOT. Notebook chọn 5 publication
-có ít nhất 20 entry và candidate arXiv, lấy 20 entry/publication bằng seed
-42 không dựa trên matcher, rồi lưu `plans/<MEMBER>.json`. Có thể chỉ định
-đúng 5 ID bằng MANUAL_PUBLICATIONS và loại các bài auto/đã phân công bằng
-EXCLUDED_PUBLICATIONS. Không tính quota auto hoặc chia tập trong bước này.
+Biểu mẫu có bốn công việc: bắt đầu manual trên dữ liệu riêng, tiếp tục
+manual với kế hoạch gốc, review kết quả auto và demo. Công việc mới chỉ
+cần BibTeX M2, references M1 và nơi ghi nhãn; tự tạo 5 bài × 20 entry và
+lưu plans/memberX.json. Các lần sau dùng lại kế hoạch, không resample.
+Có thể chọn 5 ID cụ thể, loại bài auto/đã giao người khác hoặc cung cấp
+checkpoint M2/reference snapshots trong mục nâng cao để lọc thiếu/lỗi.
+Không có artifact chất lượng sẽ hiện giới hạn kiểm tra; không suy luận
+parse đúng chỉ từ số dòng. Chọn manual trước khi chạy auto và loại các
+bài manual khỏi auto. Nhóm đối soát trùng publication khi gộp dữ liệu sau.
 
-CHECKPOINT_PATH và REFERENCE_SNAPSHOTS_PATH tùy chọn cho việc tạo kế hoạch
-cá nhân; nếu cung cấp thì lọc những publication thiếu/lỗi/conflict từ báo
-cáo. Không có các artifact này sẽ hiện cảnh báo về phạm vi kiểm tra, không
-coi đủ số dòng là parse đúng. Kế hoạch có sẵn được nạp lại, không resample
-hay ghi đè khi đổi input/seed/lựa chọn bài. Cần giữ cùng cấu hình để tiếp tục.
+Người đã có nhãn cũ chọn Tiếp tục manual với kế hoạch gốc, chọn đúng
+snapshot, JSON kế hoạch và thư mục cha chứa manual/ trước đây. Không tạo
+mẫu mới thay cho phân công cũ. Review chọn đúng thư mục auto hoàn tất;
+kiểm marker/schema/fingerprint rồi lấy needs_review từ auto_labels.parquet.
+Không dùng nhầm queue cũ; progress tách theo review/<auto-run>/<reviewer>.parquet.
 
-Người đã có nhãn CLI/notebook cũ dùng PLAN_MODE=existing và PLAN_PATH gốc.
-Nếu có progress nhưng chưa có kế hoạch cá nhân, notebook chặn chọn lại mẫu
-để tránh mất liên hệ với phân công cũ. Review không bắt buộc PLAN_PATH:
-fingerprint được kiểm trực tiếp giữa pool hiện tại và summary của auto run.
-Khi bàn giao mỗi người gửi progress và kế hoạch kèm phiên bản dữ liệu;
-nhóm 4 người đối soát 20 bài manual khác nhau, ít nhất 400 nhãn, tránh trùng
-auto rồi mới gộp fingerprint có kiểm tra, tính quota và chia tập members=4.
+DOI index chỉ bổ sung hiển thị qua ref_arxiv_id, không đổi pool/fingerprint.
+Bảng không dùng confidence, không chọn sẵn/rank theo matcher. Có tìm kiếm,
+phân trang, mở rộng tác giả và link arXiv. Xem tất cả bỏ lọc; Không có match
+bị khóa khi lọc. Chọn dòng lưu ngay rồi chuyển entry pending. Chưa chắc/ Tiếp
+không tạo nhãn. Lỗi ghi không chuyển entry; callback bảng cũ không được
+label entry mới. File nhãn CLI cũ vẫn đọc được. Một writer/file trên Drive.
 
-Bảng giữ nguyên thứ tự ứng viên của pool, không xếp hạng hoặc chọn sẵn
-bằng matcher. Tìm kiếm theo từ trong title/tác giả/ID/năm/DOI chỉ lọc màn
-hình; luôn có Xem tất cả. Không có match bị khóa khi đang lọc. Ứng viên
-được phân trang, có link arXiv và tác giả mở rộng. Chọn một dòng sẽ ghi
-ngay rồi chuyển tới entry chưa gán; Chưa chắc / Tiếp không tạo nhãn mới.
-Các nhãn cũ vẫn được giữ và có thể quay lại sửa/xóa.
+Cấu hình được lưu tùy chọn tại notebook_profiles/memberX.json trong thư
+mục nhãn. Lần sau chọn file cấu hình, Nạp cấu hình, kiểm tra rồi mở bảng;
+không phải sửa cell. Chuyển người/data/công việc sẽ đóng bảng cũ trước khi
+áp dụng. Profile là JSON dữ liệu, không chạy code; không chứa nhãn tự động.
+Không đưa profile/dataset/labels lên GitHub.
 
-DOI chỉ bổ sung cho hiển thị qua join ref_arxiv_id, không sửa pool hay
-fingerprint. Hiển thị mọi DOI khác nhau, nguồn và giá trị gốc cần kiểm tra;
-không tự suy luận DOI arXiv bằng DOI tạp chí. Progress dùng cùng schema
-và metadata cũ nên tiếp tục được nhãn đã gán bằng CLI. Mỗi lần ghi dùng
-khóa ngắn, nạp lại file, giữ cập nhật ở entry khác và từ chối ghi đè entry
-đã đổi ở phiên khác. Callback từ nút của bảng cũ không được gán nhãn cho
-entry tiếp theo; lỗi ghi không chuyển entry và không làm mất file cũ.
-Khóa filesystem trên Drive vẫn cần một writer cho mỗi progress file.
+Notebook giữ nhóm 4 người là bối cảnh nhưng chưa nghiệm thu toàn nhóm:
+cần đối soát ít nhất 20 bài manual khác nhau và 400 nhãn, auto đủ quota,
+review hoàn tất và chia tập members=4 ở bước tổng hợp. Mỗi người gửi file
+progress và kế hoạch kèm snapshot dữ liệu. Không nối các snapshot khác nhau
+rồi bỏ kiểm tra fingerprint.
 
-Review lấy needs_review từ auto_labels.parquet của AUTO_RUN_DIR sau khi
-kiểm tra marker/schema/fingerprint. Tiến độ review mới tách theo tên lần
-chạy: `review/<auto-run>/<reviewer>.parquet`, tránh trộn quyết định của
-auto cũ với auto v2. Nhãn review vẫn được truyền riêng bằng --review cho
-bước hợp nhất; không tính là manual quota. Notebook không tự nghiệm thu
-hay xuất ground truth khi quota và nhãn chưa đủ.
-
-Mở `notebooks/labeling_tool.ipynb`. Tự điền đường dẫn tới dữ liệu của người
-dùng; có thể đặt `DEMO=True` để thử giao diện. Điền reviewer và kiểm
-tra đường dẫn hai bảng cùng file tiến độ. Công cụ hiển thị đầy đủ
-title, authors, year, DOI và đường dẫn arXiv của từng candidate cùng
-metadata entry. Year phía reference lấy từ `ref_submission_date` khi có.
-Chọn một số để match, `n` để xác nhận no-match, `s` bỏ qua, `p` quay lại,
-`c` xóa quyết định hiện tại và `q` thoát. Skip giữ nguyên quyết định cũ nếu
-entry đó đã có nhãn. Có thể dùng cùng giao diện trong terminal.
+CLI vẫn dùng được độc lập nếu muốn nhập số thay vì bảng notebook:
 
 ```powershell
 $env:PYTHONPATH = 'src'
 python -m matching.labeling --bibtex runtime/parsed/bibtex.parquet --references runtime/exports/EXPORT_ID/references.parquet --progress runtime/matching/manual_labels_member1.parquet --reviewer MEMBER1 --publication 2411.18799
 ```
 
-Lặp lại `--publication` để chọn nhiều publication. Dùng file progress riêng
-cho mỗi người. Chạy lại với cùng input và progress để tiếp tục entry chưa
-gán nhãn đầu tiên. Nhãn được lưu ngay sau mỗi lựa chọn bằng file tạm rồi
-replace. File progress gồm arxiv_id, citation_key, groundtruth_arxiv_id,
-label_status, reviewer và updated_at. Match có một ID, no-match có ID null,
-còn chưa gán nhãn không có row. Đây là tiến độ manual nội bộ; partition và
-groundtruth cuối được xây ở bước sau.
+Nhãn lưu ngay bằng file tạm rồi replace; cùng schema arxiv_id, citation_key,
+groundtruth_arxiv_id, label_status, reviewer, updated_at. Match có một ID,
+no-match có ID null, chưa gán không có row; chưa có partition ở bước này.
 
 Fingerprint nằm trong metadata Parquet của progress, gắn với cả hai bảng
 đầu vào đã chuẩn hóa. Khi input thay đổi, chương trình yêu cầu file progress

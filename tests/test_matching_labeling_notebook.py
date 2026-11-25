@@ -1,4 +1,4 @@
-"""Execute the notebook's public workflow rather than mirroring its implementation."""
+"""Test the shared notebook through the form callbacks users execute."""
 import json
 from pathlib import Path
 
@@ -7,182 +7,210 @@ import pyarrow.parquet as pq
 import pytest
 
 from matching.candidate_pool import build_candidate_pool
-from matching.labeling import pool_fingerprint
+from matching.labeling import pool_fingerprint, run_labeling_session
 from matching.auto_matcher import write_auto_labels
-from matching.dataset_plan import personal_manual_plan
+from matching.notebook_tool import AnnotationConfig, AnnotationNotebook, PathPicker, prepare_annotation
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def code_cells():
-    notebook = json.loads((ROOT / 'notebooks/labeling_tool.ipynb').read_text(encoding='utf-8'))
+def codes():
+    n = json.loads((ROOT / 'notebooks/labeling_tool.ipynb').read_text(encoding='utf-8'))
     assert all(not c.get('outputs') and c.get('execution_count') is None
-               for c in notebook['cells'] if c['cell_type'] == 'code')
-    return [''.join(c['source']) for c in notebook['cells'] if c['cell_type'] == 'code']
+               for c in n['cells'] if c['cell_type'] == 'code')
+    return [''.join(c['source']) for c in n['cells'] if c['cell_type'] == 'code']
 
 
-def test_all_six_notebook_cells_run_in_demo_and_save_only_after_a_human_click(monkeypatch):
-    pytest.importorskip('ipywidgets')
-    import IPython.display
-    monkeypatch.setattr(IPython.display, 'display', lambda *args, **kwargs: None)
-    monkeypatch.chdir(ROOT)
-    codes = code_cells()
-    assert len(codes) == 6
-    ns = {'__name__': '__notebook__'}
-    try:
-        for i, code in enumerate(codes):
-            exec(compile(code, f'labeling_tool:cell{i + 1}', 'exec'), ns)
-            if i == 0:
-                ns.update(DEMO=True, ON_COLAB=False, INSTALL_PACKAGES=False)
-            if i == 3:
-                ui = ns['labeling_ui']
-                assert not ns['progress'].exists()
-                next(b for b in ui.actions.children
-                     if getattr(b, 'description', '') == 'Không có match').click()
-                assert len(ui.session.labels) == 1
-        assert pq.read_table(ns['progress']).num_rows == 1
-        assert ns['labeling_ui'].closed
-    finally:
-        if 'labeling_ui' in ns:
-            ns['labeling_ui'].close()
-        if 'demo_directory' in ns:
-            ns['demo_directory'].cleanup()
-
-
-def test_notebook_review_selects_only_pending_auto_keys_and_isolates_run_progress(tmp_path):
-    entries = pa.Table.from_pylist([dict(arxiv_id='p', citation_key='k', title='Example',
-                                       authors=['Jane Doe'])])
-    references = pa.Table.from_pylist([
-        dict(arxiv_id='p', ref_arxiv_id=r, ref_title='Example', ref_authors=['Jane Doe'])
-        for r in ('r1', 'r2')])
-    bib = tmp_path / 'bib.parquet'
-    refs = tmp_path / 'refs.parquet'
-    pq.write_table(entries, bib)
-    pq.write_table(references, refs)
-    p = build_candidate_pool(entries, references)
-    plan = tmp_path / 'dataset_plan.json'
-    plan.write_text(json.dumps({'candidate_pool_sha256': pool_fingerprint(p)}), encoding='utf-8')
-    auto = tmp_path / 'auto-run-v2'
-    write_auto_labels(p, auto)
-    import matching.auto_matcher as matcher_module
-    ns = dict(DEMO=False, MODE='review', MEMBER='member1', REVIEWER='hieu',
-        BIBTEX_PATH=bib, REFERENCES_PATH=refs, DOI_INDEX=None, PLAN_PATH='',
-        AUTO_RUN_DIR=auto, PROGRESS_ROOT=tmp_path, json=json, pq=pq, pc=pa.compute,
-        build_candidate_pool=build_candidate_pool, pool_fingerprint=pool_fingerprint,
-        matcher_module=matcher_module, Path=Path)
-    exec(compile(code_cells()[2], 'labeling_tool:cell3', 'exec'), ns)
-    assert ns['entry_keys'] == [('p', 'k')]
-    assert ns['progress'] == tmp_path / 'review/auto-run-v2/hieu.parquet'
-    assert not ns['progress'].exists()
-
-
-def test_notebook_refuses_to_prepare_manual_on_a_different_snapshot(tmp_path):
-    entries = pa.Table.from_pylist([dict(arxiv_id='p', citation_key='k')])
-    references = pa.table({'arxiv_id': pa.array([], pa.string()),
-                           'ref_arxiv_id': pa.array([], pa.string())})
+def inputs(tmp_path):
     bib, refs = tmp_path / 'bib.parquet', tmp_path / 'refs.parquet'
+    entries = pa.Table.from_pylist([dict(arxiv_id=f'p{i}', citation_key=f'k{k}',
+        title='Example', authors=['Jane Doe']) for i in range(6) for k in range(23)])
+    references = pa.Table.from_pylist([dict(arxiv_id=f'p{i}', ref_arxiv_id=f'r{i}',
+        ref_title='Example', ref_authors=['Jane Doe']) for i in range(6)])
     pq.write_table(entries, bib)
     pq.write_table(references, refs)
-    plan = tmp_path / 'dataset_plan.json'
-    plan.write_text(json.dumps({'candidate_pool_sha256': 'different'}), encoding='utf-8')
-    ns = dict(DEMO=False, MODE='manual', PLAN_MODE='existing', MEMBER='member1', REVIEWER='hieu',
-        BIBTEX_PATH=bib, REFERENCES_PATH=refs, DOI_INDEX=None, PLAN_PATH=plan,
-        json=json, build_candidate_pool=build_candidate_pool, pool_fingerprint=pool_fingerprint,
-        Path=Path, PROGRESS_ROOT=tmp_path)
-    with pytest.raises(ValueError, match='Snapshot khác'):
-        exec(compile(code_cells()[2], 'labeling_tool:cell3', 'exec'), ns)
+    return AnnotationConfig(member='member4', reviewer='fourth', bibtex=str(bib),
+        references=str(refs), output=str(tmp_path / 'my-labels'))
 
 
-def test_shared_notebook_template_leaves_all_data_and_output_paths_blank(monkeypatch):
-    monkeypatch.chdir(ROOT)
-    ns = {}
-    exec(compile(code_cells()[0], 'labeling_tool:cell1', 'exec'), ns)
-    for name in ('BIBTEX_PATH', 'REFERENCES_PATH', 'PLAN_PATH', 'PROGRESS_ROOT',
-                 'DOI_INDEX', 'AUTO_RUN_DIR', 'MEMBER', 'REVIEWER'):
-        assert ns[name] == ''
-    assert 'DATA_ROOT' not in ns and 'DATASET_ROOT' not in ns
-    assert ns['GROUP_MEMBERS'] == 4 and ns['PLAN_MODE'] == 'personal'
-    assert ns['CHECKPOINT_PATH'] == ns['REFERENCE_SNAPSHOTS_PATH'] == ''
+def test_shared_notebook_has_no_personal_configuration_to_edit():
+    cells = codes()
+    assert len(cells) == 4
+    for i, code in enumerate(cells):
+        compile(code, f'labeling_tool:cell{i+1}', 'exec')
+    assert not any(x in '\n'.join(cells) for x in ('Data_Crawl_Last', 'BIBTEX_PATH =',
+        'REFERENCES_PATH =', 'MEMBER =', 'GROUP_MEMBERS =', 'ROOT ='))
+    c = AnnotationConfig()
+    assert c.member == c.reviewer == c.bibtex == c.references == c.output == ''
+    assert c.plan == c.doi == c.auto_run == ''
 
 
-@pytest.mark.parametrize('missing', ['BIBTEX_PATH', 'REFERENCES_PATH',
-                                    'PROGRESS_ROOT', 'AUTO_RUN_DIR'])
-def test_blank_required_paths_are_named_before_filesystem_access(tmp_path, missing):
-    ns = dict(DEMO=False, MODE='review', MEMBER='member1', REVIEWER='hieu',
-              Path=Path, DOI_INDEX='', **{name: str(tmp_path / 'not-read-yet') for name in
-              ('BIBTEX_PATH', 'REFERENCES_PATH', 'PLAN_PATH', 'PROGRESS_ROOT', 'AUTO_RUN_DIR')})
-    ns[missing] = ''
-    with pytest.raises(ValueError, match='Chưa điền đường dẫn.*' + missing):
-        exec(compile(code_cells()[2], 'labeling_tool:cell3', 'exec'), ns)
-
-
-def test_personal_notebook_creates_and_resumes_own_plan_without_group_data(tmp_path):
-    entries = pa.Table.from_pylist([dict(arxiv_id=f'p{i}', citation_key=f'k{k}', title='Example')
-                                    for i in range(6) for k in range(23)])
-    refs = pa.Table.from_pylist([dict(arxiv_id=f'p{i}', ref_arxiv_id=f'r{i}') for i in range(6)])
-    bib_path, ref_path = tmp_path / 'bib.parquet', tmp_path / 'refs.parquet'
-    pq.write_table(entries, bib_path)
-    pq.write_table(refs, ref_path)
-    ns = dict(DEMO=False, MODE='manual', PLAN_MODE='personal', MEMBER='member4', REVIEWER='fourth',
-        BIBTEX_PATH=str(bib_path), REFERENCES_PATH=str(ref_path), PLAN_PATH='',
-        PROGRESS_ROOT=str(tmp_path / 'my-labels'), DOI_INDEX='', Path=Path, json=json,
-        build_candidate_pool=build_candidate_pool, pool_fingerprint=pool_fingerprint,
-        personal_manual_plan=personal_manual_plan, GROUP_MEMBERS=4, SEED=42,
-        MANUAL_PUBLICATIONS=[], EXCLUDED_PUBLICATIONS=[])
-    code = compile(code_cells()[2], 'labeling_tool:cell3', 'exec')
-    exec(code, ns)
-    assert len(ns['entry_keys']) == 100 and len(ns['publications']) == 5
-    assert not ns['progress'].exists()
-    plan_path = tmp_path / 'my-labels/plans/member4.json'
-    original = plan_path.read_bytes()
-    from matching.labeling_table import TableSession
-    session = TableSession(ns['pool'], ns['progress'], reviewer='fourth',
-                           publications=ns['publications'], entry_keys=ns['entry_keys'])
-    session.save(None)
-    exec(code, ns)
-    assert plan_path.read_bytes() == original
-    assert pq.read_table(ns['progress']).num_rows == 1
-
-
-def test_existing_mode_requires_original_plan_path_before_reading_files(tmp_path):
-    ns = dict(DEMO=False, MODE='manual', PLAN_MODE='existing', MEMBER='member1', REVIEWER='hieu',
-        BIBTEX_PATH='bib.parquet', REFERENCES_PATH='refs.parquet', PLAN_PATH='',
-        PROGRESS_ROOT=tmp_path, DOI_INDEX=None)
-    with pytest.raises(ValueError, match='Chưa điền đường dẫn.*PLAN_PATH'):
-        exec(compile(code_cells()[2], 'labeling_tool:cell3', 'exec'), ns)
-
-
-def test_all_six_cells_work_on_a_personal_dataset_and_keep_saved_labels_on_restart(tmp_path, monkeypatch):
+def test_four_cells_run_demo_and_save_only_after_a_human_click(monkeypatch):
     pytest.importorskip('ipywidgets')
     import IPython.display
-    monkeypatch.setattr(IPython.display, 'display', lambda *args, **kwargs: None)
+    monkeypatch.setattr(IPython.display, 'display', lambda *a, **k: None)
     monkeypatch.chdir(ROOT)
-    bib, refs = tmp_path / 'own-bib.parquet', tmp_path / 'own-refs.parquet'
-    pq.write_table(pa.Table.from_pylist([
-        dict(arxiv_id=f'own{i}', citation_key=f'k{k}', title='Own entry', authors=['Jane Doe'])
-        for i in range(6) for k in range(22)]), bib)
-    pq.write_table(pa.Table.from_pylist([
-        dict(arxiv_id=f'own{i}', ref_arxiv_id=f'r{i}', ref_title='Own reference')
-        for i in range(6)]), refs)
     ns = {'__name__': '__notebook__'}
+    tool = None
     try:
-        for i, code in enumerate(code_cells()):
-            exec(compile(code, f'labeling_tool:cell{i + 1}', 'exec'), ns)
-            if i == 0:
-                ns.update(ON_COLAB=False, INSTALL_PACKAGES=False, MEMBER='member4', REVIEWER='fourth',
-                          BIBTEX_PATH=str(bib), REFERENCES_PATH=str(refs),
-                          PROGRESS_ROOT=str(tmp_path / 'progress'))
-            if i == 3:
-                ui = ns['labeling_ui']
-                ui.table.children[2].children[0].click()
-                assert len(ui.session.labels) == 1
-        assert ns['labeling_ui'].closed
-        before = ns['personal_path'].read_bytes()
-        exec(compile(code_cells()[2], 'labeling_tool:cell3', 'exec'), ns)
-        exec(compile(code_cells()[3], 'labeling_tool:cell4', 'exec'), ns)
-        assert len(ns['labeling_ui'].session.labels) == 1
-        assert len(ns['labeling_ui'].session.keys) == 100
-        assert ns['personal_path'].read_bytes() == before
+        for i, code in enumerate(codes()):
+            exec(compile(code, f'labeling_tool:cell{i+1}', 'exec'), ns)
+            if i == 1:
+                tool = ns['tool']
+                tool.task.value = 'demo'
+                tool.open_button.click()
+                assert tool.prepared is not None
+                assert not tool.prepared.progress.exists()
+                next(b for b in tool.table.actions.children
+                     if getattr(b, 'description', '') == 'Không có match').click()
+                assert pq.read_table(tool.prepared.progress).num_rows == 1
+        assert tool.table.closed
     finally:
-        if 'labeling_ui' in ns:
-            ns['labeling_ui'].close()
+        if tool:
+            tool.close()
+            if tool.temporary:
+                tool.temporary.cleanup()
+
+
+def test_personal_form_creates_plan_and_profile_resumes_without_resampling(tmp_path):
+    pytest.importorskip('ipywidgets')
+    c = inputs(tmp_path)
+    tool, restored = AnnotationNotebook(start_directory=tmp_path), None
+    try:
+        tool.member.value, tool.reviewer.value = 'member4', 'fourth'
+        for name in ('bibtex', 'references', 'output'):
+            tool.fields[name].value = getattr(c, name)
+        tool.open_button.click()
+        assert tool.prepared is not None, tool.status.value
+        assert len(tool.prepared.entry_keys) == 100
+        assert not tool.prepared.progress.exists()
+        tool.table.table.children[2].children[0].click()
+        assert len(tool.table.session.labels) == 1
+        original_plan, profile = tool.prepared.plan_path.read_bytes(), tool.profile.value
+        assert Path(profile).is_file()
+        tool.finish()
+        restored = AnnotationNotebook(start_directory=tmp_path)
+        restored.profile.value = profile
+        restored.root.children[1].children[-1].click()
+        assert restored.member.value == 'member4'
+        restored.open_button.click()
+        assert restored.prepared is not None, restored.status.value
+        assert len(restored.table.session.labels) == 1
+        assert restored.prepared.plan_path.read_bytes() == original_plan
+        assert len(restored.table.session.keys) == 100
+    finally:
+        tool.close()
+        if restored:
+            restored.close()
+
+
+def test_existing_mode_keeps_legacy_progress_and_rejects_different_snapshot(tmp_path):
+    c = inputs(tmp_path)
+    pool = build_candidate_pool(c.bibtex, c.references)
+    keys = [(r['arxiv_id'], r['citation_key']) for r in pool.entries.to_pylist()[:20]]
+    plan = tmp_path / 'original-plan.json'
+    plan.write_text(json.dumps({'candidate_pool_sha256': pool_fingerprint(pool),
+        'manual_assignments': [dict(owner='member1', arxiv_id='p0', citation_keys=[k[1] for k in keys])]}),
+        encoding='utf-8')
+    progress = Path(c.output) / 'manual/member1.parquet'
+    run_labeling_session(pool, progress, reviewer='hieu', entry_keys=[keys[0]],
+                         input_fn=lambda _: '1', output=lambda _: None)
+    original = progress.read_bytes()
+    c.task, c.member, c.reviewer, c.plan = 'existing', 'member1', 'hieu', str(plan)
+    prepared = prepare_annotation(c)
+    assert prepared.progress == progress and progress.read_bytes() == original
+    payload = json.loads(plan.read_text(encoding='utf-8'))
+    payload['candidate_pool_sha256'] = 'wrong'
+    plan.write_text(json.dumps(payload), encoding='utf-8')
+    with pytest.raises(ValueError, match='snapshot'):
+        prepare_annotation(c)
+    assert progress.read_bytes() == original
+
+
+def test_review_uses_correct_auto_run_without_manual_plan(tmp_path):
+    c = inputs(tmp_path)
+    pool = build_candidate_pool(c.bibtex, c.references)
+    rows = pool.references.to_pylist()
+    rows.append(dict(rows[0], ref_arxiv_id='another-r0'))
+    pq.write_table(pa.Table.from_pylist(rows, schema=pool.references.schema), c.references)
+    pool = build_candidate_pool(c.bibtex, c.references)
+    auto = tmp_path / 'auto-v2'
+    write_auto_labels(pool, auto)
+    c.task, c.auto_run = 'review', str(auto)
+    prepared = prepare_annotation(c)
+    assert prepared.plan_path is None and len(prepared.entry_keys) == 23
+    assert prepared.progress == Path(c.output) / 'review/auto-v2/fourth.parquet'
+    assert not prepared.progress.exists()
+
+
+@pytest.mark.parametrize('field,label', [('bibtex', 'BibTeX M2'), ('references', 'References M1'),
+                                        ('output', 'thư mục lưu nhãn')])
+def test_required_fields_are_named_in_errors(tmp_path, field, label):
+    c = inputs(tmp_path)
+    setattr(c, field, '')
+    with pytest.raises(ValueError, match=label):
+        prepare_annotation(c)
+
+
+def test_web_link_is_not_mistaken_for_a_drive_path(tmp_path):
+    c = inputs(tmp_path)
+    c.bibtex = 'https://drive.google.com/file/d/example/view'
+    with pytest.raises(ValueError, match='link website Drive'):
+        prepare_annotation(c)
+
+
+def test_hidden_fields_are_ignored_and_identity_change_closes_old_buttons(tmp_path):
+    pytest.importorskip('ipywidgets')
+    c = inputs(tmp_path)
+    tool = AnnotationNotebook(start_directory=tmp_path)
+    try:
+        tool.member.value = 'member1'
+        for name in ('bibtex', 'references', 'output'):
+            tool.fields[name].value = getattr(c, name)
+        tool.fields['plan'].value = 'hidden-plan-from-old-task.json'
+        tool.fields['auto_run'].value = 'hidden-auto'
+        tool.open_button.click()
+        assert tool.prepared is not None, tool.status.value
+        button = tool.table.table.children[2].children[0]
+        path = tool.prepared.progress
+        tool.member.value = 'member2'
+        assert tool.table.closed and tool.prepared is None
+        button.click()
+        assert not path.exists() and tool.reviewer.value == 'anh'
+    finally:
+        tool.close()
+
+
+def test_picker_navigates_and_distinguishes_file_from_directory(tmp_path):
+    pytest.importorskip('ipywidgets')
+    import ipywidgets as w
+    folder = tmp_path / 'sub'
+    folder.mkdir()
+    file = folder / 'plan.json'
+    file.write_text('{}', encoding='utf-8')
+    field = w.Text()
+    picker = PathPicker(field, start=tmp_path, kind='file')
+    try:
+        picker.items.value = str(folder)
+        picker._select()
+        assert field.value == ''
+        picker._open()
+        assert Path(picker.location.value) == folder
+        picker.items.value = str(file)
+        picker._select()
+        assert field.value == str(file)
+    finally:
+        picker.close()
+        field.close()
+
+
+def test_progress_and_finish_before_open_are_friendly_not_name_errors(tmp_path):
+    pytest.importorskip('ipywidgets')
+    tool = AnnotationNotebook(start_directory=tmp_path)
+    try:
+        tool.show_progress()
+        assert 'biểu mẫu' in tool.report_area.children[0].value
+        tool.finish()
+        assert 'Chưa mở bảng' in tool.report_area.children[0].value
+    finally:
+        tool.close()
