@@ -792,6 +792,29 @@ def _publication_audits(parts_root: Path, arxiv_ids) -> dict:
     return audits
 
 
+def _write_bibtex_audit_stream(parts_root: Path, output_root: Path, arxiv_ids) -> int:
+    """Stream-write bibtex_audit.json one publication at a time to avoid OOM."""
+    target = output_root / 'bibtex_audit.json'
+    tmp = output_root / '.bibtex_audit.json.tmp'
+    count = 0
+    with tmp.open('w', encoding='utf8') as handle:
+        handle.write('{"schema_version": 1, "publications": {\n')
+        first = True
+        for arxiv_id in sorted(arxiv_ids):
+            path = parts_root / quote(arxiv_id, safe='') / 'audit.json'
+            payload = _read_json(path, None)
+            if not isinstance(payload, dict):
+                continue
+            if not first:
+                handle.write(',\n')
+            first = False
+            handle.write(f'{json.dumps(arxiv_id, ensure_ascii=False)}: {json.dumps(payload, ensure_ascii=False)}')
+            count += 1
+        handle.write('\n}}\n')
+    os.replace(tmp, target)
+    return count
+
+
 def _merge_parts(parts_root: Path, output_root: Path, arxiv_ids) -> dict[str, int]:
     part_dirs = [parts_root / quote(arxiv_id, safe='') for arxiv_id in sorted(arxiv_ids)]
     counts = {}
@@ -810,7 +833,7 @@ def _merge_parts(parts_root: Path, output_root: Path, arxiv_ids) -> dict[str, in
                 total += table.num_rows
                 buffer.append(table)
                 buffered_rows += table.num_rows
-                if buffered_rows >= 25000:
+                if buffered_rows >= 10000:
                     writer.write_table(pa.concat_tables(buffer))
                     buffer.clear()
                     buffered_rows = 0
@@ -1162,9 +1185,7 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
     gc.collect()
     counts = _merge_parts(parts_root, output, input_ids)
     _write_coverage(output, processed)
-    audits = _publication_audits(parts_root, input_ids)
-    _atomic_json(output / 'bibtex_audit.json',
-                 dict(schema_version=1, publications=audits))
+    audit_count = _write_bibtex_audit_stream(parts_root, output, input_ids)
     errors = [error for item in processed.values() for error in item.get('errors', [])]
     warnings = [warning for item in processed.values() for warning in item.get('warnings', [])]
     _atomic_json(output / 'errors.json', errors)
@@ -1218,7 +1239,7 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
                         bibtex_conflict_fields=aggregate['bibtex_conflict_fields'],
                         bibtex_unexportable=aggregate['bibtex_unexportable'],
                         bibtex_unresolved=aggregate['bibtex_unresolved']),
-        'audit': dict(schema_version=1, publications=len(audits),
+        'audit': dict(schema_version=1, publications=audit_count,
                       path='bibtex_audit.json'),
         'empty_versions': aggregate['versions_empty'],
         'timing': dict(elapsed_seconds=round(elapsed, 3),
@@ -1251,7 +1272,7 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
                                                bytes=coverage_path.stat().st_size)
     audit_path = output / 'bibtex_audit.json'
     manifest['outputs']['bibtex_audit.json'] = dict(
-        rows=len(audits), sha256=digest(audit_path), bytes=audit_path.stat().st_size)
+        rows=audit_count, sha256=digest(audit_path), bytes=audit_path.stat().st_size)
     manifest['storage']['output_bytes'] = sum(item['bytes'] for item in manifest['outputs'].values())
     _atomic_json(output / 'manifest.json', manifest)
     if not output_validation['ok']:
