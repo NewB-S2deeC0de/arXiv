@@ -214,3 +214,22 @@ def test_progress_and_finish_before_open_are_friendly_not_name_errors(tmp_path):
         assert 'Chưa mở bảng' in tool.report_area.children[0].value
     finally:
         tool.close()
+
+
+def test_doi_is_a_visible_main_form_row_and_does_not_depend_on_accordion(tmp_path):
+    pytest.importorskip('ipywidgets')
+    tool = AnnotationNotebook(start_directory=tmp_path)
+    try:
+        children = list(tool.root.children)
+        assert children.index(tool.path_rows['doi']) == children.index(tool.path_rows['references']) + 1
+        assert tool.path_rows['doi'].layout.display != 'none'
+        assert tool.advanced_box.layout.display == 'none'
+        tool.task.value = 'existing'
+        assert tool.path_rows['doi'].layout.display != 'none'
+        tool.advanced_toggle.value = True
+        assert tool.advanced_box.layout.display != 'none'
+        tool.advanced_toggle.value = False
+        assert tool.advanced_box.layout.display == 'none'
+        assert tool.path_rows['doi'].layout.display != 'none'
+    finally:
+        tool.close()

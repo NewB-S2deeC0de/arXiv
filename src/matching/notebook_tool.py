@@ -273,9 +273,11 @@ class AnnotationNotebook:
             control.observe(lambda _: self._invalidate(), names='value')
         self.personal_options = w.VBox([self.publications, self.excluded,
             self.path_rows['checkpoint'], self.path_rows['reference_snapshots'], self.seed])
-        advanced = w.Accordion(children=[w.VBox([self.path_rows['doi'], self.personal_options, self.page_size])])
-        advanced.set_title(0, 'DOI và tùy chọn nâng cao — có thể để trống')
-        advanced.selected_index = None
+        self.advanced_box = w.VBox([self.personal_options, self.page_size],
+                                   layout=w.Layout(display='none'))
+        self.advanced_toggle = w.ToggleButton(description='Hiện tùy chọn nâng cao',
+                                               layout=w.Layout(width='240px'))
+        self.advanced_toggle.observe(self._toggle_advanced, names='value')
         self.save_profile = w.Checkbox(value=True, description='Lưu cấu hình tại thư mục nhãn để mở lại lần sau')
         self.profile = w.Text(description='File cấu hình đã lưu:', placeholder='Tùy chọn: .../notebook_profiles/memberX.json',
             layout=w.Layout(width='85%'), style={'description_width': '220px'})
@@ -294,10 +296,16 @@ class AnnotationNotebook:
         self.root = w.VBox([w.HTML('<h3>Thiết lập phiên gán nhãn</h3>'
             'Điền thông tin trong biểu mẫu; không sửa các cell Python. Các ô dữ liệu đều để trống.'),
             w.HBox([self.profile, choose_profile, load]), self.task, self.member, self.reviewer, self.explanation,
-            self.path_rows['bibtex'], self.path_rows['references'], self.path_rows['output'],
-            self.path_rows['plan'], self.path_rows['auto_run'], advanced, self.save_profile,
+            self.path_rows['bibtex'], self.path_rows['references'], self.path_rows['doi'],
+            self.path_rows['output'], self.path_rows['plan'], self.path_rows['auto_run'],
+            self.advanced_toggle, self.advanced_box, self.save_profile,
             self.open_button, self.status, self.browser_area, self.table_area, self.report_area])
         self._task_changed(None)
+
+    def _toggle_advanced(self, change):
+        self.advanced_box.layout.display = '' if change['new'] else 'none'
+        self.advanced_toggle.description = ('Ẩn tùy chọn nâng cao' if change['new']
+                                            else 'Hiện tùy chọn nâng cao')
 
     def _invalidate(self):
         if self.table is not None and not self.table.closed:
