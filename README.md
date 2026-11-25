@@ -140,7 +140,7 @@ Notebook có sáu cell thực thi, kèm hướng dẫn tiếng Việt trước t
 |---|---|
 | 1 | Điền MEMBER/REVIEWER, PROJECT_ROOT, các đường dẫn dữ liệu và nơi ghi tiến độ |
 | 2 | Mount Drive, clone/pull M3_E1 trên Colab, cài dependency, import và bật widgets |
-| 3 | Kiểm tra các file, fingerprint và phân công; review dùng đúng một auto run |
+| 3 | Tạo/nạp kế hoạch cá nhân hoặc nạp kế hoạch cũ; kiểm tra snapshot; review đúng một auto run |
 | 4 | Mở bảng tìm kiếm/phân trang, chọn reference hoặc xác nhận no-match |
 | 5 | Nạp lại tiến độ và đếm số nhãn xác nhận theo từng publication |
 | 6 | Đóng bảng, đọc lại file tiến độ để bàn giao |
@@ -150,12 +150,35 @@ Colab mặc định chỉ có đường dẫn code `/content/arxiv_m3_e1`. Tất
 người tự điền trong Cell 1. Có hướng dẫn Copy path và phân biệt đường dẫn
 file với thư mục, kèm ví dụ minh họa. Cell 3 báo tên biến bắt buộc còn
 trống trước khi đọc file; không biến chuỗi rỗng thành thư mục hiện tại.
-Hiếu chọn member1/hieu, Anh chọn member2/anh, Kiên chọn member3/kien.
+Hiếu chọn member1/hieu, Anh chọn member2/anh, Kiên chọn member3/kien;
+người thứ tư dùng member4 và mã reviewer của mình. GROUP_MEMBERS=4.
 Nếu dùng chung kế hoạch, input phải cùng nội dung dù đường dẫn khác nhau;
 dữ liệu khác nội dung phải có kế hoạch tương ứng. PROGRESS_ROOT có thể
 trỏ sang Drive riêng khi dataset chỉ có quyền đọc; để tiếp tục nhãn cũ
 phải giữ đúng nơi lưu trước đây. DOI_INDEX để trống hoặc None khi chưa
 có DOI bổ sung; AUTO_RUN_DIR chỉ bắt buộc trong chế độ review.
+
+Notebook hỗ trợ mỗi người chạy trên dữ liệu riêng mà không cần kế hoạch
+15 bài chung trước đây. Người bắt đầu mới dùng PLAN_MODE=personal, điền
+BIBTEX_PATH, REFERENCES_PATH và PROGRESS_ROOT. Notebook chọn 5 publication
+có ít nhất 20 entry và candidate arXiv, lấy 20 entry/publication bằng seed
+42 không dựa trên matcher, rồi lưu `plans/<MEMBER>.json`. Có thể chỉ định
+đúng 5 ID bằng MANUAL_PUBLICATIONS và loại các bài auto/đã phân công bằng
+EXCLUDED_PUBLICATIONS. Không tính quota auto hoặc chia tập trong bước này.
+
+CHECKPOINT_PATH và REFERENCE_SNAPSHOTS_PATH tùy chọn cho việc tạo kế hoạch
+cá nhân; nếu cung cấp thì lọc những publication thiếu/lỗi/conflict từ báo
+cáo. Không có các artifact này sẽ hiện cảnh báo về phạm vi kiểm tra, không
+coi đủ số dòng là parse đúng. Kế hoạch có sẵn được nạp lại, không resample
+hay ghi đè khi đổi input/seed/lựa chọn bài. Cần giữ cùng cấu hình để tiếp tục.
+
+Người đã có nhãn CLI/notebook cũ dùng PLAN_MODE=existing và PLAN_PATH gốc.
+Nếu có progress nhưng chưa có kế hoạch cá nhân, notebook chặn chọn lại mẫu
+để tránh mất liên hệ với phân công cũ. Review không bắt buộc PLAN_PATH:
+fingerprint được kiểm trực tiếp giữa pool hiện tại và summary của auto run.
+Khi bàn giao mỗi người gửi progress và kế hoạch kèm phiên bản dữ liệu;
+nhóm 4 người đối soát 20 bài manual khác nhau, ít nhất 400 nhãn, tránh trùng
+auto rồi mới gộp fingerprint có kiểm tra, tính quota và chia tập members=4.
 
 Bảng giữ nguyên thứ tự ứng viên của pool, không xếp hạng hoặc chọn sẵn
 bằng matcher. Tìm kiếm theo từ trong title/tác giả/ID/năm/DOI chỉ lọc màn
