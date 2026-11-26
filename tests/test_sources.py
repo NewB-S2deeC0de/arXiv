@@ -13,6 +13,13 @@ def test_tex(tmp_path):
     assert result['status']=='succeeded'
     assert (tmp_path/'out'/'tex'/'source.tex').read_bytes()==raw
 
+def test_tex_without_document_class(tmp_path):
+    archive=tmp_path/'download'; raw=b'\\overfullrule=0pt\n\\centerline {\\bf Multiple critical points}\\par\n\\bigskip\nBody'
+    archive.write_bytes(raw)
+    result=inspect_and_extract(archive,tmp_path/'out',CrawlerConfig())
+    assert result['status']=='succeeded'
+    assert (tmp_path/'out'/'tex'/'source.tex').read_bytes()==raw
+
 def test_corrupt_gzip(tmp_path):
     archive=tmp_path/'bad'; archive.write_bytes(b'\x1f\x8b\x08\x00'+b'\x00'*6+b'\xff'*20)
     with pytest.raises(ValueError): inspect_and_extract(archive,tmp_path/'out',CrawlerConfig())

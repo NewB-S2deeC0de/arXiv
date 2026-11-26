@@ -35,6 +35,32 @@ def is_docx(payload, limits):
         raise ValueError('Invalid DOCX') from exc
 
 
+def is_html_paper(prefix):
+    lowered=prefix.lower()
+    if not (b'<html' in lowered or b'<!doctype html' in lowered): return False
+    if not (b'<body' in lowered and (b'<head' in lowered or b'<title' in lowered or b'<!doctype' in lowered)): return False
+    if any(err in lowered for err in (b'oops',b'access denied',b'attention required',b'cloudflare',b'captcha',b'just a moment')): return False
+    return True
+
+
+def is_tex_source(prefix):
+    lowered=prefix.lower()
+    if b'<html' in lowered or b'<!doctype html' in lowered: return False
+    if 0 in prefix: return False
+    text=prefix.decode('utf-8','ignore')
+    if not all(ch.isprintable() or ch.isspace() for ch in text): return False
+    sep=chr(92)
+    parts=[w.strip() for w in text.replace(chr(10),' ').split(sep)]
+    commands=set()
+    for w in parts:
+        if not w or not (w[0].isalpha() or w[0]=='@'): continue
+        name=w.split('=')[0].split('{')[0].split()
+        if name: commands.add(name[0])
+    if not commands: return False
+    known={'documentclass','documentstyle','begin','end','input','include','def','newcommand','renewcommand','newtheorem','usepackage','title','author','maketitle','section','subsection','subsubsection','paragraph','item','cite','label','ref','bibitem','bibliography','overfullrule','centerline','par','bigskip','smallskip','medskip','bf','it','em','underline','href','includegraphics','caption','figure','table','abstract','appendix'}
+    return bool(commands & known) or len(commands)>=5
+
+
 def inspect_and_extract(archive,staging,config):
     staging=Path(staging)
     if staging.exists(): shutil.rmtree(staging)
@@ -80,7 +106,10 @@ def inspect_and_extract(archive,staging,config):
         if prefix.startswith(b'%PDF-'):
             total=payload.stat().st_size; discarded=1
             if total>min(limits['max_member_bytes'],limits['max_unpacked_bytes']): raise RuntimeError('resource_limit')
-        elif any(token in prefix for token in (b'\\documentclass',b'\\documentstyle',b'\\begin{document}',b'\\input',b'\\def')) and b'<html' not in prefix.lower():
+        elif is_html_paper(prefix):
+            total=payload.stat().st_size; discarded=1
+            if total>min(limits['max_member_bytes'],limits['max_unpacked_bytes']): raise RuntimeError('resource_limit')
+        elif is_tex_source(prefix):
             with payload.open('rb') as f: save('source.tex',f,payload.stat().st_size)
         elif docx_size:=is_docx(payload,limits):
             total=docx_size; discarded=1
