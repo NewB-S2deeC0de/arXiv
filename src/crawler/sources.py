@@ -35,6 +35,14 @@ def is_docx(payload, limits):
         raise ValueError('Invalid DOCX') from exc
 
 
+def is_html_paper(prefix):
+    lowered = prefix.lower()
+    if not (b'<html' in lowered or b'<!doctype html' in lowered): return False
+    if not (b'<body' in lowered and (b'<head' in lowered or b'<title' in lowered or b'<!doctype' in lowered)): return False
+    if any(err in lowered for err in (b'oops', b'access denied', b'attention required', b'cloudflare', b'captcha', b'just a moment')): return False
+    return True
+
+
 def inspect_and_extract(archive,staging,config):
     staging=Path(staging)
     if staging.exists(): shutil.rmtree(staging)
@@ -84,6 +92,9 @@ def inspect_and_extract(archive,staging,config):
             with payload.open('rb') as f: save('source.tex',f,payload.stat().st_size)
         elif docx_size:=is_docx(payload,limits):
             total=docx_size; discarded=1
+        elif is_html_paper(prefix):
+            total=payload.stat().st_size; discarded=1
+            if total>min(limits['max_member_bytes'],limits['max_unpacked_bytes']): raise RuntimeError('resource_limit')
         else: raise ValueError('Unrecognized source payload')
     if payload!=Path(archive): payload.unlink()
     result=dict(no_tex_reason=None if tex else 'valid_source_without_tex',status='succeeded' if tex else 'no_tex',compressed_bytes=Path(archive).stat().st_size,unpacked_bytes=total,kept_bytes=kept,tex_count=tex,bib_count=bib,discarded_files=discarded,sha256=digest(archive))
