@@ -1,9 +1,11 @@
 """One shared notebook workflow: users fill forms, not Python configuration."""
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from pathlib import Path
+import hashlib
 import json
 import re
+import unicodedata
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -52,6 +54,30 @@ def _ids(value):
     return [item for item in re.split(r'[\s,;]+', value.strip()) if item]
 
 
+def _user_id(name):
+    """Portable filename ID; display names stay Unicode in the labels."""
+    text = unicodedata.normalize('NFKD', name.replace('đ', 'd').replace('Đ', 'D'))
+    ascii_name = text.encode('ascii', 'ignore').decode('ascii').lower()
+    code = re.sub(r'[^a-z0-9_-]+', '_', ascii_name).strip('_-')
+    return code or 'user_' + hashlib.sha256(name.encode('utf-8')).hexdigest()[:12]
+
+
+def resolve_identity(config):
+    if config.task == 'demo':
+        return config
+    reviewer = config.reviewer.strip() if isinstance(config.reviewer, str) else ''
+    if not reviewer or any(not char.isprintable() for char in reviewer):
+        raise ValueError('Nhập tên người gán nhãn; có thể dùng tiếng Việt có dấu, không dùng ký tự điều khiển')
+    member = config.member.strip() if isinstance(config.member, str) else ''
+    if not member:
+        if config.task == 'existing':
+            raise ValueError('Tiếp tục nhãn cũ: nhập đúng mã lưu tiến độ đã dùng trong kế hoạch gốc')
+        member = _user_id(reviewer)
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', member):
+        raise ValueError('Mã lưu tiến độ chỉ gồm chữ không dấu, số, _ hoặc -; không điền đường dẫn')
+    return replace(config, reviewer=reviewer, member=member)
+
+
 def _file(value, label, *, optional=False, table=False):
     if not value or not str(value).strip():
         if optional:
@@ -86,9 +112,7 @@ def prepare_annotation(config, *, group_members=4):
             ['Demo dùng dữ liệu giả và thư mục tạm, không ghi vào tiến độ thật.'], temporary)
     if config.task not in ('personal', 'existing', 'review'):
         raise ValueError('Chọn một công việc hợp lệ')
-    for label, value in [('Thành viên', config.member), ('Mã người gán nhãn', config.reviewer)]:
-        if not re.fullmatch(r'[A-Za-z0-9_-]+', value):
-            raise ValueError(f'{label}: chọn/điền mã không dấu, không khoảng trắng')
+    config = resolve_identity(config)
     if type(config.page_size) is not int or not 1 <= config.page_size <= 50:
         raise ValueError('Số dòng mỗi trang phải từ 1 đến 50')
     if type(config.seed) is not int:
@@ -126,6 +150,9 @@ def prepare_annotation(config, *, group_members=4):
                 checkpoint=json.loads(checkpoint_path.read_text(encoding='utf-8')) if checkpoint_path else None,
                 snapshots=pq.read_table(snapshots_path) if snapshots_path else None)
             notes.extend(plan['warnings'])
+            if plan.get('reviewer') != config.reviewer:
+                raise ValueError('Mã lưu tiến độ này đã được dùng với tên người gán nhãn khác. '
+                                 'Nạp cấu hình cũ nếu là cùng người; người khác cần nhập mã riêng')
         assigned = [a for a in plan['manual_assignments'] if a['owner'] == config.member]
         if not assigned:
             raise ValueError('Thành viên không có phân công trong kế hoạch đã chọn')
@@ -148,12 +175,15 @@ def prepare_annotation(config, *, group_members=4):
             raise ValueError('Lần chạy auto này không còn entry needs_review')
         keys = [(r['arxiv_id'], r['citation_key']) for r in queue]
         publications = sorted({r['arxiv_id'] for r in queue})
-        progress = output / 'review' / auto_path.name / f'{config.reviewer}.parquet'
+        progress = output / 'review' / auto_path.name / f'{config.member}.parquet'
         notes.append('Review lần chạy: ' + auto_path.name)
     # Validate existing progress before a configuration is accepted by the form.
     session = TableSession(pool, progress, reviewer=config.reviewer,
                             publications=publications, entry_keys=keys, papers=doi)
     if any(r['reviewer'] != config.reviewer for r in session.labels.values()):
+        if config.task == 'review':
+            raise ValueError('File review đã có nhãn mang tên người khác. Dùng đúng cấu hình đã lưu '
+                             'nếu tiếp tục; người mới cần mã lưu tiến độ riêng')
         notes.append('File có nhãn mang mã reviewer khác trước đây; giữ nguyên nguồn của nhãn cũ. '
                      'Kiểm tra đúng thành viên/nơi lưu trước khi sửa.')
     return PreparedAnnotation(pool, progress, config.reviewer, publications, keys, doi, plan_path, notes)
@@ -240,13 +270,12 @@ class AnnotationNotebook:
             ('Tiếp tục manual với kế hoạch gốc', 'existing'),
             ('Review kết quả auto', 'review'), ('Thử giao diện bằng dữ liệu giả', 'demo')],
             layout=w.Layout(width='95%'), style={'description_width': '170px'})
-        self.member = w.Dropdown(description='Người thực hiện:', options=[('Chọn thành viên…', ''),
-            ('Hiếu — member1', 'member1'), ('Anh — member2', 'member2'),
-            ('Kiên — member3', 'member3'), ('Thành viên thứ tư — member4', 'member4')],
+        self.reviewer = w.Text(description='Tên người gán nhãn:', placeholder='Tự nhập tên của bạn, có thể dùng tiếng Việt có dấu',
             layout=w.Layout(width='95%'), style={'description_width': '170px'})
-        self.reviewer = w.Text(description='Mã người gán nhãn:', placeholder='hieu / anh / kien / mã người thứ tư',
+        self.member = w.Text(description='Mã lưu tiến độ:',
+            placeholder='Người mới: để trống để tạo từ tên; nhãn cũ: nhập đúng mã đã dùng',
             layout=w.Layout(width='95%'), style={'description_width': '170px'})
-        self.member.observe(self._member_changed, names='value')
+        self.member.observe(lambda _: self._invalidate(), names='value')
         self.task.observe(self._task_changed, names='value')
         self.reviewer.observe(lambda _: self._invalidate(), names='value')
         self.path_rows = {}
@@ -279,7 +308,7 @@ class AnnotationNotebook:
                                                layout=w.Layout(width='240px'))
         self.advanced_toggle.observe(self._toggle_advanced, names='value')
         self.save_profile = w.Checkbox(value=True, description='Lưu cấu hình tại thư mục nhãn để mở lại lần sau')
-        self.profile = w.Text(description='File cấu hình đã lưu:', placeholder='Tùy chọn: .../notebook_profiles/memberX.json',
+        self.profile = w.Text(description='File cấu hình đã lưu:', placeholder='Tùy chọn: .../notebook_profiles/<mã_lưu>.json',
             layout=w.Layout(width='85%'), style={'description_width': '220px'})
         choose_profile = w.Button(description='Chọn…', layout=w.Layout(width='80px'))
         choose_profile.on_click(lambda _: self._browse(self.profile, 'file'))
@@ -295,7 +324,7 @@ class AnnotationNotebook:
         self.report_area = w.VBox()
         self.root = w.VBox([w.HTML('<h3>Thiết lập phiên gán nhãn</h3>'
             'Điền thông tin trong biểu mẫu; không sửa các cell Python. Các ô dữ liệu đều để trống.'),
-            w.HBox([self.profile, choose_profile, load]), self.task, self.member, self.reviewer, self.explanation,
+            w.HBox([self.profile, choose_profile, load]), self.task, self.reviewer, self.member, self.explanation,
             self.path_rows['bibtex'], self.path_rows['references'], self.path_rows['doi'],
             self.path_rows['output'], self.path_rows['plan'], self.path_rows['auto_run'],
             self.advanced_toggle, self.advanced_box, self.save_profile,
@@ -313,10 +342,6 @@ class AnnotationNotebook:
             self.table_area.children = ()
             self.status.value = 'Cấu hình đã đổi. Bấm Kiểm tra & mở bảng để áp dụng; nhãn cũ đã lưu được giữ.'
         self.prepared = None
-
-    def _member_changed(self, change):
-        self.reviewer.value = {'member1': 'hieu', 'member2': 'anh', 'member3': 'kien'}.get(change['new'], '')
-        self._invalidate()
 
     def _task_changed(self, _):
         task = self.task.value
@@ -363,7 +388,7 @@ class AnnotationNotebook:
     def _save_profile(self, config):
         path = Path(config.output) / 'notebook_profiles' / f'{config.member}.json'
         with _exclusive_progress(path):
-            _write_plan(path, dict(schema_version=1, configuration=asdict(config)))
+            _write_plan(path, dict(schema_version=2, configuration=asdict(config)))
         self.profile.value = str(path)
         return path
 
@@ -371,13 +396,16 @@ class AnnotationNotebook:
         try:
             path = _file(self.profile.value, 'File cấu hình')
             data = json.loads(path.read_text(encoding='utf-8'))
-            if data.get('schema_version') != 1 or not isinstance(data.get('configuration'), dict):
+            if data.get('schema_version') not in (1, 2) or not isinstance(data.get('configuration'), dict):
                 raise ValueError('File không phải cấu hình của công cụ gán nhãn')
             config = AnnotationConfig(**data['configuration'])
             if config.task not in ('personal', 'existing', 'review', 'demo'):
                 raise ValueError('Công việc trong cấu hình không hợp lệ')
-            if config.member not in ('', 'member1', 'member2', 'member3', 'member4'):
-                raise ValueError('Mã thành viên không thuộc nhóm 4 người')
+            if data['schema_version'] == 1 and config.task == 'review':
+                # Legacy review files were named after reviewer, not member.
+                old_id = config.reviewer
+                config.member = old_id if re.fullmatch(r'[A-Za-z0-9_-]+', old_id) else _user_id(old_id)
+            config = resolve_identity(config)
             self.task.value, self.member.value = config.task, config.member
             self.reviewer.value = config.reviewer
             for name, field in self.fields.items():
@@ -393,7 +421,10 @@ class AnnotationNotebook:
         self.open_button.disabled = True
         self.status.value = 'Đang kiểm tra file và dựng candidate pool…'
         try:
-            config = self.current_config()
+            config = resolve_identity(self.current_config())
+            if config.task != 'demo':
+                self.member.value = config.member
+                self.reviewer.value = config.reviewer
             prepared = prepare_annotation(config, group_members=self.group_members)
             session = TableSession(prepared.pool, prepared.progress, reviewer=prepared.reviewer,
                 publications=prepared.publications, entry_keys=prepared.entry_keys, papers=prepared.doi)

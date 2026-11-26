@@ -1,5 +1,6 @@
 """Test the shared notebook through the form callbacks users execute."""
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import pyarrow as pa
@@ -9,7 +10,7 @@ import pytest
 from matching.candidate_pool import build_candidate_pool
 from matching.labeling import pool_fingerprint, run_labeling_session
 from matching.auto_matcher import write_auto_labels
-from matching.notebook_tool import AnnotationConfig, AnnotationNotebook, PathPicker, prepare_annotation
+from matching.notebook_tool import AnnotationConfig, AnnotationNotebook, PathPicker, prepare_annotation, resolve_identity
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -139,7 +140,7 @@ def test_review_uses_correct_auto_run_without_manual_plan(tmp_path):
     c.task, c.auto_run = 'review', str(auto)
     prepared = prepare_annotation(c)
     assert prepared.plan_path is None and len(prepared.entry_keys) == 23
-    assert prepared.progress == Path(c.output) / 'review/auto-v2/fourth.parquet'
+    assert prepared.progress == Path(c.output) / 'review/auto-v2/member4.parquet'
     assert not prepared.progress.exists()
 
 
@@ -165,6 +166,7 @@ def test_hidden_fields_are_ignored_and_identity_change_closes_old_buttons(tmp_pa
     tool = AnnotationNotebook(start_directory=tmp_path)
     try:
         tool.member.value = 'member1'
+        tool.reviewer.value = 'hieu'
         for name in ('bibtex', 'references', 'output'):
             tool.fields[name].value = getattr(c, name)
         tool.fields['plan'].value = 'hidden-plan-from-old-task.json'
@@ -176,7 +178,7 @@ def test_hidden_fields_are_ignored_and_identity_change_closes_old_buttons(tmp_pa
         tool.member.value = 'member2'
         assert tool.table.closed and tool.prepared is None
         button.click()
-        assert not path.exists() and tool.reviewer.value == 'anh'
+        assert not path.exists() and tool.reviewer.value == 'hieu'
     finally:
         tool.close()
 
@@ -231,5 +233,96 @@ def test_doi_is_a_visible_main_form_row_and_does_not_depend_on_accordion(tmp_pat
         tool.advanced_toggle.value = False
         assert tool.advanced_box.layout.display == 'none'
         assert tool.path_rows['doi'].layout.display != 'none'
+    finally:
+        tool.close()
+
+
+@pytest.mark.parametrize('name,code', [('Tân', 'tan'), ('Đặng Văn Tân', 'dang_van_tan'),
+                                      ('Người dùng 17', 'nguoi_dung_17')])
+def test_identity_accepts_unicode_names_and_generates_portable_ids(name, code):
+    config = resolve_identity(AnnotationConfig(reviewer=name))
+    assert config.member == code and config.reviewer == name
+    assert resolve_identity(AnnotationConfig(member='custom_user_99', reviewer=name)).member == 'custom_user_99'
+
+
+def test_existing_identity_cannot_guess_a_new_filename_from_name():
+    with pytest.raises(ValueError, match='đúng mã lưu tiến độ'):
+        resolve_identity(AnnotationConfig(task='existing', reviewer='Hiếu'))
+    with pytest.raises(ValueError, match='không điền đường dẫn'):
+        resolve_identity(AnnotationConfig(member='../elsewhere', reviewer='Tân'))
+
+
+def test_free_name_form_has_no_roster_and_saves_unicode_name_with_generated_id(tmp_path):
+    pytest.importorskip('ipywidgets')
+    import ipywidgets as w
+    c = inputs(tmp_path)
+    tool = AnnotationNotebook(start_directory=tmp_path)
+    restored = None
+    try:
+        assert isinstance(tool.member, w.Text) and isinstance(tool.reviewer, w.Text)
+        assert tool.member.value == tool.reviewer.value == ''
+        tool.reviewer.value = 'Tân'
+        for name in ('bibtex', 'references', 'output'):
+            tool.fields[name].value = getattr(c, name)
+        tool.open_button.click()
+        assert tool.prepared is not None, tool.status.value
+        assert tool.member.value == 'tan'
+        assert tool.prepared.progress == Path(c.output) / 'manual/tan.parquet'
+        tool.table.table.children[2].children[0].click()
+        saved = pq.read_table(tool.prepared.progress).to_pylist()
+        assert len(saved) == 1 and saved[0]['reviewer'] == 'Tân'
+        profile = Path(tool.profile.value)
+        assert json.loads(profile.read_text(encoding='utf-8'))['schema_version'] == 2
+        restored = AnnotationNotebook(start_directory=tmp_path)
+        restored.profile.value = str(profile)
+        restored.root.children[1].children[-1].click()
+        assert restored.reviewer.value == 'Tân' and restored.member.value == 'tan'
+        restored.open_button.click()
+        assert restored.prepared is not None, restored.status.value
+        assert len(restored.table.session.labels) == 1
+    finally:
+        tool.close()
+        if restored:
+            restored.close()
+
+
+def test_two_names_with_same_generated_id_do_not_silently_share_personal_plan(tmp_path):
+    c = inputs(tmp_path)
+    c.member, c.reviewer = '', 'Tân'
+    prepared = prepare_annotation(c)
+    original = prepared.plan_path.read_bytes()
+    c.reviewer = 'Tấn'
+    with pytest.raises(ValueError, match='tên người gán nhãn khác'):
+        prepare_annotation(c)
+    assert prepared.plan_path.read_bytes() == original
+
+
+def test_v1_review_profile_keeps_legacy_filename_for_any_user_id(tmp_path):
+    pytest.importorskip('ipywidgets')
+    c = inputs(tmp_path)
+    pool = build_candidate_pool(c.bibtex, c.references)
+    rows = pool.references.to_pylist()
+    rows.append(dict(rows[0], ref_arxiv_id='another-r0'))
+    pq.write_table(pa.Table.from_pylist(rows, schema=pool.references.schema), c.references)
+    pool = build_candidate_pool(c.bibtex, c.references)
+    auto = tmp_path / 'auto-old'
+    write_auto_labels(pool, auto)
+    c.task, c.member, c.reviewer, c.auto_run = 'review', 'member27', 'legacy_user', str(auto)
+    progress = Path(c.output) / 'review/auto-old/legacy_user.parquet'
+    run_labeling_session(pool, progress, reviewer='legacy_user', entry_keys=[('p0', 'k0')],
+                         input_fn=lambda _: '1', output=lambda _: None)
+    original = progress.read_bytes()
+    profile = tmp_path / 'old-profile.json'
+    profile.write_text(json.dumps({'schema_version': 1, 'configuration': asdict(c)}), encoding='utf-8')
+    tool = AnnotationNotebook(start_directory=tmp_path)
+    try:
+        tool.profile.value = str(profile)
+        tool.root.children[1].children[-1].click()
+        assert tool.member.value == 'legacy_user'
+        tool.open_button.click()
+        assert tool.prepared is not None, tool.status.value
+        assert tool.prepared.progress == progress
+        assert len(tool.table.session.labels) == 1
+        assert progress.read_bytes() == original
     finally:
         tool.close()

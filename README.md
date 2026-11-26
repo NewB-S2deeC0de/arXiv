@@ -141,9 +141,11 @@ PROJECT_ROOT**. Cấu hình được nhập qua biểu mẫu trong
 | 3 | Khi cần: đọc lại tiến độ đã lưu theo từng bài |
 | 4 | Kết thúc: đóng bảng, chỉ ra file nhãn và kế hoạch cần bàn giao |
 
-Người dùng chọn Hiếu/member1, Anh/member2, Kiên/member3 hoặc thành viên
-thứ tư/member4. Mã reviewer được điền theo người thực sự chọn nhãn; người
-thứ tư tự điền mã. Mọi ô đường dẫn đều để trống. Nút Chọn… duyệt từng
+Người dùng tự nhập tên (hỗ trợ tiếng Việt có dấu) và mã lưu tiến độ,
+không có danh sách tên/mã cố định hoặc giới hạn member1–member4. Người
+mới có thể để trống mã để tạo mã không dấu từ tên; cần chọn mã riêng khi
+trùng với người khác trong cùng nơi lưu. Người tiếp tục nhãn cũ giữ mã đã
+dùng hoặc nạp profile cũ. Mọi ô đường dẫn đều để trống. Nút Chọn… duyệt từng
 thư mục và phân biệt file/thư mục; có thể dán Copy path từ Files của
 Colab. Không nhận link website Drive thay đường dẫn filesystem. Nơi
 lưu nhãn cần quyền ghi và có thể tách khỏi dataset chỉ có quyền đọc.
@@ -151,7 +153,7 @@ lưu nhãn cần quyền ghi và có thể tách khỏi dataset chỉ có quyề
 Biểu mẫu có bốn công việc: bắt đầu manual trên dữ liệu riêng, tiếp tục
 manual với kế hoạch gốc, review kết quả auto và demo. Công việc mới chỉ
 cần BibTeX M2, references M1 và nơi ghi nhãn; tự tạo 5 bài × 20 entry và
-lưu plans/memberX.json. Các lần sau dùng lại kế hoạch, không resample.
+lưu plans/<mã_lưu>.json. Các lần sau dùng lại kế hoạch, không resample.
 Có thể chọn 5 ID cụ thể, loại bài auto/đã giao người khác hoặc cung cấp
 checkpoint M2/reference snapshots trong mục nâng cao để lọc thiếu/lỗi.
 Không có artifact chất lượng sẽ hiện giới hạn kiểm tra; không suy luận
@@ -162,7 +164,7 @@ Người đã có nhãn cũ chọn Tiếp tục manual với kế hoạch gốc,
 snapshot, JSON kế hoạch và thư mục cha chứa manual/ trước đây. Không tạo
 mẫu mới thay cho phân công cũ. Review chọn đúng thư mục auto hoàn tất;
 kiểm marker/schema/fingerprint rồi lấy needs_review từ auto_labels.parquet.
-Không dùng nhầm queue cũ; progress tách theo review/<auto-run>/<reviewer>.parquet.
+Không dùng nhầm queue cũ; progress mới tách theo review/<auto-run>/<mã_lưu>.parquet.
 
 DOI index chỉ bổ sung hiển thị qua ref_arxiv_id, không đổi pool/fingerprint.
 Bảng không dùng confidence, không chọn sẵn/rank theo matcher. Có tìm kiếm,
@@ -171,9 +173,10 @@ bị khóa khi lọc. Chọn dòng lưu ngay rồi chuyển entry pending. Chưa
 không tạo nhãn. Lỗi ghi không chuyển entry; callback bảng cũ không được
 label entry mới. File nhãn CLI cũ vẫn đọc được. Một writer/file trên Drive.
 
-Cấu hình được lưu tùy chọn tại notebook_profiles/memberX.json trong thư
+Cấu hình được lưu tùy chọn tại notebook_profiles/<mã_lưu>.json trong thư
 mục nhãn. Lần sau chọn file cấu hình, Nạp cấu hình, kiểm tra rồi mở bảng;
-không phải sửa cell. Chuyển người/data/công việc sẽ đóng bảng cũ trước khi
+không phải sửa cell. Profile v1 cũ vẫn nạp được; review v1 giữ tên file
+theo reviewer cũ, còn profile v2 dùng mã lưu người dùng đã chọn. Chuyển người/data/công việc sẽ đóng bảng cũ trước khi
 áp dụng. Profile là JSON dữ liệu, không chạy code; không chứa nhãn tự động.
 Không đưa profile/dataset/labels lên GitHub.
 
