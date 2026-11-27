@@ -4,6 +4,11 @@ import re
 from pathlib import Path
 from dataclasses import asdict
 import hashlib
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+def _phase(message):
+    print(f'[export {time.monotonic():.1f}s] {message}', flush=True)
 import pyarrow as pa
 import pyarrow.parquet as pq
 from .progress import ProgressStore
@@ -28,7 +33,9 @@ def _export_snapshot(config,run_id,*,runtime_root=None,logical_config=None,outpu
     target=(Path(output_root) if output_root is not None else effective_root/'exports')/run_id
     if target.exists(): raise FileExistsError(f"Export run ID '{run_id}' already exists")
     target.mkdir(parents=True,exist_ok=False)
+    _phase('progress load started')
     store=ProgressStore(effective_root)
+    _phase('progress load complete; local table build/read started')
     selected=set(generate_ids(**config.range))
     missing_expected_jobs=sum((paper,0,'discovery',0) not in store.rows for paper in selected)
     for paper in sorted(selected):
@@ -106,12 +113,22 @@ def _export_snapshot(config,run_id,*,runtime_root=None,logical_config=None,outpu
                 previous=references.get(unique)
                 rank=lambda r:(sum(v is not None for v in r.values()),json.dumps(r,sort_keys=True))
                 if previous is None or rank(row)>rank(previous): references[unique]=row
+    _phase('Parquet build started')
     pq.write_table(pa.Table.from_pylist(papers,schema=PAPER_SCHEMA),target/'papers.parquet')
     pq.write_table(pa.Table.from_pylist(list(references.values()),schema=REFERENCE_SCHEMA),target/'references.parquet')
     pq.write_table(pa.Table.from_pylist(list(version_references.values()),schema=VERSION_REFERENCE_SCHEMA),target/'version_references.parquet')
     pq.write_table(pa.Table.from_pylist(snapshot_rows,schema=SNAPSHOT_SCHEMA),target/'reference_snapshots.parquet')
     exported_ids={p['arxiv_id'] for p in papers}
+    _phase('Parquet complete; metrics started')
     paper_metrics=[]; version_metrics=[]
+    reference_totals={}
+    for key,row in store.rows.items():
+        if key[0] not in selected or key[2]!='references': continue
+        totals=reference_totals.setdefault(key[0],[0,0,0])
+        totals[0]+=row['total']
+        if key[1]>0 and key[3]==0:
+            totals[1]+=1
+            totals[2]+=row['status']=='succeeded'
     for key,row in store.rows.items():
         if key[0] not in selected: continue
         if key[2]=='discovery':
@@ -119,7 +136,7 @@ def _export_snapshot(config,run_id,*,runtime_root=None,logical_config=None,outpu
             count=None
             snapshots=snapshots_by_paper.get(key[0],[])
             if snapshots: count=len({r.get('ref_arxiv_id') or r.get('ref_s2_id') or json.dumps(r,sort_keys=True) for _,snapshot in snapshots for r in snapshot['references']})
-            paper_metrics.append(dict(arxiv_id=key[0],discovery_status=row['status'],metadata_exported=key[0] in exported_ids,references_status=refs['status'],reference_count=count,discovery_attempts=row['total'],references_attempts=sum(r['total'] for k,r in store.rows.items() if k[0]==key[0] and k[2]=='references'),reference_count_scope='paper_union_including_legacy',references_status_scope='legacy_paper',reference_versions_total=sum(k[0]==key[0] and k[1]>0 and k[2:]==('references',0) for k in store.rows),reference_versions_succeeded=sum(k[0]==key[0] and k[1]>0 and k[2:]==('references',0) and r['status']=='succeeded' for k,r in store.rows.items())))
+            paper_metrics.append(dict(arxiv_id=key[0],discovery_status=row['status'],metadata_exported=key[0] in exported_ids,references_status=refs['status'],reference_count=count,discovery_attempts=row['total'],references_attempts=reference_totals.get(key[0], [0,0,0])[0],reference_count_scope='paper_union_including_legacy',references_status_scope='legacy_paper',reference_versions_total=reference_totals.get(key[0], [0,0,0])[1],reference_versions_succeeded=reference_totals.get(key[0], [0,0,0])[2]))
         elif key[2]=='source':
             inventory={}
             inventory=read_result(key,'inventory.json') or {}
@@ -179,11 +196,13 @@ def _export_snapshot(config,run_id,*,runtime_root=None,logical_config=None,outpu
     return manifest
 
 
-def export_dataset_snapshot(config,run_id,*,fast_staging=True,scratch_root=None,takeover_stale=False):
+def export_dataset_snapshot(config,run_id,*,fast_staging=True,scratch_root=None,takeover_stale=False,staging_workers=1):
     import copy, shutil, uuid
     from .locking import DatasetLock
 
     if not re.fullmatch(r'[A-Za-z0-9_-]+',run_id): raise ValueError('Invalid run ID')
+    if not isinstance(staging_workers,int) or not 1 <= staging_workers <= 16:
+        raise ValueError('staging_workers must be between 1 and 16')
     source_root = Path(config.paths['persistent_root'])
     if not source_root.exists(): raise FileNotFoundError(f'Source dataset root does not exist: {source_root}')
 
@@ -196,6 +215,7 @@ def export_dataset_snapshot(config,run_id,*,fast_staging=True,scratch_root=None,
 
         base_scratch_str = scratch_root or config.paths.get('scratch_root', 'scratch')
         base_scratch = Path(base_scratch_str)
+        _phase(f'scratch resolved: {base_scratch.resolve()}; workers={staging_workers}')
         staging_dir = base_scratch / f'staging-{run_id}-{uuid.uuid4().hex[:8]}'
         publish_staging = source_root / '.staging_exports' / run_id
         published = False
@@ -226,40 +246,70 @@ def export_dataset_snapshot(config,run_id,*,fast_staging=True,scratch_root=None,
                 shutil.copyfile(source_root / 'completed.json', staging_dir / 'completed.json')
 
             # Job-directed selective data staging: copy only needed JSONs for selected papers
-            src_store = ProgressStore(source_root)
+            _phase('Drive discovery planning started' if fast_staging else 'direct mode: no staging plan')
+            src_store = ProgressStore(source_root) if fast_staging else None
             selected = set(generate_ids(**config.range))
             keys_to_stage = set()
-            for paper in selected:
+            for paper in selected if fast_staging else ():
                 keys_to_stage.add((paper, 0, 'discovery', 0))
-            for key in src_store.rows:
-                if key[0] in selected:
+            for key in src_store.rows if src_store else ():
+                if key[0] in selected and key[3]==0 and key[2] in ('references','source'):
                     keys_to_stage.add(key)
 
-            # Discovery commits imply version metadata even when an old ledger omitted its job.
-            for paper in selected:
-                discovery = src_store.storage.result_dir((paper, 0, 'discovery', 0)) / 'normalized.json'
+            # Copy discovery once, then plan revisions from the verified local commit.
+            for paper in selected if fast_staging else ():
+                key=(paper,0,'discovery',0)
+                directory=src_store.storage.result_dir(key)
+                destination=staging_dir / directory.relative_to(source_root)
+                destination.mkdir(parents=True,exist_ok=True)
                 try:
-                    latest = int(json.loads(discovery.read_text()).get('version', 0))
+                    marker_bytes=(directory/'complete.json').read_bytes()
+                    payload=(directory/'normalized.json').read_bytes()
+                    (destination/'complete.json').write_bytes(marker_bytes)
+                    (destination/'normalized.json').write_bytes(payload)
+                    marker=json.loads(marker_bytes)
+                    if marker['key']!=list(key) or marker['status']!='succeeded' or hashlib.sha256(payload).hexdigest()!=marker['checksums']['normalized.json']:
+                        continue
+                    latest = int(json.loads(payload).get('version', 0))
                     keys_to_stage.update((paper, version, 'metadata', 0) for version in range(2, latest + 1))
-                except (OSError, ValueError, TypeError):
+                except (FileNotFoundError, ValueError, TypeError, KeyError):
                     pass
+                finally:
+                    keys_to_stage.discard(key)
 
-            for key in sorted(keys_to_stage if fast_staging else ()):
+            def stage(key):
                 src_res_dir = src_store.storage.result_dir(key)
-                if src_res_dir.is_dir():
-                    rel = src_res_dir.relative_to(source_root)
-                    dest_res_dir = staging_dir / rel
-                    for fname in ('complete.json', 'normalized.json', 'inventory.json'):
-                        src_file = src_res_dir / fname
-                        if src_file.is_file():
-                            dest_res_dir.mkdir(parents=True, exist_ok=True)
-                            shutil.copyfile(src_file, dest_res_dir / fname)
+                dest_res_dir = staging_dir / src_res_dir.relative_to(source_root)
+                dest_res_dir.mkdir(parents=True, exist_ok=True)
+                size = files = 0
+                for fname in ('complete.json', 'inventory.json' if key[2]=='source' else 'normalized.json'):
+                    try:
+                        payload=(src_res_dir / fname).read_bytes()
+                    except FileNotFoundError:
+                        continue
+                    (dest_res_dir / fname).write_bytes(payload)
+                    size+=len(payload); files+=1
+                return size,files
+
+            keys=sorted(keys_to_stage)
+            started=last=time.monotonic(); size=files=done=0
+            with ThreadPoolExecutor(max_workers=staging_workers) as pool:
+                # Batch submission bounds queued work and propagates unexpected I/O errors.
+                for offset in range(0,len(keys),staging_workers):
+                    for amount,count in pool.map(stage,keys[offset:offset+staging_workers]):
+                        size+=amount; files+=count; done+=1
+                    now=time.monotonic()
+                    if now-last>=10:
+                        _phase(f'Drive staging {done}/{len(keys)}; files={files}; bytes={size}; bytes/s={size/max(now-started,.001):.0f}')
+                        last=now
+            _phase(f'staging complete {done}/{len(keys)}; files={files}; bytes={size}; elapsed={time.monotonic()-started:.1f}s')
 
             output_root = staging_dir / 'built_exports'
             manifest = _export_snapshot(config, run_id, runtime_root=runtime_root,
                                         logical_config=logical_config, output_root=output_root)
 
             # Transactional publication to source
+            _phase('Drive publish/checksum started')
             staged_export = output_root / run_id
             publish_staging.parent.mkdir(parents=True, exist_ok=True)
             publish_staging.mkdir(exist_ok=False)
@@ -287,6 +337,7 @@ def export_dataset_snapshot(config,run_id,*,fast_staging=True,scratch_root=None,
             return manifest
 
         finally:
+            _phase('cleanup started')
             if owns_scratch: shutil.rmtree(staging_dir, ignore_errors=True)
             if owns_publish and not published and publish_staging.exists():
                 shutil.rmtree(publish_staging, ignore_errors=True)

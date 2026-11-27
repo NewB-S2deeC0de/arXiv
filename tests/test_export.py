@@ -344,6 +344,10 @@ def test_export_dataset_snapshot_parity_direct_vs_fast(tmp_path, monkeypatch):
     dir_r = pq.read_table(tmp_path / dataset_folder / 'exports/snap-direct/references.parquet').to_pydict()
     fst_r = pq.read_table(tmp_path / dataset_folder / 'exports/snap-fast/references.parquet').to_pydict()
     assert dir_r == fst_r
+    for name in ('version_references.parquet','reference_snapshots.parquet'):
+        assert pq.read_table(tmp_path/dataset_folder/'exports/snap-direct'/name).to_pylist()==pq.read_table(tmp_path/dataset_folder/'exports/snap-fast'/name).to_pylist()
+    for name in ('paper_metrics.csv','version_metrics.csv'):
+        assert (tmp_path/dataset_folder/'exports/snap-direct'/name).read_bytes()==(tmp_path/dataset_folder/'exports/snap-fast'/name).read_bytes()
 
 
 def test_export_dataset_snapshot_rejects_duplicate_run_id(tmp_path, monkeypatch):
