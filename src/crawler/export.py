@@ -30,6 +30,7 @@ def _export_snapshot(config,run_id,*,runtime_root=None,logical_config=None,outpu
     target.mkdir(parents=True,exist_ok=False)
     store=ProgressStore(effective_root)
     selected=set(generate_ids(**config.range))
+    missing_expected_jobs=sum((paper,0,'discovery',0) not in store.rows for paper in selected)
     for paper in sorted(selected):
         store.add((paper,0,'discovery',0))
     cache={}
@@ -172,6 +173,8 @@ def _export_snapshot(config,run_id,*,runtime_root=None,logical_config=None,outpu
     contrib_runs = (completed_data.get('contributing_run_ids') if completed_data and completed_data.get('contributing_run_ids')
                     else [r['run_id'] for r in run_summaries if r.get('run_id')])
     manifest=dict(schema_version=3,reference_scope='references.parquet is the deduplicated paper union including legacy; version_references.parquet associates only version queries; version correspondence unverified',version_reference_links=len(version_references),version_snapshots=sum(r['version']>0 and r['reference_count'] is not None for r in snapshot_rows),version_snapshots_missing=sum(r['version']>0 and r['reference_count'] is None for r in snapshot_rows),version_snapshots_empty=sum(r['version']>0 and r['reference_count']==0 for r in snapshot_rows),paper_reference_count_scope='union_including_legacy',assigned_ids=len(selected),missing_expected_jobs=sum((paper,0,'discovery',0) not in store.rows for paper in selected),venue_conflicts=sorted(p for p,v in venue_candidates.items() if p in selected and len(v)>1),reference_date_source="semantic_scholar.publicationDate (not verified arXiv submission date)",integrity_scope="checksums of exported JSON only; full source audit is separate",run_id=run_id,papers=len(papers),references=len(references),missing_metadata=missing,missing_reference_snapshots=sum(r['reference_count'] is None for r in paper_metrics),valid_empty_reference_snapshots=sum(r['reference_count']==0 for r in paper_metrics),missing_revision_dates=revision_missing,duplicate_references=duplicates,conflicting_references=len(conflicts),config_fingerprint=hashlib.sha256(json.dumps(asdict(logical_config or config),sort_keys=True).encode()).hexdigest(),input_fingerprint=hashlib.sha256(json.dumps(sorted(selected)).encode()).hexdigest(),schema_fingerprint=hashlib.sha256((str(PAPER_SCHEMA)+str(REFERENCE_SCHEMA)+str(VERSION_REFERENCE_SCHEMA)+str(SNAPSHOT_SCHEMA)).encode()).hexdigest(),contributing_run_ids=contrib_runs,means=dict(reference_count=mean(paper_metrics,'reference_count'),compressed_bytes=mean(version_metrics,'compressed_bytes'),unpacked_bytes=mean(version_metrics,'unpacked_bytes'),kept_bytes=mean(version_metrics,'kept_bytes')),api_wait_seconds=api_wait_dict,checksums={p.name:digest(p) for p in target.iterdir()})
+    manifest['missing_expected_jobs']=missing_expected_jobs
+    manifest['missing_expected_jobs_scope']='selected discovery jobs only'
     atomic_json(target/'manifest.json',manifest)
     return manifest
 
@@ -196,8 +199,10 @@ def export_dataset_snapshot(config,run_id,*,fast_staging=True,scratch_root=None,
         staging_dir = base_scratch / f'staging-{run_id}-{uuid.uuid4().hex[:8]}'
         publish_staging = source_root / '.staging_exports' / run_id
         published = False
+        owns_scratch = owns_publish = False
         try:
             staging_dir.mkdir(parents=True, exist_ok=False)
+            owns_scratch = True
             if publish_staging.exists():
                 raise FileExistsError(f"Export run ID '{run_id}' has an unfinished publication")
             runtime_root = source_root
@@ -257,7 +262,9 @@ def export_dataset_snapshot(config,run_id,*,fast_staging=True,scratch_root=None,
             # Transactional publication to source
             staged_export = output_root / run_id
             publish_staging.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(staged_export, publish_staging)
+            publish_staging.mkdir(exist_ok=False)
+            owns_publish = True
+            shutil.copytree(staged_export, publish_staging, dirs_exist_ok=True)
 
             # Verify checksummed files
             for filename, expected_hash in manifest['checksums'].items():
@@ -280,8 +287,8 @@ def export_dataset_snapshot(config,run_id,*,fast_staging=True,scratch_root=None,
             return manifest
 
         finally:
-            shutil.rmtree(staging_dir, ignore_errors=True)
-            if not published and publish_staging.exists():
+            if owns_scratch: shutil.rmtree(staging_dir, ignore_errors=True)
+            if owns_publish and not published and publish_staging.exists():
                 shutil.rmtree(publish_staging, ignore_errors=True)
             try:
                 parent_staging = source_root / '.staging_exports'

@@ -104,12 +104,17 @@ def resolve_input_path(value: str | Path | None, default: str | Path) -> Path:
     """Resolve an optional CLI path, allowing a directory for references."""
 
     path = Path(value) if value is not None else Path(default)
+    for candidate in (path.absolute(), path.resolve()):
+        if any(part.lower().startswith(('staging-', 'staging_')) or part.lower() in
+               ('staging', 'staging_exports', '.staging_exports') for part in candidate.parts):
+            raise ValueError(f'staging input is not published: {path}')
     if path.is_dir():
         return discover_reference_path(path)
     if not path.exists():
         raise FileNotFoundError(f'input file does not exist: {path}')
     # A Parquet file inside a published snapshot is not a standalone input.
-    if path.name == 'references.parquet' and (path.parent / 'manifest.json').exists():
+    if path.name == 'references.parquet' and ((path.parent / 'manifest.json').exists()
+            or 'exports' in path.parts or 'exports' in path.resolve().parts):
         found = discover_reference_path(path.parent)
         if found != path:
             raise ValueError(f'invalid snapshot input: {path}')

@@ -14,6 +14,9 @@ def test_missing_metadata_stays_in_ledger_only(tmp_path,monkeypatch):
     assert manifest['papers']==0
     assert manifest['assigned_ids']==1
     assert manifest['missing_metadata']==1
+    assert manifest['missing_expected_jobs']==0
+    c.range['end_id']=2524
+    assert export_snapshot(c,'missing-job')['missing_expected_jobs']==1
     assert (tmp_path/'runtime/exports/test-run/paper_metrics.csv').exists()
     assert (tmp_path/'runtime/exports/test-run/version_metrics.csv').exists()
     assert manifest['input_fingerprint']
