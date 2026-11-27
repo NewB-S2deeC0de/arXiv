@@ -1,5 +1,7 @@
 # Milestone 1 arXiv crawler
 
+[Milestone 3 evaluation and Hugging Face publishing](docs/matching-e3.md)
+
 M2 A1–A3 implementation: `src/parser/gather.py`, `hierarchy.py`, `leaves.py`.
 
 Python >=3.11, Colab CPU; inclusive range `2504.02523`–`2504.07522`.
