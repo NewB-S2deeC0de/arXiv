@@ -244,3 +244,162 @@ async def run_range_queue(
 
     log(f"Queue: all {len(normalized_targets)} targets processed.")
     return results
+
+
+async def retry_target_failed(
+    base_config: CrawlerConfig,
+    target: dict[str, Any],
+    *,
+    force_mark_completed: bool = False,
+    takeover_stale: bool = False,
+    limit: int | None = None,
+    runner: Any = None,
+) -> dict[str, Any]:
+    """Retry failed jobs for a target, resetting their attempts and re-running them."""
+    from .pipeline import run_pipeline
+    pipeline_runner = runner or run_pipeline
+
+    norm = normalize_target(target)
+    folder = norm["folder"]
+    expected_ids = norm["expected_ids"]
+    target_api_key = resolve_s2_key(norm.get("s2_api_key"))
+    key_label = f"S2 key: {norm['s2_api_key']}" if norm.get("s2_api_key") else "S2 key: default"
+    range_desc = f"{norm['start_month']}.{norm['start_id']:05d} -> {norm['end_month']}.{norm['end_id']:05d}"
+
+    log(f"Retry: target {range_desc} (folder: {folder}, {key_label})")
+
+    root = Path(folder)
+    progress_dir = root / "progress"
+    if not (progress_dir / "jobs.csv").exists() and not (progress_dir / "jobs.journal.jsonl").exists():
+        log(f"Retry: [{folder}] no progress data found. Skipping.")
+        return {
+            "target": target,
+            "folder": folder,
+            "failed_before": 0,
+            "failed_after": 0,
+            "status": "no_progress_data",
+        }
+
+    store = ProgressStore(root)
+    failed_keys = [k for k, r in store.rows.items() if r["status"] == "failed"]
+    failed_before = len(failed_keys)
+
+    if failed_before == 0:
+        log(f"Retry: [{folder}] no failed jobs found (failed = 0).")
+        if force_mark_completed or is_target_completed(folder, expected_ids):
+            mark_target_completed(folder, {"total_jobs": len(store.rows), "expected_papers": len(expected_ids)})
+        return {
+            "target": target,
+            "folder": folder,
+            "failed_before": 0,
+            "failed_after": 0,
+            "status": "no_failed_jobs",
+        }
+
+    # Remove existing completed.json marker to permit re-running
+    marker = root / "completed.json"
+    marker.unlink(missing_ok=True)
+
+    target_config = copy.deepcopy(base_config)
+    target_config.range = {
+        "start_month": norm["start_month"],
+        "start_id": norm["start_id"],
+        "end_month": norm["end_month"],
+        "end_id": norm["end_id"],
+    }
+    if norm["monthly_end_ids"]:
+        target_config.range["monthly_end_ids"] = norm["monthly_end_ids"]
+    target_config.paths["persistent_root"] = folder
+    target_config.validate()
+
+    # Step 1: If any discovery jobs failed, reset and run discovery first
+    disc_failed = [k for k in failed_keys if k[2] == "discovery"]
+    if disc_failed:
+        log(f"Retry: [{folder}] resetting {len(disc_failed)} failed discovery jobs...")
+        store.reset(status="failed", stages={"discovery"})
+        await pipeline_runner(
+            target_config,
+            {"discovery"},
+            resume=True,
+            limit=limit,
+            takeover_stale=takeover_stale,
+            api_key=target_api_key,
+        )
+
+    # Step 2: Reset remaining failed jobs for all other stages (metadata, source, references)
+    store = ProgressStore(root)
+    remaining_to_reset = [k for k, r in store.rows.items() if r["status"] == "failed"]
+    if remaining_to_reset:
+        log(f"Retry: [{folder}] resetting {len(remaining_to_reset)} failed jobs for stages {{'arxiv', 's2'}}...")
+        store.reset(status="failed")
+
+    # Step 3: Run arxiv and s2 if there are pending jobs (from reset or newly discovered)
+    store = ProgressStore(root)
+    has_active = any(k[2] in ("metadata", "source", "references") and r["status"] in ("pending", "running") for k, r in store.rows.items())
+    summary: dict[str, Any] = {}
+    if has_active:
+        log(f"Retry: [{folder}] running stages {{'arxiv', 's2'}} for active jobs...")
+        summary = await pipeline_runner(
+            target_config,
+            {"arxiv", "s2"},
+            resume=True,
+            limit=limit,
+            takeover_stale=takeover_stale,
+            api_key=target_api_key,
+        )
+
+    # Step 4: Inspect outcomes after retry
+    store = ProgressStore(root)
+    failed_after_keys = [k for k, r in store.rows.items() if r["status"] == "failed"]
+    failed_after = len(failed_after_keys)
+
+    completed = False
+    if failed_after == 0:
+        log(f"Retry: [{folder}] all failed jobs recovered successfully (failed = 0)! Marking completed.json.")
+        mark_target_completed(folder, summary if isinstance(summary, dict) else {})
+        completed = True
+    elif force_mark_completed:
+        log(f"Retry: [{folder}] FORCE_MARK_COMPLETED=True. Marking completed.json despite {failed_after} remaining failed jobs.")
+        mark_target_completed(folder, summary if isinstance(summary, dict) else {})
+        completed = True
+    else:
+        log(f"Retry: [{folder}] still has {failed_after} failed jobs. completed.json NOT created.")
+
+    # Clean scratch SSD directory
+    clean_scratch_dir(target_config.paths.get("scratch_root", "scratch"))
+
+    return {
+        "target": target,
+        "folder": folder,
+        "failed_before": failed_before,
+        "failed_after": failed_after,
+        "remaining_failed_keys": failed_after_keys[:50],
+        "completed": completed,
+        "status": "completed" if completed else "has_failures",
+        "summary": summary,
+    }
+
+
+async def retry_range_queue(
+    base_config: CrawlerConfig,
+    targets: list[dict[str, Any]],
+    *,
+    force_mark_completed: bool = False,
+    takeover_stale: bool = False,
+    limit: int | None = None,
+    runner: Any = None,
+) -> list[dict[str, Any]]:
+    """Retry failed jobs across all specified targets sequentially."""
+    results = []
+    for t in targets:
+        res = await retry_target_failed(
+            base_config,
+            t,
+            force_mark_completed=force_mark_completed,
+            takeover_stale=takeover_stale,
+            limit=limit,
+            runner=runner,
+        )
+        results.append(res)
+    return results
+

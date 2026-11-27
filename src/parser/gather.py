@@ -120,7 +120,7 @@ def _commands(text):
         if name in ('iftrue', 'iffalse', 'else', 'fi') or name.startswith('if'):
             yield name if name in ('iftrue', 'iffalse', 'else', 'fi') else 'unknown_if', start, i, None
             continue
-        if name not in ('documentclass', 'input', 'include', 'includeonly', 'begin', 'end'):
+        if name not in ('documentclass', 'documentstyle', 'input', 'include', 'includeonly', 'begin', 'end'):
             arg_at = i
             while arg_at < len(text) and text[arg_at].isspace(): arg_at += 1
             if arg_at < len(text) and text[arg_at] == '*': arg_at += 1
@@ -138,7 +138,7 @@ def _commands(text):
         arg_start = i
         while arg_start < len(text) and text[arg_start].isspace():
             arg_start += 1
-        if name == 'documentclass' and arg_start < len(text) and text[arg_start] == '[':
+        if name in ('documentclass', 'documentstyle') and arg_start < len(text) and text[arg_start] == '[':
             option_end = text.find(']', arg_start + 1)
             if option_end >= 0:
                 arg_start = option_end + 1
@@ -191,6 +191,46 @@ def _conditional_events(text):
         yield 'unclosed_if', len(text), len(text), None, active, active
 
 
+def _resolve_root_candidate(roots: list[Path], source_dir: Path, arxiv_id: str) -> Path | None:
+    """Disambiguate multiple candidate root files using heuristics."""
+    if len(roots) <= 1:
+        return roots[0] if roots else None
+
+    # Step 1: Filter out secondary/auxiliary files (supplementary, rebuttal, templates, packages)
+    exclude_keywords = (
+        'supp', 'supplement', 'appendix', 'rebuttal', 'response',
+        'reply', 'standalone', 'symbols', 'natnotes', 'natbib',
+        'example', 'template', 'instructions'
+    )
+    filtered = [
+        p for p in roots
+        if not any(k in p.name.lower() for k in exclude_keywords)
+    ]
+    if len(filtered) == 1:
+        return filtered[0]
+    candidates = filtered if filtered else roots
+
+    # Step 2: Prefer top-level files over subdirectories (e.g. main.tex over chi2025lbw/main.tex)
+    min_depth = min(len(p.relative_to(source_dir).parts) for p in candidates)
+    top_candidates = [p for p in candidates if len(p.relative_to(source_dir).parts) == min_depth]
+    if len(top_candidates) == 1:
+        return top_candidates[0]
+
+    # Step 3: Prefer standard canonical paper names
+    canonical_names = {'main.tex', 'paper.tex', 'ms.tex', 'camera_ready.tex', f'{arxiv_id.lower()}.tex'}
+    std_candidates = [p for p in top_candidates if p.name.lower() in canonical_names]
+    if len(std_candidates) == 1:
+        return std_candidates[0]
+
+    # Step 4: Pick largest file by size if it is substantially larger (>1.5x and >1KB difference)
+    sizes = [(p.stat().st_size, p) for p in top_candidates]
+    sizes.sort(key=lambda x: x[0], reverse=True)
+    if len(sizes) >= 2 and sizes[0][0] >= sizes[1][0] * 1.5 and (sizes[0][0] - sizes[1][0]) > 1024:
+        return sizes[0][1]
+
+    return None
+
+
 def gather_version(arxiv_id: str, version: int, source_dir: Path, *,
                    max_file_bytes: int = 32 * 1024 * 1024,
                    max_output_bytes: int = 64 * 1024 * 1024) -> GatheredVersion:
@@ -215,13 +255,35 @@ def gather_version(arxiv_id: str, version: int, source_dir: Path, *,
     oversized = []
     for path in files:
         try:
-            if any(name == 'documentclass' and arg is not None and before
-                   for name, _, _, arg, before, _ in _conditional_events(read(path))):
+            text = read(path)
+            if any(name in ('documentclass', 'documentstyle') and arg is not None and before
+                   for name, _, _, arg, before, _ in _conditional_events(text)):
                 roots.append(path)
         except UnicodeError:
+            try:
+                raw_bytes = path.read_bytes()
+                fallback_text = raw_bytes.decode('utf8', errors='replace')
+                if any(name in ('documentclass', 'documentstyle') and arg is not None and before
+                       for name, _, _, arg, before, _ in _conditional_events(fallback_text)):
+                    contents[path] = fallback_text
+                    roots.append(path)
+                    continue
+            except Exception:
+                pass
             unreadable.append(path.relative_to(source_dir).as_posix())
         except _ResourceLimit:
             oversized.append(path.relative_to(source_dir).as_posix())
+
+    if len(roots) > 1:
+        chosen = _resolve_root_candidate(roots, source_dir, arxiv_id)
+        if chosen is not None:
+            roots = [chosen]
+            result.diagnostics.append(GatherDiagnostic(
+                'resolved_root',
+                f'Resolved root to {chosen.relative_to(source_dir).as_posix()}',
+                None, 'info'
+            ))
+
     if len(roots) != 1:
         for path in unreadable:
             result.diagnostics.append(GatherDiagnostic(
@@ -244,7 +306,7 @@ def gather_version(arxiv_id: str, version: int, source_dir: Path, *,
     begins = [pos for name, pos in markers if name == 'begin']
     ends = [pos for name, pos in markers if name == 'end']
     classes = [start for name, start, _, arg, before, _ in root_commands
-               if name == 'documentclass' and arg is not None and before]
+               if name in ('documentclass', 'documentstyle') and arg is not None and before]
     if (len(classes) != 1 or len(begins) != 1 or len(ends) != 1 or
             not classes[0] < begins[0] < ends[0]):
         result.status = 'partial'

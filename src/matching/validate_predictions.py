@@ -76,7 +76,7 @@ def _validate_table(table, partitions, entries, references, labels=None):
     predictions = _index(table.to_pylist(), ENTRY_KEY, "predictions")
     _require_keys(predictions.keys(), entries, "predictions")
     if labels is not None:
-        _require_keys(labels.keys(), entries, "labels")
+        _require_keys(labels.keys(), labels.keys() & entries, "labels")
     reference_keys = {
         (row["arxiv_id"], row["ref_arxiv_id"])
         for row in pq.read_table(
@@ -87,8 +87,11 @@ def _validate_table(table, partitions, entries, references, labels=None):
     for key, row in predictions.items():
         if row["partition"] != partitions[key[0]]:
             raise ValueError(f"predictions: {key!r} has wrong partition {row['partition']!r}")
-        if labels is not None and row[GROUNDTRUTH] != labels[key][GROUNDTRUTH]:
-            raise ValueError(f"predictions: {key!r} has ground truth different from labels")
+        if labels is not None:
+            label = labels.get(key)
+            target = label[GROUNDTRUTH] if label is not None else None
+            if row[GROUNDTRUTH] != target:
+                raise ValueError(f"predictions: {key!r} has ground truth different from labels")
         candidates = [row[column] for column in CANDIDATE_COLUMNS if row[column] is not None]
         if len(candidates) != len(set(candidates)):
             raise ValueError(f"predictions: {key!r} contains duplicate candidates")
@@ -109,26 +112,30 @@ def validate_predictions(predictions, splits, bibtex, references, labels=None):
     )
 
 
-def build_predictions(output, splits, bibtex, references, labels, rankings):
+def build_predictions(output, splits, bibtex, references, labels, rankings, *, model_output=False):
     partitions, entries = read_scope(splits, bibtex)
     labelled = read_labels(labels)
-    ranked = _index(
-        pq.read_table(rankings, columns=[*ENTRY_KEY, *CANDIDATE_COLUMNS]).to_pylist(),
-        ENTRY_KEY, "rankings",
-    )
-    _require_keys(labelled.keys(), entries, "labels")
-    _require_keys(ranked.keys(), entries, "rankings")
-    rows = [
-        {
-            "arxiv_id": key[0],
-            "partition": partitions[key[0]],
-            "citation_key": key[1],
-            GROUNDTRUTH: labelled[key][GROUNDTRUTH],
-            **{column: ranked[key][column] for column in CANDIDATE_COLUMNS},
-        }
-        for key in sorted(entries)
-    ]
-    table = pa.Table.from_pylist(rows, schema=PREDICTIONS_SCHEMA)
+    if model_output:
+        raw = pq.read_table(rankings)
+        _require_keys(set(raw.column_names), set(PREDICTIONS_SCHEMA.names), "model output columns")
+        table = raw.select(PREDICTIONS_SCHEMA.names).cast(PREDICTIONS_SCHEMA)
+    else:
+        ranked = _index(
+            pq.read_table(rankings, columns=[*ENTRY_KEY, *CANDIDATE_COLUMNS]).to_pylist(),
+            ENTRY_KEY, "rankings",
+        )
+        _require_keys(ranked.keys(), entries, "rankings")
+        rows = [
+            {
+                "arxiv_id": key[0],
+                "partition": partitions[key[0]],
+                "citation_key": key[1],
+                GROUNDTRUTH: labelled.get(key, {}).get(GROUNDTRUTH),
+                **{column: ranked[key][column] for column in CANDIDATE_COLUMNS},
+            }
+            for key in sorted(entries)
+        ]
+        table = pa.Table.from_pylist(rows, schema=PREDICTIONS_SCHEMA)
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(dir=output.parent) as directory:
@@ -148,17 +155,22 @@ def main():
     parser.add_argument("--bibtex", type=Path, required=True)
     parser.add_argument("--references", type=Path, required=True)
     parser.add_argument("--labels", type=Path)
-    parser.add_argument("--rankings", type=Path)
+    ranking_source = parser.add_mutually_exclusive_group()
+    ranking_source.add_argument("--rankings", type=Path)
+    ranking_source.add_argument("--model-output", type=Path, help="E2 predictions_raw.parquet")
     args = parser.parse_args()
     sources = (args.splits, args.bibtex, args.references)
     try:
         if args.output:
-            if args.labels is None or args.rankings is None:
-                parser.error("--output requires --labels and --rankings")
-            count = build_predictions(args.output, *sources, args.labels, args.rankings)
+            if args.labels is None or (args.rankings is None and args.model_output is None):
+                parser.error("--output requires --labels and either --rankings or --model-output")
+            count = build_predictions(
+                args.output, *sources, args.labels, args.rankings or args.model_output,
+                model_output=args.model_output is not None,
+            )
         else:
-            if args.rankings is not None:
-                parser.error("--rankings is only used with --output")
+            if args.rankings is not None or args.model_output is not None:
+                parser.error("--rankings and --model-output are only used with --output")
             count = validate_predictions(args.predictions, *sources, args.labels)
     except (OSError, ValueError) as error:
         parser.exit(1, f"{error}\n")

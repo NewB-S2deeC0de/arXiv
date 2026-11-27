@@ -45,10 +45,10 @@ publication.
 Each configuration can be loaded with `split="train"` and `streaming=True`.
 For the matching task, use the `partition` column of `predictions` to select
 `train`, `valid`, or `test`. Both ground truth and candidate IDs refer to the
-`ref_arxiv_id` values of the same citing publication. Null ground truth marks
-a labelled entry with no matching reference. Null candidate cells represent
-unfilled ranks.
+`ref_arxiv_id` values of the same citing publication. Null ground truth
+represents either an unlabelled entry or a label with no matching reference.
+Null candidate cells represent unfilled ranks.
 
 MRR@5 averages the reciprocal rank of the correct reference over labelled
 BibTeX entries. An entry with null ground truth or without a correct reference
-among the five candidates contributes zero.
+among the five candidates contributes zero if the entry was labelled.

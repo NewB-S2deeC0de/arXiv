@@ -131,9 +131,17 @@ def test_reject_invalid_predictions(inputs, change, error):
         )))
 
 
-def test_missing_label_does_not_count_as_null_groundtruth(inputs):
+def test_model_output_excludes_unlabelled_entries_from_mrr(inputs, tmp_path):
     build(inputs)
     labels = pq.read_table(inputs["labels"])
     pq.write_table(labels.slice(0, labels.num_rows - 1), inputs["labels"])
-    with pytest.raises(ValueError, match="missing keys"):
-        evaluate_predictions(inputs["output"], inputs["labels"])
+    raw = tmp_path / "predictions_raw.parquet"
+    final = pq.read_table(inputs["output"])
+    pq.write_table(final.cast(pa.schema([(name, pa.string()) for name in final.column_names])), raw)
+    assert build_predictions(*(inputs[key] for key in (
+        "output", "splits", "bibtex", "references", "labels",
+    )), raw, model_output=True) == 4
+    assert pq.read_schema(inputs["output"]).equals(PREDICTIONS_SCHEMA)
+    assert evaluate_predictions(inputs["output"], inputs["labels"])["test"] == {
+        "n_queries": 1, "mrr_at_5": 0.5,
+    }

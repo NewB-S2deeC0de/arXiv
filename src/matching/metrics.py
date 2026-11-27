@@ -35,18 +35,19 @@ def evaluate_predictions(predictions, labels):
         raise ValueError("predictions: expected the final M3 schema")
     rows = _index(table.to_pylist(), ENTRY_KEY, "predictions")
     labelled = read_labels(labels)
-    _require_keys(labelled.keys(), rows.keys(), "labels")
+    _require_keys(labelled.keys(), labelled.keys() & rows.keys(), "labels")
     totals = {"valid": 0.0, "test": 0.0}
     counts = dict.fromkeys(totals, 0)
     for key, row in rows.items():
-        target = labelled[key][GROUNDTRUTH]
+        label = labelled.get(key)
+        target = label[GROUNDTRUTH] if label is not None else None
         if row[GROUNDTRUTH] != target:
             raise ValueError(f"predictions: {key!r} has ground truth different from labels")
         partition = row["partition"]
-        if partition == "train":
-            continue
-        if partition not in counts:
+        if partition != "train" and partition not in counts:
             raise ValueError(f"predictions: {key!r} has invalid partition {partition!r}")
+        if partition == "train" or label is None:
+            continue
         candidates = [row[column] for column in CANDIDATE_COLUMNS]
         counts[partition] += 1
         totals[partition] += reciprocal_rank_at_5(target, candidates)

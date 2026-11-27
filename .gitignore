@@ -13,3 +13,5 @@ docs/huggingface/*
 !docs/huggingface/README.md
 
 scratch
+
+.work/

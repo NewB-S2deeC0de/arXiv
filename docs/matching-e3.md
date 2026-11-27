@@ -17,12 +17,13 @@ matching pipeline. The matching team provides these Parquet files under
 
 | File | Required columns |
 | --- | --- |
-| `splits.parquet` | `arxiv_id`, `partition` |
-| `labels.parquet` | `arxiv_id`, `citation_key`, `groundtruth_arxiv_id` |
-| `ranked_candidates.parquet` | `arxiv_id`, `citation_key`, `cand_1` through `cand_5` |
+| `publication_split.parquet` (E1) | `arxiv_id`, `partition` |
+| `groundtruth.parquet` (E1) | `arxiv_id`, `citation_key`, `groundtruth_arxiv_id` |
+| `predictions_raw.parquet` (E2) | All nine prediction columns, with a plain string `partition` |
 
-The split file has one row per participating publication. The labels and
-ranking files each cover every BibTeX entry of those publications once.
+The split file has one row per participating publication. The model output
+covers every BibTeX entry of those publications once. Ground truth contains
+only labelled entries.
 Use strings for identifiers and true Parquet nulls for absent ground truth
 or candidates. Keep the model's order in the five candidate columns. A row
 of null candidates represents an entry with no proposed candidates.
@@ -31,25 +32,28 @@ Build and validate the final table:
 
 ```powershell
 python -m matching.validate_predictions `
-  --output "$m3/predictions.parquet" --splits "$m3/splits.parquet" `
+  --output "$m3/predictions.parquet" --splits "$m3/publication_split.parquet" `
   --bibtex "$m2/bibtex.parquet" --references "$m1/references.parquet" `
-  --labels "$m3/labels.parquet" --rankings "$m3/ranked_candidates.parquet"
+  --labels "$m3/groundtruth.parquet" --model-output "$m3/predictions_raw.parquet"
 ```
 
 To validate a final table supplied by the matching team, replace
-`--output` with `--predictions` and omit `--rankings`.
+`--output` with `--predictions` and omit `--model-output`. If the ranking
+file contains only `arxiv_id`, `citation_key`, and the five candidate
+columns, pass it with `--rankings` when building the final table.
 
 Generate the MRR@5 report after validation succeeds:
 
 ```powershell
 python -m matching.metrics `
-  --predictions "$m3/predictions.parquet" --labels "$m3/labels.parquet" `
+  --predictions "$m3/predictions.parquet" --labels "$m3/groundtruth.parquet" `
   --out "$m3/mrr_report.json"
 ```
 
 The report gives the MRR@5 and number of labelled entries independently for
 `valid` and `test`. A labelled entry with null ground truth contributes zero
-and counts toward the denominator.
+and counts toward the denominator. An entry absent from the labels file
+is excluded from the score.
 
 Stage the publishable Parquet shards and the [Dataset Card](huggingface/README.md)
 in a new output directory:
@@ -57,8 +61,8 @@ in a new output directory:
 ```powershell
 python -m matching.upload_hf stage `
   --dataset-dir "$m3/hf_dataset" --m1-export "$m1" --m2-output "$m2" `
-  --predictions "$m3/predictions.parquet" --splits "$m3/splits.parquet" `
-  --labels "$m3/labels.parquet"
+  --predictions "$m3/predictions.parquet" --splits "$m3/publication_split.parquet" `
+  --labels "$m3/groundtruth.parquet"
 ```
 
 Stage validates the predictions against the selected sources. It exports

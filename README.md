@@ -401,3 +401,66 @@ python -m pytest @bTests
 C3 có thể gọi `standardize_publication` sau A1/A2/A3 để chuẩn hóa cây, đọc
 bibliography theo version, hợp nhất reference và remap citation trước C2.
 Xem [API và quy tắc tích hợp](docs/b-local-workflow-api.md).
+
+## Milestone 3 · E2 Feature Engineering & LightGBM Matching
+
+Code nằm ở `src/matching/features.py` và `src/matching/model.py`. Cài đặt lại
+dependency trước khi chạy vì E2 bổ sung `pandas`, `scikit-learn`, `rapidfuzz`,
+`lightgbm` và `matplotlib`.
+
+```bash
+python -m pip install -r src/requirements.txt
+PYTHONPATH=src python -m matching.model \
+  --bibtex runtime/parsed/bibtex.parquet \
+  --references runtime/exports \
+  --elements runtime/parsed/elements.parquet \
+  --groundtruth runtime/matching/groundtruth.parquet \
+  --output-dir runtime/matching
+```
+
+`--references` nhận trực tiếp file `references.parquet` hoặc một thư mục; khi
+nhận thư mục, script chọn file `references.parquet` có mtime mới nhất. Input
+mặc định đã khớp cấu trúc trên nên có thể chạy `PYTHONPATH=src python -m
+matching.model`.
+
+Ground truth từ E1 có bốn cột `arxiv_id`, `citation_key`,
+`groundtruth_arxiv_id`, `partition`. Nhãn của một cặp là 1 khi
+`ref_arxiv_id == groundtruth_arxiv_id`, ngược lại là 0; entry có groundtruth
+null là all-negative. Chỉ các cặp thuộc publication có `partition == 'train'`
+mới được dùng để huấn luyện. Mô hình là `LGBMClassifier` với
+`n_estimators=150`, `max_depth=5`, `learning_rate=0.05`, `random_state=42`.
+Suy luận chạy trên mọi cặp của toàn bộ publication trong train/valid/test, sau
+đó xếp hạng theo xác suất và lấy Top 5 cho mỗi `citation_key`.
+
+Sáu feature của mỗi cặp `(bibtex_entry, reference)`:
+
+| Feature | Ý tưởng |
+| --- | --- |
+| `feat_title_token_sort` | `rapidfuzz.fuzz.token_sort_ratio` của hai tiêu đề chia 100; chịu khác thứ tự từ. |
+| `feat_title_char_tfidf` | Cosine TF-IDF char n-gram 3–5, vocabulary fit trên toàn bộ tiêu đề; bắt lỗi chính tả/thay đổi nhỏ. |
+| `feat_author_jaccard` | Jaccard trên tập họ tác giả; `Family, Given` lấy `Family`, `Given Family` lấy token cuối. |
+| `feat_year_diff` | `|year_bib - year_ref|`, thiếu một bên thì 5.0; thời gian xuất bản là tín hiệu mạnh. |
+| `feat_doi_match` | 1.0 khi cả hai DOI tồn tại và bằng nhau sau `lower()/strip()`, ngược lại 0.0. |
+| `feat_hierarchy_cite` | 1.0 khi `citation_key` xuất hiện trong element `sentence` của cùng publication; tận dụng cây M2. |
+
+`references.parquet` chuẩn M1 không có cột DOI; script tự nhận `ref_doi`/`doi`
+hoặc `external_ids.DOI` nếu có, còn thiếu thì feature DOI bằng 0.0. Năm của
+reference lấy từ `ref_year`, `year` hoặc bốn chữ số đầu của
+`ref_submission_date`.
+
+Outputs trong `--output-dir`:
+
+- `predictions_raw.parquet`: đúng 9 cột theo đề bài (`arxiv_id`, `partition`,
+  `citation_key`, `groundtruth_arxiv_id`, `cand_1`…`cand_5`); candidate thiếu
+  để `None`.
+- `candidate_scores.parquet`: mọi cặp kèm sáu feature và xác suất, phục vụ
+  phân tích/poster.
+- `lgbm_model.txt`: checkpoint LightGBM.
+- `feature_importances.csv` và `feature_importances.png` (khi có matplotlib):
+  bảng/biểu đồ split và gain importance.
+
+Chạy test offline của E2:
+
+```bash
+python -m pytest -q tests/test_matching_features.py tests/test_matching_model.py
+```

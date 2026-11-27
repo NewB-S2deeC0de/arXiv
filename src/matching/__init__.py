@@ -1,1 +1,1 @@
-"""Milestone 3 evaluation and dataset publishing."""
+"""Milestone 3 reference-matching pipeline."""

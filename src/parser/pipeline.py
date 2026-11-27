@@ -792,6 +792,29 @@ def _publication_audits(parts_root: Path, arxiv_ids) -> dict:
     return audits
 
 
+def _write_bibtex_audit_stream(parts_root: Path, output_root: Path, arxiv_ids) -> int:
+    """Stream-write bibtex_audit.json one publication at a time to avoid OOM."""
+    target = output_root / 'bibtex_audit.json'
+    tmp = output_root / '.bibtex_audit.json.tmp'
+    count = 0
+    with tmp.open('w', encoding='utf8') as handle:
+        handle.write('{"schema_version": 1, "publications": {\n')
+        first = True
+        for arxiv_id in sorted(arxiv_ids):
+            path = parts_root / quote(arxiv_id, safe='') / 'audit.json'
+            payload = _read_json(path, None)
+            if not isinstance(payload, dict):
+                continue
+            if not first:
+                handle.write(',\n')
+            first = False
+            handle.write(f'{json.dumps(arxiv_id, ensure_ascii=False)}: {json.dumps(payload, ensure_ascii=False)}')
+            count += 1
+        handle.write('\n}}\n')
+    os.replace(tmp, target)
+    return count
+
+
 def _merge_parts(parts_root: Path, output_root: Path, arxiv_ids) -> dict[str, int]:
     part_dirs = [parts_root / quote(arxiv_id, safe='') for arxiv_id in sorted(arxiv_ids)]
     counts = {}
@@ -810,7 +833,7 @@ def _merge_parts(parts_root: Path, output_root: Path, arxiv_ids) -> dict[str, in
                 total += table.num_rows
                 buffer.append(table)
                 buffered_rows += table.num_rows
-                if buffered_rows >= 25000:
+                if buffered_rows >= 10000:
                     writer.write_table(pa.concat_tables(buffer))
                     buffer.clear()
                     buffered_rows = 0
@@ -889,37 +912,6 @@ def _worker_process_publication(payload: dict) -> dict:
     timeout_seconds = payload.get('timeout_seconds')
     services = _get_worker_services(payload.get('services'))
 
-    records = [read_source_record(arxiv_id, version, paper_dir / 'versions' / f'v{version}')
-               for version in version_numbers(paper_dir)]
-    input_fingerprint = _publication_input_fingerprint(
-        arxiv_id, records, selected_bib_files=selected_bib_files,
-        approved_metadata_candidates=approved_metadata_candidates)
-    policy_fingerprint = _policy_fingerprint(include_partial, services)
-
-    cached_info = payload.get('cached_info')
-    if (cached_info is not None
-            and _shards_exist(parts_root, arxiv_id)
-            and cached_info.get('input_fingerprint') == input_fingerprint
-            and cached_info.get('policy_fingerprint') == policy_fingerprint):
-        cached_warnings = cached_info.get('warnings')
-        if cached_warnings is None:
-            audit_path = parts_root / quote(arxiv_id, safe='') / 'audit.json'
-            if audit_path.is_file():
-                cached_warnings = _read_json(audit_path, {}).get('warnings', [])
-            else:
-                cached_warnings = []
-        return {
-            'arxiv_id': arxiv_id,
-            'skipped': True,
-            'records_count': len(records),
-            'input_fingerprint': input_fingerprint,
-            'policy_fingerprint': policy_fingerprint,
-            'stats': cached_info.get('stats'),
-            'errors': cached_info.get('errors', []),
-            'warnings': cached_warnings,
-            'seconds': 0.0,
-        }
-
     publication_started = time.perf_counter()
     timer_set = False
     old_handler = None
@@ -931,7 +923,41 @@ def _worker_process_publication(payload: dict) -> dict:
         except (ValueError, OSError):
             pass
 
+    records = []
+    input_fingerprint = ''
+    policy_fingerprint = ''
     try:
+        records = [read_source_record(arxiv_id, version, paper_dir / 'versions' / f'v{version}')
+                   for version in version_numbers(paper_dir)]
+        input_fingerprint = _publication_input_fingerprint(
+            arxiv_id, records, selected_bib_files=selected_bib_files,
+            approved_metadata_candidates=approved_metadata_candidates)
+        policy_fingerprint = _policy_fingerprint(include_partial, services)
+
+        cached_info = payload.get('cached_info')
+        if (cached_info is not None
+                and _shards_exist(parts_root, arxiv_id)
+                and cached_info.get('input_fingerprint') == input_fingerprint
+                and cached_info.get('policy_fingerprint') == policy_fingerprint):
+            cached_warnings = cached_info.get('warnings')
+            if cached_warnings is None:
+                audit_path = parts_root / quote(arxiv_id, safe='') / 'audit.json'
+                if audit_path.is_file():
+                    cached_warnings = _read_json(audit_path, {}).get('warnings', [])
+                else:
+                    cached_warnings = []
+            return {
+                'arxiv_id': arxiv_id,
+                'skipped': True,
+                'records_count': len(records),
+                'input_fingerprint': input_fingerprint,
+                'policy_fingerprint': policy_fingerprint,
+                'stats': cached_info.get('stats'),
+                'errors': cached_info.get('errors', []),
+                'warnings': cached_warnings,
+                'seconds': 0.0,
+            }
+
         stats, errors, warnings, rows, audit = _process_publication(
             arxiv_id, records, services, include_partial=include_partial,
             selected_bib_files=selected_bib_files,
@@ -1116,7 +1142,7 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
                 _flush_checkpoint(checkpoint_path, checkpoint, processed)
                 dirty = False
     else:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers, max_tasks_per_child=150) as executor:
             future_to_pub = {
                 executor.submit(_worker_process_publication, {
                     'arxiv_id': arxiv_id,
@@ -1145,7 +1171,7 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
                     continue
                 elif log:
                     log(f'[{completed_count}/{total_publications}] parse {arxiv_id} ({res["records_count"]} versions)')
-                processed[arxiv_id] = dict(stats=res['stats'], errors=res['errors'], warnings=res['warnings'],
+                processed[arxiv_id] = dict(stats=res['stats'], errors=res['errors'],
                                            input_fingerprint=res['input_fingerprint'],
                                            policy_fingerprint=res['policy_fingerprint'])
                 dirty = True
@@ -1159,9 +1185,7 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
     gc.collect()
     counts = _merge_parts(parts_root, output, input_ids)
     _write_coverage(output, processed)
-    audits = _publication_audits(parts_root, input_ids)
-    _atomic_json(output / 'bibtex_audit.json',
-                 dict(schema_version=1, publications=audits))
+    audit_count = _write_bibtex_audit_stream(parts_root, output, input_ids)
     errors = [error for item in processed.values() for error in item.get('errors', [])]
     warnings = [warning for item in processed.values() for warning in item.get('warnings', [])]
     _atomic_json(output / 'errors.json', errors)
@@ -1215,7 +1239,7 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
                         bibtex_conflict_fields=aggregate['bibtex_conflict_fields'],
                         bibtex_unexportable=aggregate['bibtex_unexportable'],
                         bibtex_unresolved=aggregate['bibtex_unresolved']),
-        'audit': dict(schema_version=1, publications=len(audits),
+        'audit': dict(schema_version=1, publications=audit_count,
                       path='bibtex_audit.json'),
         'empty_versions': aggregate['versions_empty'],
         'timing': dict(elapsed_seconds=round(elapsed, 3),
@@ -1248,7 +1272,7 @@ def run_parser(persistent_root: str | Path = 'runtime', *,
                                                bytes=coverage_path.stat().st_size)
     audit_path = output / 'bibtex_audit.json'
     manifest['outputs']['bibtex_audit.json'] = dict(
-        rows=len(audits), sha256=digest(audit_path), bytes=audit_path.stat().st_size)
+        rows=audit_count, sha256=digest(audit_path), bytes=audit_path.stat().st_size)
     manifest['storage']['output_bytes'] = sum(item['bytes'] for item in manifest['outputs'].values())
     _atomic_json(output / 'manifest.json', manifest)
     if not output_validation['ok']:

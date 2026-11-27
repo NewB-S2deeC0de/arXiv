@@ -201,3 +201,175 @@ async def test_run_range_queue_passes_target_api_key(tmp_path, monkeypatch):
     assert "member-custom-key" in called_api_keys
 
 
+@pytest.mark.anyio
+async def test_retry_target_failed_recovers_and_marks_completed(tmp_path, monkeypatch):
+    from crawler.progress import ProgressStore
+    from crawler.queue import retry_target_failed
+    monkeypatch.chdir(tmp_path)
+
+    target = {
+        "start_month": "2025-04",
+        "start_id": 1,
+        "end_month": "2025-04",
+        "end_id": 2,
+        "folder": "datasets/t1",
+    }
+    folder = tmp_path / "datasets" / "t1"
+    store = ProgressStore(folder)
+    store.initialize(["2504.00001", "2504.00002"])
+    store.finish(("2504.00001", 0, "discovery", 0), "succeeded")
+    store.add(("2504.00001", 1, "metadata", 0))
+    store.finish(("2504.00001", 1, "metadata", 0), "succeeded")
+
+    store.finish(("2504.00002", 0, "discovery", 0), "succeeded")
+    store.add(("2504.00002", 1, "metadata", 0))
+    store.finish(("2504.00002", 1, "metadata", 0), "failed", "http_503")
+    store.save(with_views=True)
+
+    marker = folder / "completed.json"
+    marker.write_text('{"completed_at": "old"}')
+
+    async def mock_runner(cfg, stages, **kwargs):
+        s = ProgressStore(folder)
+        for k in list(s.rows.keys()):
+            if s.rows[k]["status"] == "pending":
+                s.finish(k, "succeeded")
+        s.save(with_views=True)
+        return {"wall_seconds": 5.0}
+
+    res = await retry_target_failed(CrawlerConfig(), target, runner=mock_runner)
+    assert res["status"] == "completed"
+    assert res["failed_before"] == 1
+    assert res["failed_after"] == 0
+    assert res["completed"] is True
+    assert marker.exists()
+    assert '"completed_at": "old"' not in marker.read_text()
+
+
+@pytest.mark.anyio
+async def test_retry_target_failed_when_no_failed_jobs(tmp_path, monkeypatch):
+    from crawler.progress import ProgressStore
+    from crawler.queue import retry_target_failed
+    monkeypatch.chdir(tmp_path)
+
+    target = {
+        "start_month": "2025-04",
+        "start_id": 1,
+        "end_month": "2025-04",
+        "end_id": 1,
+        "folder": "datasets/t2",
+    }
+    folder = tmp_path / "datasets" / "t2"
+    store = ProgressStore(folder)
+    store.initialize(["2504.00001"])
+    store.finish(("2504.00001", 0, "discovery", 0), "succeeded")
+    store.save(with_views=True)
+
+    res = await retry_target_failed(CrawlerConfig(), target)
+    assert res["status"] == "no_failed_jobs"
+    assert res["failed_before"] == 0
+
+
+@pytest.mark.anyio
+async def test_retry_target_failed_force_mark_vs_leave_unmarked(tmp_path, monkeypatch):
+    from crawler.progress import ProgressStore
+    from crawler.queue import retry_target_failed
+    monkeypatch.chdir(tmp_path)
+
+    target = {
+        "start_month": "2025-04",
+        "start_id": 1,
+        "end_month": "2025-04",
+        "end_id": 1,
+        "folder": "datasets/t3",
+    }
+    folder = tmp_path / "datasets" / "t3"
+    store = ProgressStore(folder)
+    store.initialize(["2504.00001"])
+    store.finish(("2504.00001", 0, "discovery", 0), "succeeded")
+    store.add(("2504.00001", 1, "metadata", 0))
+    store.finish(("2504.00001", 1, "metadata", 0), "failed", "http_404")
+    store.save(with_views=True)
+
+    marker = folder / "completed.json"
+    marker.write_text('{"old": true}')
+
+    async def mock_runner_still_fails(cfg, stages, **kwargs):
+        s = ProgressStore(folder)
+        for k in list(s.rows.keys()):
+            if s.rows[k]["status"] == "pending":
+                s.finish(k, "failed", "http_404")
+        s.save(with_views=True)
+        return {"wall_seconds": 1.0}
+
+    # Case A: force_mark_completed = False
+    res = await retry_target_failed(CrawlerConfig(), target, force_mark_completed=False, runner=mock_runner_still_fails)
+    assert res["status"] == "has_failures"
+    assert res["completed"] is False
+    assert not marker.exists()
+
+    # Case B: force_mark_completed = True
+    res_forced = await retry_target_failed(CrawlerConfig(), target, force_mark_completed=True, runner=mock_runner_still_fails)
+    assert res_forced["status"] == "completed"
+    assert res_forced["completed"] is True
+    assert marker.exists()
+
+
+@pytest.mark.anyio
+async def test_retry_target_failed_runs_discovery_first_if_discovery_failed(tmp_path, monkeypatch):
+    from crawler.progress import ProgressStore
+    from crawler.queue import retry_target_failed
+    monkeypatch.chdir(tmp_path)
+
+    target = {
+        "start_month": "2025-04",
+        "start_id": 1,
+        "end_month": "2025-04",
+        "end_id": 2,
+        "folder": "datasets/t4",
+    }
+    folder = tmp_path / "datasets" / "t4"
+    store = ProgressStore(folder)
+    store.initialize(["2504.00001", "2504.00002"])
+    store.finish(("2504.00001", 0, "discovery", 0), "failed", "transport_ConnectTimeout")
+    store.finish(("2504.00002", 0, "discovery", 0), "succeeded")
+    store.save(with_views=True)
+
+    calls = []
+    async def mock_runner(cfg, stages, **kwargs):
+        calls.append(set(stages))
+        s = ProgressStore(folder)
+        if "discovery" in stages:
+            s.finish(("2504.00001", 0, "discovery", 0), "succeeded")
+            s.add(("2504.00001", 1, "metadata", 0))
+        if "arxiv" in stages or "s2" in stages:
+            for k in list(s.rows.keys()):
+                if s.rows[k]["status"] == "pending":
+                    s.finish(k, "succeeded")
+        s.save(with_views=True)
+        return {"wall_seconds": 2.0}
+
+    res = await retry_target_failed(CrawlerConfig(), target, runner=mock_runner)
+    assert res["status"] == "completed"
+    assert calls[0] == {"discovery"}
+    assert calls[1] == {"arxiv", "s2"}
+
+
+@pytest.mark.anyio
+async def test_retry_range_queue_iterates_targets(tmp_path, monkeypatch):
+    from crawler.progress import ProgressStore
+    from crawler.queue import retry_range_queue
+    monkeypatch.chdir(tmp_path)
+
+    target1 = {"start_month": "2025-04", "start_id": 1, "end_month": "2025-04", "end_id": 1, "folder": "datasets/q1"}
+    target2 = {"start_month": "2025-04", "start_id": 2, "end_month": "2025-04", "end_id": 2, "folder": "datasets/q2"}
+
+    # Neither folder has progress data
+    results = await retry_range_queue(CrawlerConfig(), [target1, target2])
+    assert len(results) == 2
+    assert results[0]["status"] == "no_progress_data"
+    assert results[1]["status"] == "no_progress_data"
+
+
+
+
