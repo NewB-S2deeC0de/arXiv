@@ -328,7 +328,7 @@ def test_export_dataset_snapshot_parity_direct_vs_fast(tmp_path, monkeypatch):
     # Export direct
     manifest_direct = export_dataset_snapshot(c, 'snap-direct', fast_staging=False)
     # Export fast
-    manifest_fast = export_dataset_snapshot(c, 'snap-fast', fast_staging=True)
+    manifest_fast = export_dataset_snapshot(c, 'snap-fast', fast_staging=True, staging_workers=4)
 
     # Parity check: config_fingerprint, input_fingerprint, papers, references count
     assert manifest_direct['config_fingerprint'] == manifest_fast['config_fingerprint']
@@ -461,9 +461,16 @@ def test_export_dataset_snapshot_job_directed_staging_skips_raw_files(tmp_path, 
         return orig_copyfile(src, dst, *args, **kwargs)
 
     monkeypatch.setattr('shutil.copyfile', tracked_copyfile)
+    original_read=Path.read_bytes
+    def tracked_read(path):
+        copied_sources.append(str(path))
+        return original_read(path)
+    monkeypatch.setattr(Path,'read_bytes',tracked_read)
 
     manifest = export_dataset_snapshot(c, 'job-directed', fast_staging=True)
     assert manifest['run_id'] == 'job-directed'
+    assert str(res_dir/'normalized.json') in copied_sources
+    assert str(res_dir/'complete.json') in copied_sources
 
     # Confirm raw archive and unindexed garbage were never copied
     assert not any('source.tar.gz' in s for s in copied_sources)

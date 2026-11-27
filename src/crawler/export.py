@@ -5,7 +5,27 @@ from pathlib import Path
 from dataclasses import asdict
 import hashlib
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+
+def _bounded_stage(keys, worker, workers, label):
+    started=last=time.monotonic(); done=files=size=0
+    iterator=iter(keys)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending=set()
+        for _ in range(min(workers,len(keys))):
+            pending.add(pool.submit(worker,next(iterator)))
+        while pending:
+            finished,pending=wait(pending,timeout=10,return_when=FIRST_COMPLETED)
+            for future in finished:
+                amount,count,result=future.result()
+                size+=amount; files+=count; done+=1
+                yield result
+                key=next(iterator,None)
+                if key is not None: pending.add(pool.submit(worker,key))
+            elapsed=time.monotonic()-started
+            if not finished or not pending or time.monotonic()-last>=10:
+                _phase(f'{label}: {done}/{len(keys)} pending={len(pending)} files={files} bytes={size} elapsed={elapsed:.1f}s bytes/s={size/max(elapsed,.001):.0f}')
+                last=time.monotonic()
 
 def _phase(message):
     print(f'[export {time.monotonic():.1f}s] {message}', flush=True)
@@ -247,7 +267,7 @@ def export_dataset_snapshot(config,run_id,*,fast_staging=True,scratch_root=None,
 
             # Job-directed selective data staging: copy only needed JSONs for selected papers
             _phase('Drive discovery planning started' if fast_staging else 'direct mode: no staging plan')
-            src_store = ProgressStore(source_root) if fast_staging else None
+            src_store = ProgressStore(staging_dir) if fast_staging else None
             selected = set(generate_ids(**config.range))
             keys_to_stage = set()
             for paper in selected if fast_staging else ():
@@ -257,29 +277,33 @@ def export_dataset_snapshot(config,run_id,*,fast_staging=True,scratch_root=None,
                     keys_to_stage.add(key)
 
             # Copy discovery once, then plan revisions from the verified local commit.
-            for paper in selected if fast_staging else ():
+            def discovery(paper):
                 key=(paper,0,'discovery',0)
-                directory=src_store.storage.result_dir(key)
-                destination=staging_dir / directory.relative_to(source_root)
+                destination=src_store.storage.result_dir(key)
+                directory=source_root / destination.relative_to(staging_dir)
                 destination.mkdir(parents=True,exist_ok=True)
+                size=files=0
                 try:
                     marker_bytes=(directory/'complete.json').read_bytes()
                     payload=(directory/'normalized.json').read_bytes()
                     (destination/'complete.json').write_bytes(marker_bytes)
                     (destination/'normalized.json').write_bytes(payload)
+                    size=len(marker_bytes)+len(payload); files=2
                     marker=json.loads(marker_bytes)
                     if marker['key']!=list(key) or marker['status']!='succeeded' or hashlib.sha256(payload).hexdigest()!=marker['checksums']['normalized.json']:
-                        continue
+                        return size,files,()
                     latest = int(json.loads(payload).get('version', 0))
-                    keys_to_stage.update((paper, version, 'metadata', 0) for version in range(2, latest + 1))
+                    return size,files,tuple((paper, version, 'metadata', 0) for version in range(2, latest + 1))
                 except (FileNotFoundError, ValueError, TypeError, KeyError):
-                    pass
-                finally:
-                    keys_to_stage.discard(key)
+                    return size,files,()
+
+            for revisions in _bounded_stage(sorted(selected) if fast_staging else [],discovery,staging_workers,'Drive discovery'):
+                keys_to_stage.update(revisions)
+            keys_to_stage={key for key in keys_to_stage if key[2]!='discovery'}
 
             def stage(key):
-                src_res_dir = src_store.storage.result_dir(key)
-                dest_res_dir = staging_dir / src_res_dir.relative_to(source_root)
+                dest_res_dir = src_store.storage.result_dir(key)
+                src_res_dir = source_root / dest_res_dir.relative_to(staging_dir)
                 dest_res_dir.mkdir(parents=True, exist_ok=True)
                 size = files = 0
                 for fname in ('complete.json', 'inventory.json' if key[2]=='source' else 'normalized.json'):
@@ -289,20 +313,10 @@ def export_dataset_snapshot(config,run_id,*,fast_staging=True,scratch_root=None,
                         continue
                     (dest_res_dir / fname).write_bytes(payload)
                     size+=len(payload); files+=1
-                return size,files
+                return size,files,None
 
             keys=sorted(keys_to_stage)
-            started=last=time.monotonic(); size=files=done=0
-            with ThreadPoolExecutor(max_workers=staging_workers) as pool:
-                # Batch submission bounds queued work and propagates unexpected I/O errors.
-                for offset in range(0,len(keys),staging_workers):
-                    for amount,count in pool.map(stage,keys[offset:offset+staging_workers]):
-                        size+=amount; files+=count; done+=1
-                    now=time.monotonic()
-                    if now-last>=10:
-                        _phase(f'Drive staging {done}/{len(keys)}; files={files}; bytes={size}; bytes/s={size/max(now-started,.001):.0f}')
-                        last=now
-            _phase(f'staging complete {done}/{len(keys)}; files={files}; bytes={size}; elapsed={time.monotonic()-started:.1f}s')
+            for _ in _bounded_stage(keys,stage,staging_workers,'Drive remaining staging'): pass
 
             output_root = staging_dir / 'built_exports'
             manifest = _export_snapshot(config, run_id, runtime_root=runtime_root,
