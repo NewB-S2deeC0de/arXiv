@@ -15,11 +15,24 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('command',choices=['init','run','resume','status','retry-failed','recheck-not-found','refresh-discovery','refresh-references','diagnose','diagnose-references','export'])
     parser.add_argument('--config',type=Path,default=Path('config/crawler.yaml'))
+    parser.add_argument('--folder',type=Path,default=None,help='Override persistent_root dataset folder')
     parser.add_argument('--run-id')
     parser.add_argument('--limit',type=int,default=None)
     parser.add_argument('--stages',nargs='+',choices=['arxiv','s2','discovery'],default=['arxiv','s2'])
     parser.add_argument('--takeover-stale',action='store_true')
     args=parser.parse_args(); config=load_config(args.config)
+    if args.folder:
+        try:
+            rel = Path(args.folder).resolve().relative_to(Path.cwd().resolve())
+            config.paths['persistent_root'] = str(rel)
+        except ValueError:
+            config.paths['persistent_root'] = str(args.folder)
+        import re
+        m=re.search(r'(\d{4}-\d{2})_(\d+)_to_(\d{4}-\d{2})_(\d+)',str(args.folder))
+        if m:
+            config.range['start_month']=m.group(1); config.range['start_id']=int(m.group(2))
+            config.range['end_month']=m.group(3); config.range['end_id']=int(m.group(4))
+        config.validate()
     if args.limit is not None and args.limit<1: parser.error('--limit must be positive')
     if args.command in ('run','resume'):
         result=asyncio.run(run_pipeline(config,set(args.stages),args.command=='resume',limit=args.limit,takeover_stale=args.takeover_stale))

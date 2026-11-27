@@ -183,3 +183,37 @@ def test_export_snapshot_telemetry_from_completed_json(tmp_path, monkeypatch):
     assert manifest_no_marker['api_wait_seconds']['arxiv']['pacing_seconds'] == 100.0
 
 
+def test_cli_export_with_folder(tmp_path, monkeypatch):
+    import sys
+    from crawler.cli import main
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / 'config').mkdir()
+    (tmp_path / 'config/crawler.yaml').write_text(
+        "schema_version: 1\n"
+        "range:\n"
+        "  start_month: '2025-04'\n"
+        "  start_id: 1\n"
+        "  end_month: '2025-04'\n"
+        "  end_id: 10\n"
+        "paths:\n"
+        "  persistent_root: runtime\n"
+        "  scratch_root: runtime/temp\n"
+    )
+    custom_folder = tmp_path / 'datasets/2025-04_02523_to_2025-04_02523'
+    store = ProgressStore(custom_folder)
+    store.initialize(['2504.02523'])
+
+    monkeypatch.setattr(sys, 'argv', [
+        'crawler.cli', 'export',
+        '--run-id', 'cli-run-1',
+        '--folder', str(custom_folder),
+        '--takeover-stale'
+    ])
+    main()
+
+    export_target = custom_folder / 'exports/cli-run-1'
+    assert (export_target / 'manifest.json').exists()
+    assert (export_target / 'papers.parquet').exists()
+
+
+
