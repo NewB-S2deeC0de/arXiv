@@ -4,6 +4,31 @@ import re
 from pathlib import Path
 from dataclasses import asdict
 import hashlib
+import time
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+
+def _bounded_stage(keys, worker, workers, label):
+    started=last=time.monotonic(); done=files=size=0
+    iterator=iter(keys)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending=set()
+        for _ in range(min(workers,len(keys))):
+            pending.add(pool.submit(worker,next(iterator)))
+        while pending:
+            finished,pending=wait(pending,timeout=10,return_when=FIRST_COMPLETED)
+            for future in finished:
+                amount,count,result=future.result()
+                size+=amount; files+=count; done+=1
+                yield result
+                key=next(iterator,None)
+                if key is not None: pending.add(pool.submit(worker,key))
+            elapsed=time.monotonic()-started
+            if not finished or not pending or time.monotonic()-last>=10:
+                _phase(f'{label}: {done}/{len(keys)} pending={len(pending)} files={files} bytes={size} elapsed={elapsed:.1f}s bytes/s={size/max(elapsed,.001):.0f}')
+                last=time.monotonic()
+
+def _phase(message):
+    print(f'[export {time.monotonic():.1f}s] {message}', flush=True)
 import pyarrow as pa
 import pyarrow.parquet as pq
 from .progress import ProgressStore
@@ -22,12 +47,17 @@ SNAPSHOT_SCHEMA=pa.schema([pa.field('arxiv_id',pa.string(),False),pa.field('vers
     pa.field('reference_count',pa.int64()),pa.field('fetched_at',pa.string()),
     pa.field('query_fingerprint',pa.string()),pa.field('content_sha256',pa.string())])
 
-def _export_snapshot(config,run_id):
+def _export_snapshot(config,run_id,*,runtime_root=None,logical_config=None,output_root=None):
     if not re.fullmatch(r'[A-Za-z0-9_-]+',run_id): raise ValueError('Invalid run ID')
-    store=ProgressStore(config.paths['persistent_root'])
-    target=Path(config.paths['persistent_root'])/'exports'/run_id
+    effective_root=Path(runtime_root) if runtime_root is not None else Path(config.paths['persistent_root'])
+    target=(Path(output_root) if output_root is not None else effective_root/'exports')/run_id
+    if target.exists(): raise FileExistsError(f"Export run ID '{run_id}' already exists")
     target.mkdir(parents=True,exist_ok=False)
+    _phase('progress load started')
+    store=ProgressStore(effective_root)
+    _phase('progress load complete; local table build/read started')
     selected=set(generate_ids(**config.range))
+    missing_expected_jobs=sum((paper,0,'discovery',0) not in store.rows for paper in selected)
     for paper in sorted(selected):
         store.add((paper,0,'discovery',0))
     cache={}
@@ -40,9 +70,10 @@ def _export_snapshot(config,run_id):
                 marker=json.loads((directory/'complete.json').read_text())
                 allowed=('succeeded','not_found') if key[2] in ('discovery','metadata') else ('succeeded','no_tex')
                 if marker['key']!=list(key) or marker['status'] not in allowed: return None
-                # Verify only the JSON consumed by export, never all source files.
-                if digest(directory/filename)!=marker['checksums'][filename]: return None
-                cache[token]=json.loads((directory/filename).read_text())
+                # Verify only the JSON consumed by export, reading file once into bytes to halve FUSE reads.
+                payload_bytes=(directory/filename).read_bytes()
+                if hashlib.sha256(payload_bytes).hexdigest()!=marker['checksums'][filename]: return None
+                cache[token]=json.loads(payload_bytes.decode('utf8'))
             except (OSError,ValueError,KeyError): pass
         return cache[token]
     snapshot_rows=[]; snapshots_by_paper={}
@@ -102,12 +133,22 @@ def _export_snapshot(config,run_id):
                 previous=references.get(unique)
                 rank=lambda r:(sum(v is not None for v in r.values()),json.dumps(r,sort_keys=True))
                 if previous is None or rank(row)>rank(previous): references[unique]=row
+    _phase('Parquet build started')
     pq.write_table(pa.Table.from_pylist(papers,schema=PAPER_SCHEMA),target/'papers.parquet')
     pq.write_table(pa.Table.from_pylist(list(references.values()),schema=REFERENCE_SCHEMA),target/'references.parquet')
     pq.write_table(pa.Table.from_pylist(list(version_references.values()),schema=VERSION_REFERENCE_SCHEMA),target/'version_references.parquet')
     pq.write_table(pa.Table.from_pylist(snapshot_rows,schema=SNAPSHOT_SCHEMA),target/'reference_snapshots.parquet')
     exported_ids={p['arxiv_id'] for p in papers}
+    _phase('Parquet complete; metrics started')
     paper_metrics=[]; version_metrics=[]
+    reference_totals={}
+    for key,row in store.rows.items():
+        if key[0] not in selected or key[2]!='references': continue
+        totals=reference_totals.setdefault(key[0],[0,0,0])
+        totals[0]+=row['total']
+        if key[1]>0 and key[3]==0:
+            totals[1]+=1
+            totals[2]+=row['status']=='succeeded'
     for key,row in store.rows.items():
         if key[0] not in selected: continue
         if key[2]=='discovery':
@@ -115,7 +156,7 @@ def _export_snapshot(config,run_id):
             count=None
             snapshots=snapshots_by_paper.get(key[0],[])
             if snapshots: count=len({r.get('ref_arxiv_id') or r.get('ref_s2_id') or json.dumps(r,sort_keys=True) for _,snapshot in snapshots for r in snapshot['references']})
-            paper_metrics.append(dict(arxiv_id=key[0],discovery_status=row['status'],metadata_exported=key[0] in exported_ids,references_status=refs['status'],reference_count=count,discovery_attempts=row['total'],references_attempts=sum(r['total'] for k,r in store.rows.items() if k[0]==key[0] and k[2]=='references'),reference_count_scope='paper_union_including_legacy',references_status_scope='legacy_paper',reference_versions_total=sum(k[0]==key[0] and k[1]>0 and k[2:]==('references',0) for k in store.rows),reference_versions_succeeded=sum(k[0]==key[0] and k[1]>0 and k[2:]==('references',0) and r['status']=='succeeded' for k,r in store.rows.items())))
+            paper_metrics.append(dict(arxiv_id=key[0],discovery_status=row['status'],metadata_exported=key[0] in exported_ids,references_status=refs['status'],reference_count=count,discovery_attempts=row['total'],references_attempts=reference_totals.get(key[0], [0,0,0])[0],reference_count_scope='paper_union_including_legacy',references_status_scope='legacy_paper',reference_versions_total=reference_totals.get(key[0], [0,0,0])[1],reference_versions_succeeded=reference_totals.get(key[0], [0,0,0])[2]))
         elif key[2]=='source':
             inventory={}
             inventory=read_result(key,'inventory.json') or {}
@@ -135,25 +176,204 @@ def _export_snapshot(config,run_id):
     def mean(rows,field):
         values=[r[field] for r in rows if r.get(field) is not None]
         return dict(mean=sum(values)/len(values) if values else None,sample_count=len(values),missing_count=len(rows)-len(values))
-    total_rl = sum(r.get('api_wait_seconds', {}).get('total_rate_limit_seconds', 0.0) for r in run_summaries)
-    ax_pacing = sum(r.get('api_wait_seconds', {}).get('arxiv', {}).get('pacing_seconds', 0.0) for r in run_summaries)
-    ax_rl = sum(r.get('api_wait_seconds', {}).get('arxiv', {}).get('rate_limit_seconds', 0.0) for r in run_summaries)
-    s2_pacing = sum(r.get('api_wait_seconds', {}).get('s2', {}).get('pacing_seconds', 0.0) for r in run_summaries)
-    s2_rl = sum(r.get('api_wait_seconds', {}).get('s2', {}).get('rate_limit_seconds', 0.0) for r in run_summaries)
-    total_wall = sum(r.get('wall_seconds', 0.0) for r in run_summaries)
-    api_wait_dict = {
-        'arxiv': {'pacing_seconds': ax_pacing, 'rate_limit_seconds': ax_rl},
-        's2': {'pacing_seconds': s2_pacing, 'rate_limit_seconds': s2_rl},
-        'total_rate_limit_seconds': total_rl,
-        'effective_crawler_seconds': max(0.0, total_wall - total_rl),
-    }
-    manifest=dict(schema_version=3,reference_scope='references.parquet is the deduplicated paper union including legacy; version_references.parquet associates only version queries; version correspondence unverified',version_reference_links=len(version_references),version_snapshots=sum(r['version']>0 and r['reference_count'] is not None for r in snapshot_rows),version_snapshots_missing=sum(r['version']>0 and r['reference_count'] is None for r in snapshot_rows),version_snapshots_empty=sum(r['version']>0 and r['reference_count']==0 for r in snapshot_rows),paper_reference_count_scope='union_including_legacy',assigned_ids=len(selected),venue_conflicts=sorted(p for p,v in venue_candidates.items() if p in selected and len(v)>1),reference_date_source="semantic_scholar.publicationDate (not verified arXiv submission date)",integrity_scope="checksums of exported JSON only; full source audit is separate",run_id=run_id,papers=len(papers),references=len(references),missing_metadata=missing,missing_reference_snapshots=sum(r['reference_count'] is None for r in paper_metrics),valid_empty_reference_snapshots=sum(r['reference_count']==0 for r in paper_metrics),missing_revision_dates=revision_missing,duplicate_references=duplicates,conflicting_references=len(conflicts),config_fingerprint=hashlib.sha256(json.dumps(asdict(config),sort_keys=True).encode()).hexdigest(),input_fingerprint=hashlib.sha256(json.dumps(sorted(selected)).encode()).hexdigest(),schema_fingerprint=hashlib.sha256((str(PAPER_SCHEMA)+str(REFERENCE_SCHEMA)+str(VERSION_REFERENCE_SCHEMA)+str(SNAPSHOT_SCHEMA)).encode()).hexdigest(),contributing_run_ids=[r['run_id'] for r in run_summaries],means=dict(reference_count=mean(paper_metrics,'reference_count'),compressed_bytes=mean(version_metrics,'compressed_bytes'),unpacked_bytes=mean(version_metrics,'unpacked_bytes'),kept_bytes=mean(version_metrics,'kept_bytes')),api_wait_seconds=api_wait_dict,checksums={p.name:digest(p) for p in target.iterdir()})
+    completed_marker = store.root / 'completed.json'
+    completed_data = None
+    if completed_marker.exists():
+        try: completed_data = json.loads(completed_marker.read_text(encoding='utf8'))
+        except (OSError, ValueError): pass
+
+    if completed_data and isinstance(completed_data.get('api_wait_seconds'), dict) and completed_data['api_wait_seconds'].get('arxiv'):
+        api_wait_dict = completed_data['api_wait_seconds']
+    else:
+        latest_cumulative = None
+        all_run_ids = {r.get('run_id') for r in run_summaries if r.get('run_id')}
+        for r in run_summaries:
+            contrib = set(r.get('contributing_run_ids') or [])
+            if contrib and all_run_ids.issubset(contrib) and isinstance(r.get('api_wait_seconds'), dict) and r['api_wait_seconds'].get('arxiv'):
+                latest_cumulative = r['api_wait_seconds']
+                break
+        if latest_cumulative:
+            api_wait_dict = latest_cumulative
+        else:
+            total_rl = sum(r.get('api_wait_seconds', {}).get('total_rate_limit_seconds', 0.0) for r in run_summaries)
+            ax_pacing = sum(r.get('api_wait_seconds', {}).get('arxiv', {}).get('pacing_seconds', 0.0) for r in run_summaries)
+            ax_rl = sum(r.get('api_wait_seconds', {}).get('arxiv', {}).get('rate_limit_seconds', 0.0) for r in run_summaries)
+            s2_pacing = sum(r.get('api_wait_seconds', {}).get('s2', {}).get('pacing_seconds', 0.0) for r in run_summaries)
+            s2_rl = sum(r.get('api_wait_seconds', {}).get('s2', {}).get('rate_limit_seconds', 0.0) for r in run_summaries)
+            total_wall = sum(r.get('wall_seconds', 0.0) for r in run_summaries)
+            api_wait_dict = {
+                'arxiv': {'pacing_seconds': ax_pacing, 'rate_limit_seconds': ax_rl},
+                's2': {'pacing_seconds': s2_pacing, 'rate_limit_seconds': s2_rl},
+                'total_rate_limit_seconds': total_rl,
+                'effective_crawler_seconds': max(0.0, total_wall - total_rl),
+            }
+    contrib_runs = (completed_data.get('contributing_run_ids') if completed_data and completed_data.get('contributing_run_ids')
+                    else [r['run_id'] for r in run_summaries if r.get('run_id')])
+    manifest=dict(schema_version=3,reference_scope='references.parquet is the deduplicated paper union including legacy; version_references.parquet associates only version queries; version correspondence unverified',version_reference_links=len(version_references),version_snapshots=sum(r['version']>0 and r['reference_count'] is not None for r in snapshot_rows),version_snapshots_missing=sum(r['version']>0 and r['reference_count'] is None for r in snapshot_rows),version_snapshots_empty=sum(r['version']>0 and r['reference_count']==0 for r in snapshot_rows),paper_reference_count_scope='union_including_legacy',assigned_ids=len(selected),missing_expected_jobs=sum((paper,0,'discovery',0) not in store.rows for paper in selected),venue_conflicts=sorted(p for p,v in venue_candidates.items() if p in selected and len(v)>1),reference_date_source="semantic_scholar.publicationDate (not verified arXiv submission date)",integrity_scope="checksums of exported JSON only; full source audit is separate",run_id=run_id,papers=len(papers),references=len(references),missing_metadata=missing,missing_reference_snapshots=sum(r['reference_count'] is None for r in paper_metrics),valid_empty_reference_snapshots=sum(r['reference_count']==0 for r in paper_metrics),missing_revision_dates=revision_missing,duplicate_references=duplicates,conflicting_references=len(conflicts),config_fingerprint=hashlib.sha256(json.dumps(asdict(logical_config or config),sort_keys=True).encode()).hexdigest(),input_fingerprint=hashlib.sha256(json.dumps(sorted(selected)).encode()).hexdigest(),schema_fingerprint=hashlib.sha256((str(PAPER_SCHEMA)+str(REFERENCE_SCHEMA)+str(VERSION_REFERENCE_SCHEMA)+str(SNAPSHOT_SCHEMA)).encode()).hexdigest(),contributing_run_ids=contrib_runs,means=dict(reference_count=mean(paper_metrics,'reference_count'),compressed_bytes=mean(version_metrics,'compressed_bytes'),unpacked_bytes=mean(version_metrics,'unpacked_bytes'),kept_bytes=mean(version_metrics,'kept_bytes')),api_wait_seconds=api_wait_dict,checksums={p.name:digest(p) for p in target.iterdir()})
+    manifest['missing_expected_jobs']=missing_expected_jobs
+    manifest['missing_expected_jobs_scope']='selected discovery jobs only'
     atomic_json(target/'manifest.json',manifest)
     return manifest
 
 
-def export_snapshot(config,run_id):
+def export_dataset_snapshot(config,run_id,*,fast_staging=True,scratch_root=None,takeover_stale=False,staging_workers=1):
+    import copy, shutil, uuid
     from .locking import DatasetLock
-    import uuid
-    with DatasetLock(config.paths['persistent_root'],'export-'+uuid.uuid4().hex):
-        return _export_snapshot(config,run_id)
+
+    if not re.fullmatch(r'[A-Za-z0-9_-]+',run_id): raise ValueError('Invalid run ID')
+    if not isinstance(staging_workers,int) or not 1 <= staging_workers <= 16:
+        raise ValueError('staging_workers must be between 1 and 16')
+    source_root = Path(config.paths['persistent_root'])
+    if not source_root.exists(): raise FileNotFoundError(f'Source dataset root does not exist: {source_root}')
+
+    logical_config = copy.deepcopy(config)
+
+    with DatasetLock(source_root, 'export-src-' + run_id, takeover_stale=takeover_stale):
+        final_export = source_root / 'exports' / run_id
+        if final_export.exists():
+            raise FileExistsError(f"Export run ID '{run_id}' already exists")
+
+        base_scratch_str = scratch_root or config.paths.get('scratch_root', 'scratch')
+        base_scratch = Path(base_scratch_str)
+        _phase(f'scratch resolved: {base_scratch.resolve()}; workers={staging_workers}')
+        staging_dir = base_scratch / f'staging-{run_id}-{uuid.uuid4().hex[:8]}'
+        publish_staging = source_root / '.staging_exports' / run_id
+        published = False
+        owns_scratch = owns_publish = False
+        try:
+            staging_dir.mkdir(parents=True, exist_ok=False)
+            owns_scratch = True
+            if publish_staging.exists():
+                raise FileExistsError(f"Export run ID '{run_id}' has an unfinished publication")
+            runtime_root = source_root
+            if fast_staging:
+                runtime_root = staging_dir
+            # Stage progress
+            phase_started=time.monotonic(); _phase('progress copy started')
+            src_progress = source_root / 'progress'
+            if fast_staging and src_progress.is_dir():
+                dest_progress = staging_dir / 'progress'; dest_progress.mkdir(parents=True, exist_ok=True)
+                for item in src_progress.iterdir():
+                    if item.is_file() and item.name not in ('active_run.json', 'writer.lock'):
+                        shutil.copyfile(item, dest_progress / item.name)
+
+            _phase(f'progress copy ended elapsed={time.monotonic()-phase_started:.1f}s')
+            phase_started=time.monotonic(); _phase('metrics copy started')
+            # Stage metrics
+            src_metrics = source_root / 'metrics'
+            if fast_staging and src_metrics.is_dir():
+                shutil.copytree(src_metrics, staging_dir / 'metrics', dirs_exist_ok=True)
+
+            _phase(f'metrics copy ended elapsed={time.monotonic()-phase_started:.1f}s')
+            phase_started=time.monotonic(); _phase('completed marker copy started')
+            # Stage completed.json
+            if fast_staging and (source_root / 'completed.json').is_file():
+                shutil.copyfile(source_root / 'completed.json', staging_dir / 'completed.json')
+
+            _phase(f'completed marker copy ended elapsed={time.monotonic()-phase_started:.1f}s')
+            phase_started=time.monotonic(); _phase('planning progress load started')
+            # Job-directed selective data staging: copy only needed JSONs for selected papers
+            _phase('Drive discovery planning started' if fast_staging else 'direct mode: no staging plan')
+            src_store = ProgressStore(staging_dir) if fast_staging else None
+            _phase(f'planning progress load ended elapsed={time.monotonic()-phase_started:.1f}s')
+            selected = set(generate_ids(**config.range))
+            keys_to_stage = set()
+            for paper in selected if fast_staging else ():
+                keys_to_stage.add((paper, 0, 'discovery', 0))
+            for key in src_store.rows if src_store else ():
+                if key[0] in selected and key[3]==0 and key[2] in ('references','source'):
+                    keys_to_stage.add(key)
+
+            # Copy discovery once, then plan revisions from the verified local commit.
+            def discovery(paper):
+                key=(paper,0,'discovery',0)
+                destination=src_store.storage.result_dir(key)
+                directory=source_root / destination.relative_to(staging_dir)
+                destination.mkdir(parents=True,exist_ok=True)
+                size=files=0
+                try:
+                    marker_bytes=(directory/'complete.json').read_bytes()
+                    payload=(directory/'normalized.json').read_bytes()
+                    (destination/'complete.json').write_bytes(marker_bytes)
+                    (destination/'normalized.json').write_bytes(payload)
+                    size=len(marker_bytes)+len(payload); files=2
+                    marker=json.loads(marker_bytes)
+                    if marker['key']!=list(key) or marker['status']!='succeeded' or hashlib.sha256(payload).hexdigest()!=marker['checksums']['normalized.json']:
+                        return size,files,()
+                    latest = int(json.loads(payload).get('version', 0))
+                    return size,files,tuple((paper, version, 'metadata', 0) for version in range(2, latest + 1))
+                except (FileNotFoundError, ValueError, TypeError, KeyError):
+                    return size,files,()
+
+            for revisions in _bounded_stage(sorted(selected) if fast_staging else [],discovery,staging_workers,'Drive discovery'):
+                keys_to_stage.update(revisions)
+            keys_to_stage={key for key in keys_to_stage if key[2]!='discovery'}
+
+            def stage(key):
+                dest_res_dir = src_store.storage.result_dir(key)
+                src_res_dir = source_root / dest_res_dir.relative_to(staging_dir)
+                dest_res_dir.mkdir(parents=True, exist_ok=True)
+                size = files = 0
+                for fname in ('complete.json', 'inventory.json' if key[2]=='source' else 'normalized.json'):
+                    try:
+                        payload=(src_res_dir / fname).read_bytes()
+                    except FileNotFoundError:
+                        continue
+                    (dest_res_dir / fname).write_bytes(payload)
+                    size+=len(payload); files+=1
+                return size,files,None
+
+            keys=sorted(keys_to_stage)
+            for _ in _bounded_stage(keys,stage,staging_workers,'Drive remaining staging'): pass
+
+            output_root = staging_dir / 'built_exports'
+            manifest = _export_snapshot(config, run_id, runtime_root=runtime_root,
+                                        logical_config=logical_config, output_root=output_root)
+
+            # Transactional publication to source
+            _phase('Drive publish/checksum started')
+            phase_started=time.monotonic()
+            staged_export = output_root / run_id
+            publish_staging.parent.mkdir(parents=True, exist_ok=True)
+            publish_staging.mkdir(exist_ok=False)
+            owns_publish = True
+            shutil.copytree(staged_export, publish_staging, dirs_exist_ok=True)
+
+            # Verify checksummed files
+            for filename, expected_hash in manifest['checksums'].items():
+                dest_file = publish_staging / filename
+                if not dest_file.is_file() or digest(dest_file) != expected_hash:
+                    raise OSError(f'Destination checksum verification failed on publish: {filename}')
+
+            # Verify manifest.json
+            dest_manifest = publish_staging / 'manifest.json'
+            if not dest_manifest.is_file() or digest(dest_manifest) != digest(staged_export / 'manifest.json'):
+                raise OSError('Destination checksum verification failed on publish: manifest.json')
+            try:
+                json.loads(dest_manifest.read_text(encoding='utf8'))
+            except (OSError, ValueError) as err:
+                raise OSError(f'Destination manifest.json corrupted on publish: {err}')
+
+            final_export.parent.mkdir(parents=True, exist_ok=True)
+            publish_staging.replace(final_export)
+            published = True
+            _phase(f'Drive publish/checksum ended elapsed={time.monotonic()-phase_started:.1f}s')
+            return manifest
+
+        finally:
+            _phase('cleanup started')
+            cleanup_started=time.monotonic()
+            if owns_scratch: shutil.rmtree(staging_dir, ignore_errors=True)
+            if owns_publish and not published and publish_staging.exists():
+                shutil.rmtree(publish_staging, ignore_errors=True)
+            try:
+                parent_staging = source_root / '.staging_exports'
+                if parent_staging.is_dir() and not any(parent_staging.iterdir()):
+                    parent_staging.rmdir()
+            except OSError:
+                pass
+            _phase(f'cleanup ended elapsed={time.monotonic()-cleanup_started:.1f}s')
+
+
+def export_snapshot(config,run_id,takeover_stale=False):
+    return export_dataset_snapshot(config,run_id,fast_staging=False,takeover_stale=takeover_stale)

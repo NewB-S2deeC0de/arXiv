@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -60,14 +61,42 @@ def _string_or_none(value: Any) -> str | None:
 
 
 def discover_reference_path(root: str | Path) -> Path:
-    """Find the most recently written ``references.parquet`` under ``root``."""
+    """Find the most recently written valid ``references.parquet`` under ``root``."""
 
     root = Path(root)
     if not root.exists():
         raise FileNotFoundError(f'reference search root does not exist: {root}')
-    candidates = sorted(root.rglob('references.parquet'))
+    root_parts = [part.lower() for part in root.parts]
+    if any(part.startswith(('staging-', 'staging_'))
+           or part in ('staging', 'staging_exports', '.staging_exports') for part in root_parts):
+        raise FileNotFoundError(f'no valid references.parquet with manifest found under {root}')
+    candidates = []
+    for path in sorted(root.rglob('references.parquet')):
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            rel = path
+        if any(part.startswith('.') or part.lower().startswith(('staging-', 'staging_'))
+               or part.lower() in ('staging', 'staging_exports') for part in rel.parts):
+            continue
+        manifest_file = path.parent / 'manifest.json'
+        if not manifest_file.is_file():
+            continue
+        try:
+            manifest = json.loads(manifest_file.read_text(encoding='utf-8'))
+            if not isinstance(manifest, dict) or manifest.get('schema_version') != 3:
+                continue
+            expected = manifest.get('checksums', {}).get('references.parquet')
+            if not isinstance(expected, str) or len(expected) != 64:
+                continue
+            int(expected, 16)
+            if hashlib.sha256(path.read_bytes()).hexdigest() != expected.lower():
+                continue
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+        candidates.append(path)
     if not candidates:
-        raise FileNotFoundError(f'no references.parquet found under {root}')
+        raise FileNotFoundError(f'no valid references.parquet with manifest found under {root}')
     return max(candidates, key=lambda path: (path.stat().st_mtime, str(path)))
 
 
@@ -75,10 +104,20 @@ def resolve_input_path(value: str | Path | None, default: str | Path) -> Path:
     """Resolve an optional CLI path, allowing a directory for references."""
 
     path = Path(value) if value is not None else Path(default)
+    for candidate in (path.absolute(), path.resolve()):
+        if any(part.lower().startswith(('staging-', 'staging_')) or part.lower() in
+               ('staging', 'staging_exports', '.staging_exports') for part in candidate.parts):
+            raise ValueError(f'staging input is not published: {path}')
     if path.is_dir():
         return discover_reference_path(path)
     if not path.exists():
         raise FileNotFoundError(f'input file does not exist: {path}')
+    # A Parquet file inside a published snapshot is not a standalone input.
+    if path.name == 'references.parquet' and ((path.parent / 'manifest.json').exists()
+            or 'exports' in path.parts or 'exports' in path.resolve().parts):
+        found = discover_reference_path(path.parent)
+        if found != path:
+            raise ValueError(f'invalid snapshot input: {path}')
     return path
 
 

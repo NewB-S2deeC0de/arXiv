@@ -15,11 +15,24 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('command',choices=['init','run','resume','status','retry-failed','recheck-not-found','refresh-discovery','refresh-references','diagnose','diagnose-references','export'])
     parser.add_argument('--config',type=Path,default=Path('config/crawler.yaml'))
+    parser.add_argument('--folder',type=Path,default=None,help='Override persistent_root dataset folder')
     parser.add_argument('--run-id')
     parser.add_argument('--limit',type=int,default=None)
     parser.add_argument('--stages',nargs='+',choices=['arxiv','s2','discovery'],default=['arxiv','s2'])
     parser.add_argument('--takeover-stale',action='store_true')
     args=parser.parse_args(); config=load_config(args.config)
+    if args.folder:
+        try:
+            rel = Path(args.folder).resolve().relative_to(Path.cwd().resolve())
+            config.paths['persistent_root'] = str(rel)
+        except ValueError:
+            config.paths['persistent_root'] = str(args.folder)
+        import re
+        m=re.search(r'(\d{4}-\d{2})_(\d+)_to_(\d{4}-\d{2})_(\d+)',str(args.folder))
+        if m:
+            config.range['start_month']=m.group(1); config.range['start_id']=int(m.group(2))
+            config.range['end_month']=m.group(3); config.range['end_id']=int(m.group(4))
+        config.validate()
     if args.limit is not None and args.limit<1: parser.error('--limit must be positive')
     if args.command in ('run','resume'):
         result=asyncio.run(run_pipeline(config,set(args.stages),args.command=='resume',limit=args.limit,takeover_stale=args.takeover_stale))
@@ -31,12 +44,12 @@ def main():
         result=diagnose_references(config)
     elif args.command=='status': result=ProgressStore(config.paths['persistent_root']).status_counts()
     else:
-        with DatasetLock(config.paths['persistent_root'],'admin-'+uuid.uuid4().hex,args.takeover_stale):
-            if args.command=='export':
-                from .export import _export_snapshot
-                if not args.run_id: parser.error('--run-id required')
-                result=_export_snapshot(config,args.run_id)
-            else:
+        if args.command=='export':
+            from .export import export_dataset_snapshot
+            if not args.run_id: parser.error('--run-id required')
+            result=export_dataset_snapshot(config,args.run_id,fast_staging=False,takeover_stale=args.takeover_stale)
+        else:
+            with DatasetLock(config.paths['persistent_root'],'admin-'+uuid.uuid4().hex,args.takeover_stale):
                 store=ProgressStore(config.paths['persistent_root'])
                 ids=generate_ids(**config.range)
                 selected=set(ids[:args.limit]) if args.limit else set(ids)
