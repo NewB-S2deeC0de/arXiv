@@ -1,6 +1,7 @@
+from pathlib import Path
 from crawler.config import CrawlerConfig
 from crawler.progress import ProgressStore
-from crawler.export import export_snapshot
+from crawler.export import export_snapshot, export_dataset_snapshot
 import pyarrow.parquet as pq
 
 def test_missing_metadata_stays_in_ledger_only(tmp_path,monkeypatch):
@@ -340,6 +341,127 @@ def test_export_dataset_snapshot_parity_direct_vs_fast(tmp_path, monkeypatch):
     dir_r = pq.read_table(tmp_path / dataset_folder / 'exports/snap-direct/references.parquet').to_pydict()
     fst_r = pq.read_table(tmp_path / dataset_folder / 'exports/snap-fast/references.parquet').to_pydict()
     assert dir_r == fst_r
+
+
+def test_export_dataset_snapshot_rejects_duplicate_run_id(tmp_path, monkeypatch):
+    import pytest
+    monkeypatch.chdir(tmp_path)
+    c = CrawlerConfig(); c.range['end_id'] = 2523
+    dataset_folder = 'datasets/2025-04_02523_to_2025-04_02523'
+    c.paths['persistent_root'] = dataset_folder
+    store = ProgressStore(dataset_folder); store.initialize(['2504.02523'])
+
+    export_dataset_snapshot(c, 'dup-run', fast_staging=False)
+    with pytest.raises(FileExistsError, match="Export run ID 'dup-run' already exists"):
+        export_dataset_snapshot(c, 'dup-run', fast_staging=True)
+
+
+def test_export_dataset_snapshot_absolute_scratch_root_succeeds(tmp_path, monkeypatch):
+    import tempfile
+    monkeypatch.chdir(tmp_path)
+    c = CrawlerConfig(); c.range['end_id'] = 2523
+    dataset_folder = 'datasets/2025-04_02523_to_2025-04_02523'
+    c.paths['persistent_root'] = dataset_folder
+    store = ProgressStore(dataset_folder); store.initialize(['2504.02523'])
+
+    with tempfile.TemporaryDirectory() as external_scratch:
+        # Pass absolute external scratch root outside cwd
+        manifest = export_dataset_snapshot(c, 'abs-scratch', fast_staging=True, scratch_root=external_scratch)
+        assert manifest['run_id'] == 'abs-scratch'
+        assert (tmp_path / dataset_folder / 'exports/abs-scratch/manifest.json').exists()
+
+
+def test_export_dataset_snapshot_publish_staging_outside_exports(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    c = CrawlerConfig(); c.range['end_id'] = 2523
+    dataset_folder = 'datasets/2025-04_02523_to_2025-04_02523'
+    c.paths['persistent_root'] = dataset_folder
+    store = ProgressStore(dataset_folder); store.initialize(['2504.02523'])
+
+    replaced_paths = []
+    orig_replace = Path.replace
+
+    def tracked_replace(self, target):
+        replaced_paths.append((str(self), str(target)))
+        return orig_replace(self, target)
+
+    monkeypatch.setattr(Path, 'replace', tracked_replace)
+    manifest = export_dataset_snapshot(c, 'staging-loc', fast_staging=True)
+    assert manifest['run_id'] == 'staging-loc'
+
+    # Filter for the export directory promotion replace
+    export_replaces = [p for p in replaced_paths if p[1].endswith(f'{dataset_folder}/exports/staging-loc')]
+    assert len(export_replaces) == 1
+    src_path, dst_path = export_replaces[0]
+    assert '.staging_exports' in src_path
+    assert f'{dataset_folder}/exports/' not in src_path
+
+
+def test_export_dataset_snapshot_cleans_drive_staging_on_error(tmp_path, monkeypatch):
+    import pytest
+    from crawler import export as export_mod
+    monkeypatch.chdir(tmp_path)
+    c = CrawlerConfig(); c.range['end_id'] = 2523
+    dataset_folder = 'datasets/2025-04_02523_to_2025-04_02523'
+    c.paths['persistent_root'] = dataset_folder
+    store = ProgressStore(dataset_folder); store.initialize(['2504.02523'])
+
+    orig_digest = export_mod.digest
+    def failing_digest(path):
+        # Fail only when verifying destination files on Drive staging
+        if '.staging_exports' in str(path):
+            return 'corrupted_hash'
+        return orig_digest(path)
+
+    monkeypatch.setattr(export_mod, 'digest', failing_digest)
+
+    with pytest.raises(OSError, match='Destination checksum verification failed'):
+        export_dataset_snapshot(c, 'fail-cleanup', fast_staging=True)
+
+    # Verify both final export and Drive publish staging are clean
+    assert not (tmp_path / dataset_folder / 'exports/fail-cleanup').exists()
+    staging_drive = tmp_path / dataset_folder / '.staging_exports'
+    if staging_drive.exists():
+        assert not any(staging_drive.iterdir())
+
+
+def test_export_dataset_snapshot_job_directed_staging_skips_raw_files(tmp_path, monkeypatch):
+    import json
+    monkeypatch.chdir(tmp_path)
+    c = CrawlerConfig(); c.range['end_id'] = 2523
+    dataset_folder = 'datasets/2025-04_02523_to_2025-04_02523'
+    c.paths['persistent_root'] = dataset_folder
+    store = ProgressStore(dataset_folder); store.initialize(['2504.02523'])
+
+    key = ('2504.02523', 0, 'discovery', 0)
+    stg = tmp_path / 'stg'; stg.mkdir()
+    (stg / 'normalized.json').write_text(json.dumps({'version': 1, 'title': 'T'}))
+    store.storage.commit(key, stg); store.finish(key, 'succeeded')
+
+    # Add raw file and an unindexed job directory in data/
+    res_dir = store.storage.result_dir(key)
+    (res_dir / 'source.tar.gz').write_text('raw archive content')
+    unindexed = tmp_path / dataset_folder / 'data/unindexed_garbage'
+    unindexed.mkdir(parents=True)
+    (unindexed / 'normalized.json').write_text('{}')
+
+    # Intercept staging copy
+    copied_sources = []
+    orig_copyfile = __import__('shutil').copyfile
+
+    def tracked_copyfile(src, dst, *args, **kwargs):
+        copied_sources.append(str(src))
+        return orig_copyfile(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr('shutil.copyfile', tracked_copyfile)
+
+    manifest = export_dataset_snapshot(c, 'job-directed', fast_staging=True)
+    assert manifest['run_id'] == 'job-directed'
+
+    # Confirm raw archive and unindexed garbage were never copied
+    assert not any('source.tar.gz' in s for s in copied_sources)
+    assert not any('unindexed_garbage' in s for s in copied_sources)
+
 
 
 

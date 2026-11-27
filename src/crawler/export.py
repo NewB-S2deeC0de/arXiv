@@ -22,11 +22,13 @@ SNAPSHOT_SCHEMA=pa.schema([pa.field('arxiv_id',pa.string(),False),pa.field('vers
     pa.field('reference_count',pa.int64()),pa.field('fetched_at',pa.string()),
     pa.field('query_fingerprint',pa.string()),pa.field('content_sha256',pa.string())])
 
-def _export_snapshot(config,run_id,*,logical_config=None):
+def _export_snapshot(config,run_id,*,runtime_root=None,logical_config=None):
     if not re.fullmatch(r'[A-Za-z0-9_-]+',run_id): raise ValueError('Invalid run ID')
-    store=ProgressStore(config.paths['persistent_root'])
-    target=Path(config.paths['persistent_root'])/'exports'/run_id
+    effective_root=Path(runtime_root) if runtime_root is not None else Path(config.paths['persistent_root'])
+    target=effective_root/'exports'/run_id
+    if target.exists(): raise FileExistsError(f"Export run ID '{run_id}' already exists")
     target.mkdir(parents=True,exist_ok=False)
+    store=ProgressStore(effective_root)
     selected=set(generate_ids(**config.range))
     for paper in sorted(selected):
         store.add((paper,0,'discovery',0))
@@ -185,17 +187,23 @@ def export_dataset_snapshot(config,run_id,*,fast_staging=True,scratch_root=None,
     logical_config = copy.deepcopy(config)
 
     with DatasetLock(source_root, 'export-src-' + run_id, takeover_stale=takeover_stale):
+        final_export = source_root / 'exports' / run_id
+        if final_export.exists():
+            raise FileExistsError(f"Export run ID '{run_id}' already exists")
+
         if not fast_staging:
             return _export_snapshot(config, run_id, logical_config=logical_config)
 
         base_scratch_str = scratch_root or config.paths.get('scratch_root', 'scratch')
         base_scratch = Path(base_scratch_str)
-        try: rel_scratch = base_scratch.resolve().relative_to(Path.cwd().resolve())
-        except ValueError: rel_scratch = base_scratch
-
-        staging_dir = rel_scratch / f'staging-{run_id}'
+        staging_dir = base_scratch / f'staging-{run_id}-{uuid.uuid4().hex[:8]}'
         staging_dir.mkdir(parents=True, exist_ok=True)
 
+        publish_staging = source_root / '.staging_exports' / run_id
+        if publish_staging.exists():
+            shutil.rmtree(publish_staging)
+
+        published = False
         try:
             # Stage progress
             src_progress = source_root / 'progress'
@@ -214,43 +222,64 @@ def export_dataset_snapshot(config,run_id,*,fast_staging=True,scratch_root=None,
             if (source_root / 'completed.json').is_file():
                 shutil.copyfile(source_root / 'completed.json', staging_dir / 'completed.json')
 
-            # Selective data staging: copy only metadata JSONs, skip raw source archives
-            src_data = source_root / 'data'
-            if src_data.is_dir():
-                dest_data = staging_dir / 'data'
-                for file in src_data.rglob('*'):
-                    if file.is_file() and file.name in ('complete.json', 'normalized.json', 'inventory.json'):
-                        rel = file.relative_to(src_data)
-                        target_file = dest_data / rel
-                        target_file.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copyfile(file, target_file)
+            # Job-directed selective data staging: copy only needed JSONs for selected papers
+            src_store = ProgressStore(source_root)
+            selected = set(generate_ids(**config.range))
+            keys_to_stage = set()
+            for paper in selected:
+                keys_to_stage.add((paper, 0, 'discovery', 0))
+            for key in src_store.rows:
+                if key[0] in selected:
+                    keys_to_stage.add(key)
 
-            staging_config = copy.deepcopy(config)
-            staging_config.paths['persistent_root'] = str(staging_dir)
-            staging_config.validate()
+            for key in sorted(keys_to_stage):
+                src_res_dir = src_store.storage.result_dir(key)
+                if src_res_dir.is_dir():
+                    rel = src_res_dir.relative_to(source_root)
+                    dest_res_dir = staging_dir / rel
+                    for fname in ('complete.json', 'normalized.json', 'inventory.json'):
+                        src_file = src_res_dir / fname
+                        if src_file.is_file():
+                            dest_res_dir.mkdir(parents=True, exist_ok=True)
+                            shutil.copyfile(src_file, dest_res_dir / fname)
 
-            manifest = _export_snapshot(staging_config, run_id, logical_config=logical_config)
+            manifest = _export_snapshot(config, run_id, runtime_root=staging_dir, logical_config=logical_config)
 
             # Transactional publication to source
             staged_export = staging_dir / 'exports' / run_id
-            final_export = source_root / 'exports' / run_id
-            publish_staging = source_root / 'exports' / f'.staging-{run_id}'
-
-            if publish_staging.exists(): shutil.rmtree(publish_staging)
             publish_staging.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(staged_export, publish_staging)
 
+            # Verify checksummed files
             for filename, expected_hash in manifest['checksums'].items():
                 dest_file = publish_staging / filename
                 if not dest_file.is_file() or digest(dest_file) != expected_hash:
                     raise OSError(f'Destination checksum verification failed on publish: {filename}')
 
-            if final_export.exists(): shutil.rmtree(final_export)
+            # Verify manifest.json
+            dest_manifest = publish_staging / 'manifest.json'
+            if not dest_manifest.is_file() or digest(dest_manifest) != digest(staged_export / 'manifest.json'):
+                raise OSError('Destination checksum verification failed on publish: manifest.json')
+            try:
+                json.loads(dest_manifest.read_text(encoding='utf8'))
+            except (OSError, ValueError) as err:
+                raise OSError(f'Destination manifest.json corrupted on publish: {err}')
+
+            final_export.parent.mkdir(parents=True, exist_ok=True)
             publish_staging.replace(final_export)
+            published = True
             return manifest
 
         finally:
             shutil.rmtree(staging_dir, ignore_errors=True)
+            if not published and publish_staging.exists():
+                shutil.rmtree(publish_staging, ignore_errors=True)
+            try:
+                parent_staging = source_root / '.staging_exports'
+                if parent_staging.is_dir() and not any(parent_staging.iterdir()):
+                    parent_staging.rmdir()
+            except OSError:
+                pass
 
 
 def export_snapshot(config,run_id,takeover_stale=False):
