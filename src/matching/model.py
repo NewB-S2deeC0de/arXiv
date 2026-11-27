@@ -60,14 +60,29 @@ def _string_or_none(value: Any) -> str | None:
 
 
 def discover_reference_path(root: str | Path) -> Path:
-    """Find the most recently written ``references.parquet`` under ``root``."""
+    """Find the most recently written valid ``references.parquet`` under ``root``."""
 
     root = Path(root)
     if not root.exists():
         raise FileNotFoundError(f'reference search root does not exist: {root}')
-    candidates = sorted(root.rglob('references.parquet'))
+    candidates = []
+    for path in sorted(root.rglob('references.parquet')):
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            rel = path
+        if any(part.startswith('.') or 'staging' in part.lower() for part in rel.parts):
+            continue
+        manifest_file = path.parent / 'manifest.json'
+        if not manifest_file.is_file():
+            continue
+        try:
+            json.loads(manifest_file.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue
+        candidates.append(path)
     if not candidates:
-        raise FileNotFoundError(f'no references.parquet found under {root}')
+        raise FileNotFoundError(f'no valid references.parquet with manifest found under {root}')
     return max(candidates, key=lambda path: (path.stat().st_mtime, str(path)))
 
 

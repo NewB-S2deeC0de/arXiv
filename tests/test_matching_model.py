@@ -1,3 +1,4 @@
+from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -139,9 +140,66 @@ def test_run_is_deterministic(tmp_path):
         groundtruth_path=paths['groundtruth'],
         output_dir=tmp_path / 'second',
     )
-    assert first['outputs']['predictions_raw'].split('\\')[-1] == 'predictions_raw.parquet'
+    assert Path(first['outputs']['predictions_raw']).name == 'predictions_raw.parquet'
     assert first['pairs_total'] == second['pairs_total']
     assert (
         pq.read_table(tmp_path / 'first' / 'predictions_raw.parquet').to_pylist()
         == pq.read_table(tmp_path / 'second' / 'predictions_raw.parquet').to_pylist()
     )
+
+
+def test_discover_reference_path_ignores_hidden_and_staging_and_requires_manifest(tmp_path):
+    import os, time, pytest
+    from matching.model import discover_reference_path
+
+    root = tmp_path / 'dataset'
+    root.mkdir()
+
+    # 1. Valid export run-1 (older)
+    run1 = root / 'exports' / 'run-1'
+    run1.mkdir(parents=True)
+    ref1 = run1 / 'references.parquet'
+    ref1.write_text('parquet 1')
+    (run1 / 'manifest.json').write_text('{"run_id": "run-1"}')
+    os.utime(ref1, (1000, 1000))
+
+    # 2. Newer export in hidden folder .staging_exports
+    stg_hidden = root / '.staging_exports' / 'run-2'
+    stg_hidden.mkdir(parents=True)
+    ref_hidden = stg_hidden / 'references.parquet'
+    ref_hidden.write_text('hidden parquet')
+    (stg_hidden / 'manifest.json').write_text('{"run_id": "run-2"}')
+    os.utime(ref_hidden, (2000, 2000))
+
+    # 3. Newer export in staging directory name
+    stg_dir = root / 'exports' / 'staging-run-3'
+    stg_dir.mkdir(parents=True)
+    ref_stg = stg_dir / 'references.parquet'
+    ref_stg.write_text('staging parquet')
+    (stg_dir / 'manifest.json').write_text('{"run_id": "run-3"}')
+    os.utime(ref_stg, (3000, 3000))
+
+    # 4. Newer export with missing manifest
+    no_manifest = root / 'exports' / 'run-4'
+    no_manifest.mkdir(parents=True)
+    ref_no_man = no_manifest / 'references.parquet'
+    ref_no_man.write_text('no manifest')
+    os.utime(ref_no_man, (4000, 4000))
+
+    # 5. Newer export with corrupted manifest
+    corrupt_man = root / 'exports' / 'run-5'
+    corrupt_man.mkdir(parents=True)
+    ref_corrupt = corrupt_man / 'references.parquet'
+    ref_corrupt.write_text('corrupt manifest')
+    (corrupt_man / 'manifest.json').write_text('not-valid-json {')
+    os.utime(ref_corrupt, (5000, 5000))
+
+    # Should select run1 because all newer ones are invalid/staging
+    found = discover_reference_path(root)
+    assert found == ref1
+
+    # If run1 is deleted, should raise FileNotFoundError because no valid candidate remains
+    ref1.unlink()
+    with pytest.raises(FileNotFoundError, match='no valid references.parquet'):
+        discover_reference_path(root)
+
