@@ -317,7 +317,7 @@ def test_export_dataset_snapshot_parity_direct_vs_fast(tmp_path, monkeypatch):
 
     store = ProgressStore(dataset_folder); paper = '2504.02523'; store.initialize([paper])
     for stage, data in [
-        ('discovery', {'version': 1, 'title': 'Test Paper', 'published': '2025-04-01'}),
+        ('discovery', {'version': 2, 'title': 'Test Paper', 'published': '2025-04-01'}),
         ('references', {'references': [{'ref_arxiv_id': '2401.00001', 'ref_title': 'Cited'}]})
     ]:
         key = (paper, 0, stage, 0)
@@ -325,6 +325,24 @@ def test_export_dataset_snapshot_parity_direct_vs_fast(tmp_path, monkeypatch):
         (stg / 'normalized.json').write_text(json.dumps(data))
         store.storage.commit(key, stg); store.finish(key, 'succeeded')
 
+    # Exercise multiple worker batches and committed revisions absent from the ledger.
+    c.range['end_id']=2528
+    for index in range(2524,2529): store.add((f'2504.{index:05d}',0,'discovery',0))
+    key=(paper,2,'metadata',0)
+    stg=tmp_path/'orphan-v2'; stg.mkdir()
+    (stg/'normalized.json').write_text(json.dumps({'updated':'2025-04-02'}))
+    store.storage.commit(key,stg)
+    for version,data in [(1,{'references':[{'ref_arxiv_id':'2401.00002'}]}),(2,{'references':[]})]:
+        key=(paper,version,'references',0); store.add(key)
+        stg=tmp_path/f'refs-{version}'; stg.mkdir()
+        (stg/'normalized.json').write_text(json.dumps(data))
+        store.storage.commit(key,stg); store.finish(key,'succeeded')
+    store.add((paper,3,'references',0))
+    store.add((paper,1,'references',100))
+    key=(paper,1,'source',0); store.add(key)
+    stg=tmp_path/'inventory'; stg.mkdir()
+    (stg/'inventory.json').write_text(json.dumps({'tex_count':2}))
+    store.storage.commit(key,stg); store.finish(key,'succeeded')
     # Export direct
     manifest_direct = export_dataset_snapshot(c, 'snap-direct', fast_staging=False)
     # Export fast
@@ -334,7 +352,7 @@ def test_export_dataset_snapshot_parity_direct_vs_fast(tmp_path, monkeypatch):
     assert manifest_direct['config_fingerprint'] == manifest_fast['config_fingerprint']
     assert manifest_direct['input_fingerprint'] == manifest_fast['input_fingerprint']
     assert manifest_direct['papers'] == manifest_fast['papers'] == 1
-    assert manifest_direct['references'] == manifest_fast['references'] == 1
+    assert manifest_direct['references'] == manifest_fast['references'] == 2
 
     # Parquet contents parity
     dir_p = pq.read_table(tmp_path / dataset_folder / 'exports/snap-direct/papers.parquet').to_pydict()
@@ -348,6 +366,33 @@ def test_export_dataset_snapshot_parity_direct_vs_fast(tmp_path, monkeypatch):
         assert pq.read_table(tmp_path/dataset_folder/'exports/snap-direct'/name).to_pylist()==pq.read_table(tmp_path/dataset_folder/'exports/snap-fast'/name).to_pylist()
     for name in ('paper_metrics.csv','version_metrics.csv'):
         assert (tmp_path/dataset_folder/'exports/snap-direct'/name).read_bytes()==(tmp_path/dataset_folder/'exports/snap-fast'/name).read_bytes()
+    single=export_dataset_snapshot(c,'snap-single',staging_workers=1)
+    assert {k:v for k,v in single.items() if k!='run_id'}=={k:v for k,v in manifest_fast.items() if k!='run_id'}
+
+
+def test_staging_heartbeat_and_worker_failure(monkeypatch,capsys):
+    import threading
+    import pytest
+    from crawler import export as module
+    release=threading.Event()
+    original_wait=module.wait
+    calls=[]
+    def waiting(futures,**kwargs):
+        calls.append(len(futures))
+        if len(calls)==1:
+            return set(),set(futures)
+        release.set()
+        return original_wait(futures,**kwargs)
+    monkeypatch.setattr(module,'wait',waiting)
+    def worker(key):
+        assert release.wait(5)
+        return 1,1,key
+    assert sorted(module._bounded_stage(list(range(9)),worker,4,'test'))==list(range(9))
+    assert max(calls)<=4
+    assert 'pending=4' in capsys.readouterr().out
+    def broken(key): raise OSError('injected I/O failure')
+    with pytest.raises(OSError,match='injected'):
+        list(module._bounded_stage([1,2],broken,2,'failure'))
 
 
 def test_export_dataset_snapshot_rejects_duplicate_run_id(tmp_path, monkeypatch):

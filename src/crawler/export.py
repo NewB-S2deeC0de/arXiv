@@ -249,6 +249,7 @@ def export_dataset_snapshot(config,run_id,*,fast_staging=True,scratch_root=None,
             if fast_staging:
                 runtime_root = staging_dir
             # Stage progress
+            phase_started=time.monotonic(); _phase('progress copy started')
             src_progress = source_root / 'progress'
             if fast_staging and src_progress.is_dir():
                 dest_progress = staging_dir / 'progress'; dest_progress.mkdir(parents=True, exist_ok=True)
@@ -256,18 +257,25 @@ def export_dataset_snapshot(config,run_id,*,fast_staging=True,scratch_root=None,
                     if item.is_file() and item.name not in ('active_run.json', 'writer.lock'):
                         shutil.copyfile(item, dest_progress / item.name)
 
+            _phase(f'progress copy ended elapsed={time.monotonic()-phase_started:.1f}s')
+            phase_started=time.monotonic(); _phase('metrics copy started')
             # Stage metrics
             src_metrics = source_root / 'metrics'
             if fast_staging and src_metrics.is_dir():
                 shutil.copytree(src_metrics, staging_dir / 'metrics', dirs_exist_ok=True)
 
+            _phase(f'metrics copy ended elapsed={time.monotonic()-phase_started:.1f}s')
+            phase_started=time.monotonic(); _phase('completed marker copy started')
             # Stage completed.json
             if fast_staging and (source_root / 'completed.json').is_file():
                 shutil.copyfile(source_root / 'completed.json', staging_dir / 'completed.json')
 
+            _phase(f'completed marker copy ended elapsed={time.monotonic()-phase_started:.1f}s')
+            phase_started=time.monotonic(); _phase('planning progress load started')
             # Job-directed selective data staging: copy only needed JSONs for selected papers
             _phase('Drive discovery planning started' if fast_staging else 'direct mode: no staging plan')
             src_store = ProgressStore(staging_dir) if fast_staging else None
+            _phase(f'planning progress load ended elapsed={time.monotonic()-phase_started:.1f}s')
             selected = set(generate_ids(**config.range))
             keys_to_stage = set()
             for paper in selected if fast_staging else ():
@@ -324,6 +332,7 @@ def export_dataset_snapshot(config,run_id,*,fast_staging=True,scratch_root=None,
 
             # Transactional publication to source
             _phase('Drive publish/checksum started')
+            phase_started=time.monotonic()
             staged_export = output_root / run_id
             publish_staging.parent.mkdir(parents=True, exist_ok=True)
             publish_staging.mkdir(exist_ok=False)
@@ -348,10 +357,12 @@ def export_dataset_snapshot(config,run_id,*,fast_staging=True,scratch_root=None,
             final_export.parent.mkdir(parents=True, exist_ok=True)
             publish_staging.replace(final_export)
             published = True
+            _phase(f'Drive publish/checksum ended elapsed={time.monotonic()-phase_started:.1f}s')
             return manifest
 
         finally:
             _phase('cleanup started')
+            cleanup_started=time.monotonic()
             if owns_scratch: shutil.rmtree(staging_dir, ignore_errors=True)
             if owns_publish and not published and publish_staging.exists():
                 shutil.rmtree(publish_staging, ignore_errors=True)
@@ -361,6 +372,7 @@ def export_dataset_snapshot(config,run_id,*,fast_staging=True,scratch_root=None,
                     parent_staging.rmdir()
             except OSError:
                 pass
+            _phase(f'cleanup ended elapsed={time.monotonic()-cleanup_started:.1f}s')
 
 
 def export_snapshot(config,run_id,takeover_stale=False):
