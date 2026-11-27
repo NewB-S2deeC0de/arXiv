@@ -236,12 +236,14 @@ class ProgressStore:
                     row.update(status='pending',attempts=0,cycle=row['cycle']+1,error='')
             self.save()
 
-    def status_counts(self):
+    def status_counts(self, ids=None):
         from collections import Counter
+        selected=set(ids) if ids is not None else None
         counts={stage:Counter() for stage in ('discovery','metadata','source','references')}
         versioned=any(k[1]>0 and k[2]=='references' for k in self.rows)
         if versioned: counts['legacy_references']=Counter()
         for key,row in self.rows.items():
+            if selected is not None and key[0] not in selected: continue
             if key[2]=='references' and key[3]!=0: continue
             stage='legacy_references' if versioned and key[2]=='references' and key[1]==0 else key[2]
             counts[stage][row['status']]+=1

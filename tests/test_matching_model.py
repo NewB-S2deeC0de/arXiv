@@ -149,7 +149,7 @@ def test_run_is_deterministic(tmp_path):
 
 
 def test_discover_reference_path_ignores_hidden_and_staging_and_requires_manifest(tmp_path):
-    import os, time, pytest
+    import hashlib, json, os, time, pytest
     from matching.model import discover_reference_path
 
     root = tmp_path / 'dataset'
@@ -160,7 +160,11 @@ def test_discover_reference_path_ignores_hidden_and_staging_and_requires_manifes
     run1.mkdir(parents=True)
     ref1 = run1 / 'references.parquet'
     ref1.write_text('parquet 1')
-    (run1 / 'manifest.json').write_text('{"run_id": "run-1"}')
+    checksum = hashlib.sha256(ref1.read_bytes()).hexdigest()
+    (run1 / 'manifest.json').write_text(json.dumps({
+        'schema_version': 3, 'run_id': 'run-1',
+        'checksums': {'references.parquet': checksum},
+    }))
     os.utime(ref1, (1000, 1000))
 
     # 2. Newer export in hidden folder .staging_exports

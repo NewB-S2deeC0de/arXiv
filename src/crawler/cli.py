@@ -44,12 +44,12 @@ def main():
         result=diagnose_references(config)
     elif args.command=='status': result=ProgressStore(config.paths['persistent_root']).status_counts()
     else:
-        with DatasetLock(config.paths['persistent_root'],'admin-'+uuid.uuid4().hex,args.takeover_stale):
-            if args.command=='export':
-                from .export import _export_snapshot
-                if not args.run_id: parser.error('--run-id required')
-                result=_export_snapshot(config,args.run_id)
-            else:
+        if args.command=='export':
+            from .export import export_dataset_snapshot
+            if not args.run_id: parser.error('--run-id required')
+            result=export_dataset_snapshot(config,args.run_id,fast_staging=False,takeover_stale=args.takeover_stale)
+        else:
+            with DatasetLock(config.paths['persistent_root'],'admin-'+uuid.uuid4().hex,args.takeover_stale):
                 store=ProgressStore(config.paths['persistent_root'])
                 ids=generate_ids(**config.range)
                 selected=set(ids[:args.limit]) if args.limit else set(ids)
