@@ -40,9 +40,10 @@ def _export_snapshot(config,run_id):
                 marker=json.loads((directory/'complete.json').read_text())
                 allowed=('succeeded','not_found') if key[2] in ('discovery','metadata') else ('succeeded','no_tex')
                 if marker['key']!=list(key) or marker['status'] not in allowed: return None
-                # Verify only the JSON consumed by export, never all source files.
-                if digest(directory/filename)!=marker['checksums'][filename]: return None
-                cache[token]=json.loads((directory/filename).read_text())
+                # Verify only the JSON consumed by export, reading file once into bytes to halve FUSE reads.
+                payload_bytes=(directory/filename).read_bytes()
+                if hashlib.sha256(payload_bytes).hexdigest()!=marker['checksums'][filename]: return None
+                cache[token]=json.loads(payload_bytes.decode('utf8'))
             except (OSError,ValueError,KeyError): pass
         return cache[token]
     snapshot_rows=[]; snapshots_by_paper={}
@@ -135,25 +136,46 @@ def _export_snapshot(config,run_id):
     def mean(rows,field):
         values=[r[field] for r in rows if r.get(field) is not None]
         return dict(mean=sum(values)/len(values) if values else None,sample_count=len(values),missing_count=len(rows)-len(values))
-    total_rl = sum(r.get('api_wait_seconds', {}).get('total_rate_limit_seconds', 0.0) for r in run_summaries)
-    ax_pacing = sum(r.get('api_wait_seconds', {}).get('arxiv', {}).get('pacing_seconds', 0.0) for r in run_summaries)
-    ax_rl = sum(r.get('api_wait_seconds', {}).get('arxiv', {}).get('rate_limit_seconds', 0.0) for r in run_summaries)
-    s2_pacing = sum(r.get('api_wait_seconds', {}).get('s2', {}).get('pacing_seconds', 0.0) for r in run_summaries)
-    s2_rl = sum(r.get('api_wait_seconds', {}).get('s2', {}).get('rate_limit_seconds', 0.0) for r in run_summaries)
-    total_wall = sum(r.get('wall_seconds', 0.0) for r in run_summaries)
-    api_wait_dict = {
-        'arxiv': {'pacing_seconds': ax_pacing, 'rate_limit_seconds': ax_rl},
-        's2': {'pacing_seconds': s2_pacing, 'rate_limit_seconds': s2_rl},
-        'total_rate_limit_seconds': total_rl,
-        'effective_crawler_seconds': max(0.0, total_wall - total_rl),
-    }
-    manifest=dict(schema_version=3,reference_scope='references.parquet is the deduplicated paper union including legacy; version_references.parquet associates only version queries; version correspondence unverified',version_reference_links=len(version_references),version_snapshots=sum(r['version']>0 and r['reference_count'] is not None for r in snapshot_rows),version_snapshots_missing=sum(r['version']>0 and r['reference_count'] is None for r in snapshot_rows),version_snapshots_empty=sum(r['version']>0 and r['reference_count']==0 for r in snapshot_rows),paper_reference_count_scope='union_including_legacy',assigned_ids=len(selected),venue_conflicts=sorted(p for p,v in venue_candidates.items() if p in selected and len(v)>1),reference_date_source="semantic_scholar.publicationDate (not verified arXiv submission date)",integrity_scope="checksums of exported JSON only; full source audit is separate",run_id=run_id,papers=len(papers),references=len(references),missing_metadata=missing,missing_reference_snapshots=sum(r['reference_count'] is None for r in paper_metrics),valid_empty_reference_snapshots=sum(r['reference_count']==0 for r in paper_metrics),missing_revision_dates=revision_missing,duplicate_references=duplicates,conflicting_references=len(conflicts),config_fingerprint=hashlib.sha256(json.dumps(asdict(config),sort_keys=True).encode()).hexdigest(),input_fingerprint=hashlib.sha256(json.dumps(sorted(selected)).encode()).hexdigest(),schema_fingerprint=hashlib.sha256((str(PAPER_SCHEMA)+str(REFERENCE_SCHEMA)+str(VERSION_REFERENCE_SCHEMA)+str(SNAPSHOT_SCHEMA)).encode()).hexdigest(),contributing_run_ids=[r['run_id'] for r in run_summaries],means=dict(reference_count=mean(paper_metrics,'reference_count'),compressed_bytes=mean(version_metrics,'compressed_bytes'),unpacked_bytes=mean(version_metrics,'unpacked_bytes'),kept_bytes=mean(version_metrics,'kept_bytes')),api_wait_seconds=api_wait_dict,checksums={p.name:digest(p) for p in target.iterdir()})
+    completed_marker = store.root / 'completed.json'
+    completed_data = None
+    if completed_marker.exists():
+        try: completed_data = json.loads(completed_marker.read_text(encoding='utf8'))
+        except (OSError, ValueError): pass
+
+    if completed_data and isinstance(completed_data.get('api_wait_seconds'), dict) and completed_data['api_wait_seconds'].get('arxiv'):
+        api_wait_dict = completed_data['api_wait_seconds']
+    else:
+        latest_cumulative = None
+        all_run_ids = {r.get('run_id') for r in run_summaries if r.get('run_id')}
+        for r in run_summaries:
+            contrib = set(r.get('contributing_run_ids') or [])
+            if contrib and all_run_ids.issubset(contrib) and isinstance(r.get('api_wait_seconds'), dict) and r['api_wait_seconds'].get('arxiv'):
+                latest_cumulative = r['api_wait_seconds']
+                break
+        if latest_cumulative:
+            api_wait_dict = latest_cumulative
+        else:
+            total_rl = sum(r.get('api_wait_seconds', {}).get('total_rate_limit_seconds', 0.0) for r in run_summaries)
+            ax_pacing = sum(r.get('api_wait_seconds', {}).get('arxiv', {}).get('pacing_seconds', 0.0) for r in run_summaries)
+            ax_rl = sum(r.get('api_wait_seconds', {}).get('arxiv', {}).get('rate_limit_seconds', 0.0) for r in run_summaries)
+            s2_pacing = sum(r.get('api_wait_seconds', {}).get('s2', {}).get('pacing_seconds', 0.0) for r in run_summaries)
+            s2_rl = sum(r.get('api_wait_seconds', {}).get('s2', {}).get('rate_limit_seconds', 0.0) for r in run_summaries)
+            total_wall = sum(r.get('wall_seconds', 0.0) for r in run_summaries)
+            api_wait_dict = {
+                'arxiv': {'pacing_seconds': ax_pacing, 'rate_limit_seconds': ax_rl},
+                's2': {'pacing_seconds': s2_pacing, 'rate_limit_seconds': s2_rl},
+                'total_rate_limit_seconds': total_rl,
+                'effective_crawler_seconds': max(0.0, total_wall - total_rl),
+            }
+    contrib_runs = (completed_data.get('contributing_run_ids') if completed_data and completed_data.get('contributing_run_ids')
+                    else [r['run_id'] for r in run_summaries if r.get('run_id')])
+    manifest=dict(schema_version=3,reference_scope='references.parquet is the deduplicated paper union including legacy; version_references.parquet associates only version queries; version correspondence unverified',version_reference_links=len(version_references),version_snapshots=sum(r['version']>0 and r['reference_count'] is not None for r in snapshot_rows),version_snapshots_missing=sum(r['version']>0 and r['reference_count'] is None for r in snapshot_rows),version_snapshots_empty=sum(r['version']>0 and r['reference_count']==0 for r in snapshot_rows),paper_reference_count_scope='union_including_legacy',assigned_ids=len(selected),venue_conflicts=sorted(p for p,v in venue_candidates.items() if p in selected and len(v)>1),reference_date_source="semantic_scholar.publicationDate (not verified arXiv submission date)",integrity_scope="checksums of exported JSON only; full source audit is separate",run_id=run_id,papers=len(papers),references=len(references),missing_metadata=missing,missing_reference_snapshots=sum(r['reference_count'] is None for r in paper_metrics),valid_empty_reference_snapshots=sum(r['reference_count']==0 for r in paper_metrics),missing_revision_dates=revision_missing,duplicate_references=duplicates,conflicting_references=len(conflicts),config_fingerprint=hashlib.sha256(json.dumps(asdict(config),sort_keys=True).encode()).hexdigest(),input_fingerprint=hashlib.sha256(json.dumps(sorted(selected)).encode()).hexdigest(),schema_fingerprint=hashlib.sha256((str(PAPER_SCHEMA)+str(REFERENCE_SCHEMA)+str(VERSION_REFERENCE_SCHEMA)+str(SNAPSHOT_SCHEMA)).encode()).hexdigest(),contributing_run_ids=contrib_runs,means=dict(reference_count=mean(paper_metrics,'reference_count'),compressed_bytes=mean(version_metrics,'compressed_bytes'),unpacked_bytes=mean(version_metrics,'unpacked_bytes'),kept_bytes=mean(version_metrics,'kept_bytes')),api_wait_seconds=api_wait_dict,checksums={p.name:digest(p) for p in target.iterdir()})
     atomic_json(target/'manifest.json',manifest)
     return manifest
 
 
-def export_snapshot(config,run_id):
+def export_snapshot(config,run_id,takeover_stale=False):
     from .locking import DatasetLock
     import uuid
-    with DatasetLock(config.paths['persistent_root'],'export-'+uuid.uuid4().hex):
+    with DatasetLock(config.paths['persistent_root'],'export-'+uuid.uuid4().hex,takeover_stale=takeover_stale):
         return _export_snapshot(config,run_id)

@@ -112,3 +112,74 @@ def test_version_exports_preserve_provenance_and_dedupe_paper_pairs(tmp_path,mon
     assert all(r['version_correspondence']=='unverified' for r in rows)
     snapshots=pq.read_table('runtime/exports/versions/reference_snapshots.parquet').to_pylist()
     assert len(snapshots)==3  # Includes old v0 ledger, without assigning it to any version.
+
+
+def test_export_snapshot_takeover_stale(tmp_path, monkeypatch):
+    import json
+    from crawler.storage import atomic_json
+    monkeypatch.chdir(tmp_path)
+    c = CrawlerConfig(); c.range['end_id'] = 2523
+    ProgressStore('runtime').initialize(['2504.02523'])
+    # Simulate a stale active run marker left by a killed process
+    active_marker = tmp_path / 'runtime/progress/active_run.json'
+    atomic_json(active_marker, {'run_id': 'stale-run-123', 'previous': None})
+
+    import pytest
+    with pytest.raises(RuntimeError, match='Previous active marker exists'):
+        export_snapshot(c, 'takeover-fail', takeover_stale=False)
+
+    # With takeover_stale=True, export should proceed successfully
+    manifest = export_snapshot(c, 'takeover-ok', takeover_stale=True)
+    assert manifest['run_id'] == 'takeover-ok'
+
+
+def test_export_snapshot_telemetry_from_completed_json(tmp_path, monkeypatch):
+    import json
+    from crawler.storage import atomic_json
+    monkeypatch.chdir(tmp_path)
+    c = CrawlerConfig(); c.range['end_id'] = 2523
+    store = ProgressStore('runtime'); store.initialize(['2504.02523'])
+    key = ('2504.02523', 0, 'discovery', 0)
+    staging = tmp_path / 'disc'; staging.mkdir()
+    (staging / 'normalized.json').write_text(json.dumps({'version': 1, 'title': 'T'}))
+    store.storage.commit(key, staging); store.finish(key, 'succeeded')
+
+    # Add two run summaries in metrics/ (simulating cumulative summaries)
+    m1 = tmp_path / 'runtime/metrics/run-1'; m1.mkdir(parents=True)
+    atomic_json(m1 / 'summary.json', {
+        'run_id': 'run-1', 'wall_seconds': 100.0,
+        'api_wait_seconds': {'arxiv': {'pacing_seconds': 50.0, 'rate_limit_seconds': 10.0},
+                             's2': {'pacing_seconds': 0.0, 'rate_limit_seconds': 0.0},
+                             'total_rate_limit_seconds': 10.0, 'effective_crawler_seconds': 90.0}
+    })
+    m2 = tmp_path / 'runtime/metrics/run-2'; m2.mkdir(parents=True)
+    atomic_json(m2 / 'summary.json', {
+        'run_id': 'run-2', 'wall_seconds': 20.0,
+        'contributing_run_ids': ['run-1', 'run-2'],
+        'api_wait_seconds': {'arxiv': {'pacing_seconds': 100.0, 'rate_limit_seconds': 20.0},
+                             's2': {'pacing_seconds': 0.0, 'rate_limit_seconds': 0.0},
+                             'total_rate_limit_seconds': 20.0, 'effective_crawler_seconds': 100.0}
+    })
+    # Add completed.json at root with authoritative cumulative metrics
+    atomic_json(tmp_path / 'runtime/completed.json', {
+        'run_id': 'run-2',
+        'active_wall_seconds': 120.0,
+        'wall_seconds': 20.0,
+        'contributing_run_ids': ['run-1', 'run-2'],
+        'api_wait_seconds': {'arxiv': {'pacing_seconds': 100.0, 'rate_limit_seconds': 20.0},
+                             's2': {'pacing_seconds': 0.0, 'rate_limit_seconds': 0.0},
+                             'total_rate_limit_seconds': 20.0, 'effective_crawler_seconds': 100.0}
+    })
+
+    manifest = export_snapshot(c, 'telemetry-test')
+    # Must match the authoritative 100s pacing, NOT sum 50 + 100 = 150
+    assert manifest['api_wait_seconds']['arxiv']['pacing_seconds'] == 100.0
+    assert manifest['api_wait_seconds']['total_rate_limit_seconds'] == 20.0
+    assert manifest['api_wait_seconds']['effective_crawler_seconds'] == 100.0
+
+    # Also test case where completed.json is missing, but latest summary covers previous run_ids
+    (tmp_path / 'runtime/completed.json').unlink()
+    manifest_no_marker = export_snapshot(c, 'telemetry-no-marker')
+    assert manifest_no_marker['api_wait_seconds']['arxiv']['pacing_seconds'] == 100.0
+
+
