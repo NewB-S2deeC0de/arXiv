@@ -22,7 +22,7 @@ SNAPSHOT_SCHEMA=pa.schema([pa.field('arxiv_id',pa.string(),False),pa.field('vers
     pa.field('reference_count',pa.int64()),pa.field('fetched_at',pa.string()),
     pa.field('query_fingerprint',pa.string()),pa.field('content_sha256',pa.string())])
 
-def _export_snapshot(config,run_id):
+def _export_snapshot(config,run_id,*,logical_config=None):
     if not re.fullmatch(r'[A-Za-z0-9_-]+',run_id): raise ValueError('Invalid run ID')
     store=ProgressStore(config.paths['persistent_root'])
     target=Path(config.paths['persistent_root'])/'exports'/run_id
@@ -169,9 +169,88 @@ def _export_snapshot(config,run_id):
             }
     contrib_runs = (completed_data.get('contributing_run_ids') if completed_data and completed_data.get('contributing_run_ids')
                     else [r['run_id'] for r in run_summaries if r.get('run_id')])
-    manifest=dict(schema_version=3,reference_scope='references.parquet is the deduplicated paper union including legacy; version_references.parquet associates only version queries; version correspondence unverified',version_reference_links=len(version_references),version_snapshots=sum(r['version']>0 and r['reference_count'] is not None for r in snapshot_rows),version_snapshots_missing=sum(r['version']>0 and r['reference_count'] is None for r in snapshot_rows),version_snapshots_empty=sum(r['version']>0 and r['reference_count']==0 for r in snapshot_rows),paper_reference_count_scope='union_including_legacy',assigned_ids=len(selected),venue_conflicts=sorted(p for p,v in venue_candidates.items() if p in selected and len(v)>1),reference_date_source="semantic_scholar.publicationDate (not verified arXiv submission date)",integrity_scope="checksums of exported JSON only; full source audit is separate",run_id=run_id,papers=len(papers),references=len(references),missing_metadata=missing,missing_reference_snapshots=sum(r['reference_count'] is None for r in paper_metrics),valid_empty_reference_snapshots=sum(r['reference_count']==0 for r in paper_metrics),missing_revision_dates=revision_missing,duplicate_references=duplicates,conflicting_references=len(conflicts),config_fingerprint=hashlib.sha256(json.dumps(asdict(config),sort_keys=True).encode()).hexdigest(),input_fingerprint=hashlib.sha256(json.dumps(sorted(selected)).encode()).hexdigest(),schema_fingerprint=hashlib.sha256((str(PAPER_SCHEMA)+str(REFERENCE_SCHEMA)+str(VERSION_REFERENCE_SCHEMA)+str(SNAPSHOT_SCHEMA)).encode()).hexdigest(),contributing_run_ids=contrib_runs,means=dict(reference_count=mean(paper_metrics,'reference_count'),compressed_bytes=mean(version_metrics,'compressed_bytes'),unpacked_bytes=mean(version_metrics,'unpacked_bytes'),kept_bytes=mean(version_metrics,'kept_bytes')),api_wait_seconds=api_wait_dict,checksums={p.name:digest(p) for p in target.iterdir()})
+    manifest=dict(schema_version=3,reference_scope='references.parquet is the deduplicated paper union including legacy; version_references.parquet associates only version queries; version correspondence unverified',version_reference_links=len(version_references),version_snapshots=sum(r['version']>0 and r['reference_count'] is not None for r in snapshot_rows),version_snapshots_missing=sum(r['version']>0 and r['reference_count'] is None for r in snapshot_rows),version_snapshots_empty=sum(r['version']>0 and r['reference_count']==0 for r in snapshot_rows),paper_reference_count_scope='union_including_legacy',assigned_ids=len(selected),venue_conflicts=sorted(p for p,v in venue_candidates.items() if p in selected and len(v)>1),reference_date_source="semantic_scholar.publicationDate (not verified arXiv submission date)",integrity_scope="checksums of exported JSON only; full source audit is separate",run_id=run_id,papers=len(papers),references=len(references),missing_metadata=missing,missing_reference_snapshots=sum(r['reference_count'] is None for r in paper_metrics),valid_empty_reference_snapshots=sum(r['reference_count']==0 for r in paper_metrics),missing_revision_dates=revision_missing,duplicate_references=duplicates,conflicting_references=len(conflicts),config_fingerprint=hashlib.sha256(json.dumps(asdict(logical_config or config),sort_keys=True).encode()).hexdigest(),input_fingerprint=hashlib.sha256(json.dumps(sorted(selected)).encode()).hexdigest(),schema_fingerprint=hashlib.sha256((str(PAPER_SCHEMA)+str(REFERENCE_SCHEMA)+str(VERSION_REFERENCE_SCHEMA)+str(SNAPSHOT_SCHEMA)).encode()).hexdigest(),contributing_run_ids=contrib_runs,means=dict(reference_count=mean(paper_metrics,'reference_count'),compressed_bytes=mean(version_metrics,'compressed_bytes'),unpacked_bytes=mean(version_metrics,'unpacked_bytes'),kept_bytes=mean(version_metrics,'kept_bytes')),api_wait_seconds=api_wait_dict,checksums={p.name:digest(p) for p in target.iterdir()})
     atomic_json(target/'manifest.json',manifest)
     return manifest
+
+
+def export_dataset_snapshot(config,run_id,*,fast_staging=True,scratch_root=None,takeover_stale=False):
+    import copy, shutil, uuid
+    from .locking import DatasetLock
+
+    if not re.fullmatch(r'[A-Za-z0-9_-]+',run_id): raise ValueError('Invalid run ID')
+    source_root = Path(config.paths['persistent_root'])
+    if not source_root.exists(): raise FileNotFoundError(f'Source dataset root does not exist: {source_root}')
+
+    logical_config = copy.deepcopy(config)
+
+    with DatasetLock(source_root, 'export-src-' + run_id, takeover_stale=takeover_stale):
+        if not fast_staging:
+            return _export_snapshot(config, run_id, logical_config=logical_config)
+
+        base_scratch_str = scratch_root or config.paths.get('scratch_root', 'scratch')
+        base_scratch = Path(base_scratch_str)
+        try: rel_scratch = base_scratch.resolve().relative_to(Path.cwd().resolve())
+        except ValueError: rel_scratch = base_scratch
+
+        staging_dir = rel_scratch / f'staging-{run_id}'
+        staging_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # Stage progress
+            src_progress = source_root / 'progress'
+            if src_progress.is_dir():
+                dest_progress = staging_dir / 'progress'; dest_progress.mkdir(parents=True, exist_ok=True)
+                for item in src_progress.iterdir():
+                    if item.is_file() and item.name not in ('active_run.json', 'writer.lock'):
+                        shutil.copyfile(item, dest_progress / item.name)
+
+            # Stage metrics
+            src_metrics = source_root / 'metrics'
+            if src_metrics.is_dir():
+                shutil.copytree(src_metrics, staging_dir / 'metrics', dirs_exist_ok=True)
+
+            # Stage completed.json
+            if (source_root / 'completed.json').is_file():
+                shutil.copyfile(source_root / 'completed.json', staging_dir / 'completed.json')
+
+            # Selective data staging: copy only metadata JSONs, skip raw source archives
+            src_data = source_root / 'data'
+            if src_data.is_dir():
+                dest_data = staging_dir / 'data'
+                for file in src_data.rglob('*'):
+                    if file.is_file() and file.name in ('complete.json', 'normalized.json', 'inventory.json'):
+                        rel = file.relative_to(src_data)
+                        target_file = dest_data / rel
+                        target_file.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(file, target_file)
+
+            staging_config = copy.deepcopy(config)
+            staging_config.paths['persistent_root'] = str(staging_dir)
+            staging_config.validate()
+
+            manifest = _export_snapshot(staging_config, run_id, logical_config=logical_config)
+
+            # Transactional publication to source
+            staged_export = staging_dir / 'exports' / run_id
+            final_export = source_root / 'exports' / run_id
+            publish_staging = source_root / 'exports' / f'.staging-{run_id}'
+
+            if publish_staging.exists(): shutil.rmtree(publish_staging)
+            publish_staging.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(staged_export, publish_staging)
+
+            for filename, expected_hash in manifest['checksums'].items():
+                dest_file = publish_staging / filename
+                if not dest_file.is_file() or digest(dest_file) != expected_hash:
+                    raise OSError(f'Destination checksum verification failed on publish: {filename}')
+
+            if final_export.exists(): shutil.rmtree(final_export)
+            publish_staging.replace(final_export)
+            return manifest
+
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 def export_snapshot(config,run_id,takeover_stale=False):

@@ -216,4 +216,132 @@ def test_cli_export_with_folder(tmp_path, monkeypatch):
     assert (export_target / 'papers.parquet').exists()
 
 
+def test_export_dataset_snapshot_fast_staging_validates_and_exports(tmp_path, monkeypatch):
+    import json
+    from crawler.export import export_dataset_snapshot
+    from crawler.storage import digest
+    monkeypatch.chdir(tmp_path)
+
+    c = CrawlerConfig()
+    c.range['start_month'] = '2025-04'
+    c.range['start_id'] = 2523
+    c.range['end_month'] = '2025-04'
+    c.range['end_id'] = 2523
+    dataset_folder = 'datasets/2025-04_02523_to_2025-04_02523'
+    c.paths['persistent_root'] = dataset_folder
+    c.paths['scratch_root'] = 'scratch'
+    c.validate()
+
+    store = ProgressStore(dataset_folder)
+    paper = '2504.02523'
+    store.initialize([paper])
+
+    # Populate discovery and references
+    for stage, data in [
+        ('discovery', {'version': 1, 'title': 'Test Paper', 'published': '2025-04-01'}),
+        ('references', {'references': [{'ref_arxiv_id': '2401.00001', 'ref_title': 'Cited'}]})
+    ]:
+        key = (paper, 0, stage, 0)
+        stg = tmp_path / f'stg_{stage}'; stg.mkdir(parents=True, exist_ok=True)
+        (stg / 'normalized.json').write_text(json.dumps(data))
+        store.storage.commit(key, stg)
+        store.finish(key, 'succeeded')
+
+    # Add a huge fake raw file in data/ that should NOT be staged
+    raw_tex = store.storage.paper_dir(paper) / 'source.raw'
+    raw_tex.write_text('huge ' * 1000)
+
+    # Run export_dataset_snapshot with fast_staging=True
+    manifest = export_dataset_snapshot(c, 'fast-snap-1', fast_staging=True)
+
+    # Verify persistent_root is unchanged in config
+    assert c.paths['persistent_root'] == dataset_folder
+
+    final_dir = tmp_path / dataset_folder / 'exports/fast-snap-1'
+    assert (final_dir / 'manifest.json').exists()
+    assert (final_dir / 'papers.parquet').exists()
+    assert (final_dir / 'references.parquet').exists()
+    assert manifest['papers'] == 1
+    assert manifest['references'] == 1
+
+    # Verify all files in final_dir match manifest checksums
+    for name, exp_hash in manifest['checksums'].items():
+        assert digest(final_dir / name) == exp_hash
+
+    # Verify staging scratch was cleaned up
+    scratch_dir = tmp_path / 'scratch'
+    assert not any(scratch_dir.glob('staging-*'))
+
+
+def test_export_dataset_snapshot_locks_source_before_staging(tmp_path, monkeypatch):
+    from crawler.export import export_dataset_snapshot
+    from crawler.storage import atomic_json
+    import pytest
+    monkeypatch.chdir(tmp_path)
+
+    c = CrawlerConfig()
+    dataset_folder = 'datasets/2025-04_02523_to_2025-04_02523'
+    c.paths['persistent_root'] = dataset_folder
+    c.range['end_id'] = 2523
+    store = ProgressStore(dataset_folder)
+    store.initialize(['2504.02523'])
+
+    # Stale active marker on source
+    atomic_json(tmp_path / dataset_folder / 'progress/active_run.json', {'run_id': 'old-stale', 'previous': None})
+
+    # Without takeover_stale=True, must fail before staging
+    with pytest.raises(RuntimeError, match='Previous active marker exists'):
+        export_dataset_snapshot(c, 'lock-fail', fast_staging=True, takeover_stale=False)
+
+    # With takeover_stale=True, proceeds and cleans up lock
+    manifest = export_dataset_snapshot(c, 'lock-ok', fast_staging=True, takeover_stale=True)
+    assert manifest['run_id'] == 'lock-ok'
+
+
+def test_export_dataset_snapshot_parity_direct_vs_fast(tmp_path, monkeypatch):
+    import json
+    from crawler.export import export_dataset_snapshot
+    monkeypatch.chdir(tmp_path)
+
+    c = CrawlerConfig()
+    c.range['start_month'] = '2025-04'; c.range['start_id'] = 2523
+    c.range['end_month'] = '2025-04'; c.range['end_id'] = 2523
+    dataset_folder = 'datasets/2025-04_02523_to_2025-04_02523'
+    c.paths['persistent_root'] = dataset_folder
+    c.paths['scratch_root'] = 'scratch'
+    c.validate()
+
+    store = ProgressStore(dataset_folder); paper = '2504.02523'; store.initialize([paper])
+    for stage, data in [
+        ('discovery', {'version': 1, 'title': 'Test Paper', 'published': '2025-04-01'}),
+        ('references', {'references': [{'ref_arxiv_id': '2401.00001', 'ref_title': 'Cited'}]})
+    ]:
+        key = (paper, 0, stage, 0)
+        stg = tmp_path / f'stg_{stage}'; stg.mkdir(parents=True, exist_ok=True)
+        (stg / 'normalized.json').write_text(json.dumps(data))
+        store.storage.commit(key, stg); store.finish(key, 'succeeded')
+
+    # Export direct
+    manifest_direct = export_dataset_snapshot(c, 'snap-direct', fast_staging=False)
+    # Export fast
+    manifest_fast = export_dataset_snapshot(c, 'snap-fast', fast_staging=True)
+
+    # Parity check: config_fingerprint, input_fingerprint, papers, references count
+    assert manifest_direct['config_fingerprint'] == manifest_fast['config_fingerprint']
+    assert manifest_direct['input_fingerprint'] == manifest_fast['input_fingerprint']
+    assert manifest_direct['papers'] == manifest_fast['papers'] == 1
+    assert manifest_direct['references'] == manifest_fast['references'] == 1
+
+    # Parquet contents parity
+    dir_p = pq.read_table(tmp_path / dataset_folder / 'exports/snap-direct/papers.parquet').to_pydict()
+    fst_p = pq.read_table(tmp_path / dataset_folder / 'exports/snap-fast/papers.parquet').to_pydict()
+    assert dir_p == fst_p
+
+    dir_r = pq.read_table(tmp_path / dataset_folder / 'exports/snap-direct/references.parquet').to_pydict()
+    fst_r = pq.read_table(tmp_path / dataset_folder / 'exports/snap-fast/references.parquet').to_pydict()
+    assert dir_r == fst_r
+
+
+
+
 
